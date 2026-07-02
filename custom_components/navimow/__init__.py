@@ -127,12 +127,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not devices:
             _LOGGER.warning("No Navimow devices found")
 
-        # 获取 MQTT 连接信息并创建 SDK
-        try:
-            mqtt_info = await api.async_get_mqtt_user_info()
-        except MowerAPIError as err:
-            _LOGGER.error("Failed to get MQTT info: %s", err)
-            raise ConfigEntryNotReady(f"Failed to get MQTT info: {err}") from err
+        # Cache credentials on success + fall back to cached ones on
+        # MowerAPIError (BUG-02). Logic extracted into `_mqtt_credentials`
+        # so the observable behaviour is reachable from tests without
+        # spinning up the full HA harness.
+        from ._mqtt_credentials import resolve_mqtt_info
+
+        mqtt_info = await resolve_mqtt_info(api, hass, entry)
 
         mqtt_host = mqtt_info.get("mqttHost") or entry.data.get(
             "mqtt_broker", MQTT_BROKER
