@@ -309,6 +309,34 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _handle_state(self, state: DeviceStateMessage) -> None:
         if state.device_id != self.device.id:
             return
+        # BUG-05: the Navimow cloud replays the last-buffered `/state` payload
+        # verbatim at every WSS reconnect (~40 min), overwriting a fresher
+        # state with the pre-reconnect one. Drop the push if its own
+        # payload-embedded `timestamp` (epoch ms) is strictly older than the
+        # timestamp of the state we already hold. Payloads without a timestamp
+        # (defensive `None`) fall through unchanged.
+        new_ts = getattr(state, "timestamp", None)
+        prev = self._last_state
+        prev_ts = getattr(prev, "timestamp", None) if prev is not None else None
+        # Only compare when BOTH sides expose an actual numeric epoch — any
+        # missing/non-numeric value falls through to the pre-BUG-05 accept
+        # path (defensive for firmwares that omit the field, and safe for
+        # tests that pass MagicMock-shaped states).
+        if (
+            isinstance(new_ts, (int, float))
+            and isinstance(prev_ts, (int, float))
+            and new_ts < prev_ts
+        ):
+            _LOGGER.debug(
+                "MQTT state DROPPED as stale: device=%s state=%s battery=%s "
+                "new_ts=%s < prev_ts=%s",
+                state.device_id,
+                state.state,
+                state.battery,
+                new_ts,
+                prev_ts,
+            )
+            return
         _LOGGER.debug(
             "MQTT state received: device=%s state=%s battery=%s",
             state.device_id,
