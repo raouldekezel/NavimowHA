@@ -43,6 +43,15 @@
       },
       "position": {
         "name": "Position"
+      },
+      "progression": {
+        "name": "Progression"
+      },
+      "surface_semaine": {
+        "name": "Surface hebdomadaire"
+      },
+      "zone_courante": {
+        "name": "Zone courante"
       }
     },
     "binary_sensor": {

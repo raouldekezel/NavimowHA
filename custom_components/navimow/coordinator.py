@@ -27,7 +27,7 @@ from .const import (
     SIGNAL_POSITION_UPDATE,
     UPDATE_INTERVAL,
 )
-from .location import parse_location_type_1
+from .location import parse_location_type_1, parse_location_type_2
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -76,6 +76,11 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.position: dict[str, Any] | None = None
         self.vehicle_state: int | None = None
         self._last_position_dispatch: float = 0.0
+        # FEAT-02: mowing stats (type 2 items). Cached across ticks: the
+        # /location channel stops publishing type 2 while docked, so we keep
+        # the last observed values rather than showing "unknown" until the
+        # next mowing session.
+        self.stats: dict[str, Any] | None = None
 
     async def async_setup(self) -> None:
         """Register callbacks from SDK."""
@@ -90,12 +95,25 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         The payload is a JSON array discriminated by `type`:
         - type 1 = pose (postureX/Y/Theta + vehicleState) ~every 2 s
-        - type 2 = mowing stats (FEAT-02, not handled yet)
+        - type 2 = mowing stats ~every 30-90 s (FEAT-02)
         Types 3/4 (heartbeat, taskDelay) ignored.
         """
         msg_type = item.get("type")
         if msg_type == 1:
             self._handle_location_position(item)
+        elif msg_type == 2:
+            self._handle_location_stats(item)
+
+    @callback
+    def _handle_location_stats(self, item: dict[str, Any]) -> None:
+        parsed = parse_location_type_2(item)
+        if parsed is None:
+            return
+        self.stats = parsed
+        # Stats belong to the coordinator's shared data dict, so refresh
+        # entities via the standard path (they are on the ~30 s tick anyway;
+        # this just makes updates land immediately when a payload arrives).
+        self.async_set_updated_data(self._build_data())
 
     @callback
     def _handle_location_position(self, item: dict[str, Any]) -> None:
