@@ -31,5 +31,12 @@
         "description": "配置 Navimow 集成选项"
       }
     }
+  },
+  "entity": {
+    "binary_sensor": {
+      "cloud_connected": {
+        "name": "Cloud connected"
+      }
+    }
   }
 }
