@@ -5,9 +5,10 @@ import time
 from datetime import timedelta
 from typing import Any
 
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import config_entry_oauth2_flow
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from mower_sdk.api import MowerAPI
 from mower_sdk.models import (
@@ -22,8 +23,11 @@ from .const import (
     DOMAIN,
     HTTP_FALLBACK_MIN_INTERVAL,
     MQTT_STALE_SECONDS,
+    POSITION_THROTTLE_SECONDS,
+    SIGNAL_POSITION_UPDATE,
     UPDATE_INTERVAL,
 )
+from .location import parse_location_type_1
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -66,11 +70,64 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # ~120 identical lines. Flag flips True once we have emitted the
         # WARNING; flips False once we have emitted the paired INFO.
         self._mqtt_disconnect_warned: bool = False
+        # FEAT-01: live pose from the /realtimeDate/location channel that
+        # the SDK does not subscribe. Stored separately from `_last_state`
+        # so it does NOT interfere with the HTTP fallback freshness logic.
+        self.position: dict[str, Any] | None = None
+        self.vehicle_state: int | None = None
+        self._last_position_dispatch: float = 0.0
 
     async def async_setup(self) -> None:
         """Register callbacks from SDK."""
         self.sdk.on_state(self._handle_state)
         self.sdk.on_attributes(self._handle_attributes)
+
+    # === /location channel (real-time pose + mowing stats) — FEAT-01 ===
+
+    @callback
+    def handle_location_item(self, item: dict[str, Any]) -> None:
+        """Route one item from the /location payload array.
+
+        The payload is a JSON array discriminated by `type`:
+        - type 1 = pose (postureX/Y/Theta + vehicleState) ~every 2 s
+        - type 2 = mowing stats (FEAT-02, not handled yet)
+        Types 3/4 (heartbeat, taskDelay) ignored.
+        """
+        msg_type = item.get("type")
+        if msg_type == 1:
+            self._handle_location_position(item)
+
+    @callback
+    def _handle_location_position(self, item: dict[str, Any]) -> None:
+        parsed = parse_location_type_1(item)
+        if parsed is None:
+            return
+
+        self.position = parsed
+        vehicle_state = parsed["vehicle_state"]
+
+        # A vehicleState change (e.g. transition to charging = 2) must refresh
+        # the CoordinatorEntity subscribers immediately (binary_sensor en_charge,
+        # etc.).
+        vs_changed = vehicle_state is not None and vehicle_state != self.vehicle_state
+        if vs_changed:
+            self.vehicle_state = vehicle_state
+            self.async_set_updated_data(self._build_data())
+
+        # Position pushes go through a dedicated dispatcher (throttled to
+        # POSITION_THROTTLE_SECONDS unless vehicleState changed) so we don't
+        # emit ~3600 state changes per mowing run through the coordinator.
+        now = time.monotonic()
+        if (
+            vs_changed
+            or (now - self._last_position_dispatch) >= POSITION_THROTTLE_SECONDS
+        ):
+            self._last_position_dispatch = now
+            async_dispatcher_send(
+                self.hass,
+                f"{SIGNAL_POSITION_UPDATE}_{self.device.id}",
+                self.position,
+            )
 
     def _build_data(self) -> dict[str, Any]:
         return {
