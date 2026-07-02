@@ -178,9 +178,7 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             self._mqtt_disconnect_warned = True
         elif self._mqtt_disconnect_warned and self.sdk.is_connected:
-            _LOGGER.info(
-                "MQTT reconnected for device %s", self.device.id
-            )
+            _LOGGER.info("MQTT reconnected for device %s", self.device.id)
             self._mqtt_disconnect_warned = False
 
         if is_mqtt_stale and can_http_fetch:

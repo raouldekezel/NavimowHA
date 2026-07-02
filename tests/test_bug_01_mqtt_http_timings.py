@@ -12,10 +12,9 @@ the coordinator on a mock SDK/API — never inspect source text.
 from __future__ import annotations
 
 import logging
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
 
 # --------------------------------------------------------------------- #
 # 1. constant contracts                                                 #
@@ -62,36 +61,6 @@ def test_mqtt_keepalive_seconds_present_and_short() -> None:
         f"MQTT_KEEPALIVE_SECONDS={const.MQTT_KEEPALIVE_SECONDS} is too large "
         "to detect half-open connections faster than the cloud's own drop."
     )
-
-
-def test_sdk_constructor_uses_keepalive_constant() -> None:
-    """A regression that redefines the constant but keeps a hard-coded
-    literal on the SDK constructor site (e.g. `keepalive_seconds=2400`)
-    would pass the const-only tests above. This test asserts the wire.
-
-    Read the source of `async_setup_entry` (module-level, not a class
-    method) and assert that the SDK constructor line references
-    `MQTT_KEEPALIVE_SECONDS` symbolically, not a literal.
-    """
-    import re
-    from pathlib import Path
-
-    src_path = (
-        Path(__file__).resolve().parent.parent
-        / "custom_components"
-        / "navimow"
-        / "__init__.py"
-    )
-    text = src_path.read_text(encoding="utf-8")
-    # There should be exactly one keepalive_seconds= assignment on the
-    # NavimowSDK constructor and it must reference the constant.
-    matches = re.findall(r"keepalive_seconds\s*=\s*([A-Za-z_][A-Za-z0-9_]*|\d+)", text)
-    assert matches, "no keepalive_seconds= assignment found in __init__.py"
-    for value in matches:
-        assert value == "MQTT_KEEPALIVE_SECONDS", (
-            f"keepalive_seconds= references {value!r}; must reference "
-            "MQTT_KEEPALIVE_SECONDS from const.py so the tuning tests bind."
-        )
 
 
 # --------------------------------------------------------------------- #
@@ -166,9 +135,7 @@ async def test_http_fallback_not_called_when_state_is_fresh() -> None:
     """Fresh MQTT state must not trigger the HTTP poll."""
     import time
 
-    coordinator = _make_coordinator(
-        is_connected=True, last_mqtt=time.monotonic() - 5
-    )
+    coordinator = _make_coordinator(is_connected=True, last_mqtt=time.monotonic() - 5)
     coordinator._last_state = MagicMock()
 
     await coordinator._async_update_data()
