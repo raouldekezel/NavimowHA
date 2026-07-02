@@ -12,7 +12,6 @@ either drives a feature design or validates it.
 
 | Date       | Bug | Question | Answer (TL;DR) | Link |
 | ---------- | --- | -------- | -------------- | ---- |
-| 2026-05-25 | [BUG-04](https://github.com/raouldekezel/NavimowHA/issues/6) | Why does `sensor.<slug>_batterie` flicker between `100 %` (HTTP truth) and `0 %` (post-over-discharge MQTT lie) every ~30 s once the robot has once bottomed out to 0 %? | The SDK's `get_cached_state()` retains the last MQTT push indefinitely. The coordinator re-applies it at the start of every tick, clobbering any fresher HTTP fallback state written at the end of the previous tick. Fix: skip the cache re-application when `_last_http_fetch > _last_mqtt_state_update`. | [2026-05-25_bug-04_battery-flicker](2026-05-25_bug-04_battery-flicker/findings.md) |
 
 ## Layout
 
