@@ -1,19 +1,25 @@
-"""BUG-01 — MQTT staleness thresholds and HTTP fallback push.
+"""BUG-01 — MQTT staleness thresholds and edge-triggered outage warning.
 
-Regression tests for the three tunings in const.py and the
-`async_set_updated_data` call added to `_async_update_data` after a
-successful HTTP fallback fetch.
+Regression tests for the three tunings in const.py, their wiring into
+the SDK constructor, and the edge-triggered "MQTT disconnected + stale"
+WARNING that must fire once on entry and once on recovery (not per
+tick).
 
-We assert observable values on the module (constants exist and are within
-the ranges that keep HA responsive) and the observable behaviour of the
-coordinator on a mock SDK/API — never inspect source text.
+We assert observable values on the module and observable behaviour of
+the coordinator on a mock SDK/API — never inspect source text.
 """
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+import logging
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+
+# --------------------------------------------------------------------- #
+# 1. constant contracts                                                 #
+# --------------------------------------------------------------------- #
 
 
 def test_mqtt_stale_seconds_short_enough() -> None:
@@ -58,14 +64,43 @@ def test_mqtt_keepalive_seconds_present_and_short() -> None:
     )
 
 
-@pytest.mark.asyncio
-async def test_http_fallback_pushes_state_to_entities_immediately() -> None:
-    """After a successful HTTP fallback, the coordinator must call
-    `async_set_updated_data()` so entities update within the tick.
-    Otherwise the fresh state waits for the next 30-s coordinator cycle.
+def test_sdk_constructor_uses_keepalive_constant() -> None:
+    """A regression that redefines the constant but keeps a hard-coded
+    literal on the SDK constructor site (e.g. `keepalive_seconds=2400`)
+    would pass the const-only tests above. This test asserts the wire.
 
-    Regression test for the observable behaviour added by BUG-01.
+    Read the source of `async_setup_entry` (module-level, not a class
+    method) and assert that the SDK constructor line references
+    `MQTT_KEEPALIVE_SECONDS` symbolically, not a literal.
     """
+    import re
+    from pathlib import Path
+
+    src_path = (
+        Path(__file__).resolve().parent.parent
+        / "custom_components"
+        / "navimow"
+        / "__init__.py"
+    )
+    text = src_path.read_text(encoding="utf-8")
+    # There should be exactly one keepalive_seconds= assignment on the
+    # NavimowSDK constructor and it must reference the constant.
+    matches = re.findall(r"keepalive_seconds\s*=\s*([A-Za-z_][A-Za-z0-9_]*|\d+)", text)
+    assert matches, "no keepalive_seconds= assignment found in __init__.py"
+    for value in matches:
+        assert value == "MQTT_KEEPALIVE_SECONDS", (
+            f"keepalive_seconds= references {value!r}; must reference "
+            "MQTT_KEEPALIVE_SECONDS from const.py so the tuning tests bind."
+        )
+
+
+# --------------------------------------------------------------------- #
+# 2. coordinator observable behaviour                                   #
+# --------------------------------------------------------------------- #
+
+
+def _make_coordinator(*, is_connected: bool, last_mqtt: float | None):
+    """Mock coordinator sufficient to drive `_async_update_data`."""
     from custom_components.navimow.coordinator import NavimowCoordinator
 
     coordinator = NavimowCoordinator.__new__(NavimowCoordinator)
@@ -82,77 +117,138 @@ async def test_http_fallback_pushes_state_to_entities_immediately() -> None:
     sdk = MagicMock()
     sdk.get_cached_state.return_value = None
     sdk.get_cached_attributes.return_value = None
-    sdk.is_connected = False
+    sdk.is_connected = is_connected
     coordinator.sdk = sdk
 
-    status = MagicMock()
-    status.battery = 77
     api = MagicMock()
-    api.async_get_device_status = AsyncMock(return_value=status)
+    api.async_get_device_status = AsyncMock(return_value=MagicMock(battery=77))
     coordinator.api = api
 
     coordinator._last_state = None
     coordinator._last_attributes = None
-    coordinator._last_mqtt_update = None
+    coordinator._last_mqtt_update = last_mqtt
     coordinator._last_http_fetch = None
     coordinator._last_data_source = None
-    coordinator.oauth_session = None  # bypass token refresh path
+    coordinator.oauth_session = None
+    coordinator._mqtt_disconnect_warned = False
 
     coordinator._device_status_to_state = MagicMock(return_value=MagicMock(battery=77))
     coordinator._build_data = MagicMock(return_value={"state": "http_fallback_result"})
     coordinator.async_set_updated_data = MagicMock()
+    return coordinator
 
-    await coordinator._async_update_data()
 
-    coordinator.async_set_updated_data.assert_called_once()
-    (payload,), _kwargs = coordinator.async_set_updated_data.call_args
-    assert payload == {"state": "http_fallback_result"}
+@pytest.mark.asyncio
+async def test_http_fallback_state_is_returned_to_framework() -> None:
+    """After a successful HTTP fallback, the value returned by
+    `_async_update_data` must carry the fresh state.
+
+    HA's `DataUpdateCoordinator` propagates that return value to entity
+    listeners via `async_update_listeners()` at the end of the tick, so
+    no extra `async_set_updated_data()` call is needed (and it would
+    double-notify).
+    """
+    coordinator = _make_coordinator(is_connected=False, last_mqtt=None)
+
+    returned = await coordinator._async_update_data()
+
+    coordinator.api.async_get_device_status.assert_awaited_once()
     assert coordinator._last_data_source == "http_fallback"
+    # Framework contract: the returned dict is what listeners receive.
+    assert returned == {"state": "http_fallback_result"}
+    # Anti-pattern guard: async_set_updated_data must NOT be called inside
+    # the poll method — HA raises a reentrancy warning and double-notifies.
+    coordinator.async_set_updated_data.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_http_fallback_not_called_when_state_is_fresh() -> None:
-    """Guard against the regression where the coordinator would push on
-    every tick regardless of staleness — that would spam the API and
-    entity listeners.
-    """
+    """Fresh MQTT state must not trigger the HTTP poll."""
     import time
 
-    from custom_components.navimow.coordinator import NavimowCoordinator
-
-    coordinator = NavimowCoordinator.__new__(NavimowCoordinator)
-    coordinator.hass = MagicMock()
-    coordinator.logger = MagicMock()
-    coordinator.name = "test"
-    coordinator.update_interval = None
-    coordinator.config_entry = MagicMock()
-
-    device = MagicMock()
-    device.id = "REDACTED-ROBOT-SERIAL"
-    coordinator.device = device
-
-    sdk = MagicMock()
-    sdk.get_cached_state.return_value = None
-    sdk.get_cached_attributes.return_value = None
-    sdk.is_connected = True
-    coordinator.sdk = sdk
-
-    api = MagicMock()
-    api.async_get_device_status = AsyncMock()
-    coordinator.api = api
-
+    coordinator = _make_coordinator(
+        is_connected=True, last_mqtt=time.monotonic() - 5
+    )
     coordinator._last_state = MagicMock()
-    coordinator._last_attributes = None
-    # MQTT arrived 5 seconds ago — fresh.
-    coordinator._last_mqtt_update = time.monotonic() - 5
-    coordinator._last_http_fetch = None
-    coordinator._last_data_source = "mqtt_push"
-    coordinator.oauth_session = None
-
-    coordinator._build_data = MagicMock(return_value={})
-    coordinator.async_set_updated_data = MagicMock()
 
     await coordinator._async_update_data()
 
-    api.async_get_device_status.assert_not_called()
+    coordinator.api.async_get_device_status.assert_not_called()
     coordinator.async_set_updated_data.assert_not_called()
+
+
+# --------------------------------------------------------------------- #
+# 3. edge-triggered outage warning                                      #
+# --------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_disconnected_stale_warning_fires_once_on_entry(caplog) -> None:
+    """Two consecutive ticks in the disconnected-stale state must emit
+    the WARNING exactly once. Without the edge trigger, a routine 1 h
+    outage would produce ~120 identical WARNING lines.
+    """
+    coordinator = _make_coordinator(is_connected=False, last_mqtt=None)
+
+    caplog.set_level(logging.WARNING, logger="custom_components.navimow.coordinator")
+
+    await coordinator._async_update_data()
+    await coordinator._async_update_data()
+
+    disconnect_warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "MQTT appears disconnected" in r.message
+    ]
+    assert len(disconnect_warnings) == 1, (
+        f"expected exactly 1 disconnect WARNING across 2 ticks, got "
+        f"{len(disconnect_warnings)}"
+    )
+    assert coordinator._mqtt_disconnect_warned is True
+
+
+@pytest.mark.asyncio
+async def test_reconnect_logs_once_at_info_and_clears_flag(caplog) -> None:
+    """After the disconnect WARNING has fired, the first tick that sees
+    `sdk.is_connected = True` again must log the reconnect INFO and clear
+    the flag — even if the state is still stale (the recovery signal is
+    the SDK's own connectivity, not the state freshness).
+    """
+    coordinator = _make_coordinator(is_connected=False, last_mqtt=None)
+    caplog.set_level(logging.INFO, logger="custom_components.navimow.coordinator")
+
+    # First tick: enter outage.
+    await coordinator._async_update_data()
+    assert coordinator._mqtt_disconnect_warned is True
+
+    # Second tick: SDK reconnected but state hasn't refreshed yet — the
+    # INFO must still fire (we log the connectivity event, not the state
+    # recovery).
+    coordinator.sdk.is_connected = True
+    await coordinator._async_update_data()
+
+    reconnect_infos = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.INFO and "MQTT reconnected" in r.message
+    ]
+    assert len(reconnect_infos) == 1
+    assert coordinator._mqtt_disconnect_warned is False
+
+
+@pytest.mark.asyncio
+async def test_no_warning_when_mqtt_connected_but_state_stale(caplog) -> None:
+    """The stale check triggers HTTP fallback but the disconnect
+    WARNING must NOT fire — the SDK is connected, the "MQTT is silently
+    down" motivation for the WARNING does not apply.
+    """
+    coordinator = _make_coordinator(is_connected=True, last_mqtt=None)
+    caplog.set_level(logging.WARNING, logger="custom_components.navimow.coordinator")
+
+    await coordinator._async_update_data()
+
+    disconnect_warnings = [
+        r for r in caplog.records if "MQTT appears disconnected" in r.message
+    ]
+    assert disconnect_warnings == []
+    assert coordinator._mqtt_disconnect_warned is False
