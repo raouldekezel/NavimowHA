@@ -51,8 +51,9 @@ from GitHub; they ARE the atomic patch that will be replayed by
 
 ## Tags & releases
 
-- Tag format: `NavimowHA-v<upstream-tag>-raoul.<n>` (matching the
-  release-please tag shape upstream uses).
+- Tag format: `<upstream-tag>-raoul.<n>` (upstream uses release-please
+  tags shaped `NavimowHA-vX.Y.Z`, so our tags look like
+  `NavimowHA-v1.1.0-raoul.1`).
 - Releases on GitHub: `gh release create --prerelease` (mandatory — HACS
   reads `/releases`, not raw tags; a tag pushed without a Release is
   invisible to HACS).

@@ -2,7 +2,7 @@
   "domain": "navimow",
   "name": "Navimow",
   "codeowners": [
-    "@segwaynavimow"
+    "@raouldekezel"
   ],
   "config_flow": true,
   "documentation": "https://github.com/raouldekezel/NavimowHA",

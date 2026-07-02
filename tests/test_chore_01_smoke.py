@@ -11,6 +11,18 @@ Delete this file once a real behavioural test lives under tests/.
 from __future__ import annotations
 
 
+def test_integration_module_imports_cleanly() -> None:
+    """Actually exercise the import path the docstring promises.
+
+    Importing `custom_components.navimow` triggers `__init__.py` top-level
+    (imports Platform, ConfigEntry, our const module, etc.) and thus
+    catches a silent HA or transitive-dependency breakage introduced by a
+    future upstream sync, before any behavioural test runs.
+    """
+    import custom_components.navimow  # noqa: F401
+    import custom_components.navimow.const  # noqa: F401
+
+
 def test_manifest_domain_matches_folder() -> None:
     """The manifest domain must match the folder name — HACS relies on it."""
     import json

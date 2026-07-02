@@ -17,6 +17,9 @@ README = DIAG_DIR / "README.md"
 
 # Subdirectory name shape: YYYY-MM-DD_<bug-id>_<topic>
 SUBDIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_[A-Za-z0-9-]+_[A-Za-z0-9-]+$")
+# Loose date prefix — catches malformed session dirs (e.g. underscores in the
+# topic slug) that would otherwise be silently excluded from the drift check.
+DATE_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_")
 
 # Markdown link in the Link column: [text](path) — we pull `path` and grep
 # the YYYY-MM-DD_<bug>_<topic> token out of it.
@@ -26,6 +29,20 @@ LINK_TOKEN_RE = re.compile(r"\d{4}-\d{2}-\d{2}_[A-Za-z0-9-]+_[A-Za-z0-9-]+")
 def list_subdirs() -> set[str]:
     return {
         p.name for p in DIAG_DIR.iterdir() if p.is_dir() and SUBDIR_RE.match(p.name)
+    }
+
+
+def list_malformed_subdirs() -> set[str]:
+    """Dirs that look like a session (YYYY-MM-DD_ prefix) but don't match
+    the strict `SUBDIR_RE`. These would be silently ignored by
+    `list_subdirs`, letting a typoed session escape the drift check.
+    """
+    return {
+        p.name
+        for p in DIAG_DIR.iterdir()
+        if p.is_dir()
+        and DATE_PREFIX_RE.match(p.name)
+        and not SUBDIR_RE.match(p.name)
     }
 
 
@@ -54,7 +71,11 @@ def list_table_rows() -> set[str]:
         line = raw.strip()
         if not line.startswith("|"):
             continue
-        if line.startswith("|--") or line.startswith("|---"):
+        # Markdown separator rows: `| --- | --- | ...` (space after pipe)
+        # or `|--- |` (no space). Match both by looking at the first
+        # non-pipe non-space characters.
+        stripped = line[1:].lstrip()
+        if stripped.startswith("-") or stripped.startswith(":-"):
             continue
         if "Date" in line and "Question" in line:
             continue
@@ -71,11 +92,12 @@ def main() -> int:
 
     subdirs = list_subdirs()
     rows = list_table_rows()
+    malformed = list_malformed_subdirs()
 
     missing_from_table = subdirs - rows
     missing_from_disk = rows - subdirs
 
-    if not missing_from_table and not missing_from_disk:
+    if not missing_from_table and not missing_from_disk and not malformed:
         return 0
 
     print(f"docs/diag/README.md ## Sessions table is out of sync with {DIAG_DIR}:")
@@ -83,9 +105,15 @@ def main() -> int:
         print(f"  + directory exists but no table row: {m}")
     for m in sorted(missing_from_disk):
         print(f"  - table row exists but no directory: {m}")
+    for m in sorted(malformed):
+        print(
+            f"  ! malformed session directory (YYYY-MM-DD_ prefix but bad shape): {m}"
+        )
     print()
     print("Add a row for each new session directory (or remove the row if")
-    print("the directory was removed). See docs/diag/README.md § Drift-proof index.")
+    print("the directory was removed). Session subdirs must match")
+    print("`YYYY-MM-DD_<id>_<topic>` — no underscores in the topic slug.")
+    print("See docs/diag/README.md § Drift-proof index.")
     return 1
 
 
