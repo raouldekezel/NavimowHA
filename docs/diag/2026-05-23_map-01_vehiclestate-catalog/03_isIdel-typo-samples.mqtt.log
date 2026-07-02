@@ -1,0 +1,3 @@
+2026-05-22T13:49:26.426341930Z 2026-05-22 15:49:26.424 DEBUG (MainThread) [custom_components.navimow.coordinator] MQTT state received: device=REDACTED-ROBOT-SERIAL state=idle battery=99
+2026-05-22T14:44:06.384817591Z 2026-05-22 16:44:06.379 DEBUG (MainThread) [custom_components.navimow.coordinator] MQTT state received: device=REDACTED-ROBOT-SERIAL state=idle battery=87
+2026-05-23T15:04:24.103388771Z 2026-05-23 17:04:24.099 DEBUG (MainThread) [custom_components.navimow.coordinator] MQTT state received: device=REDACTED-ROBOT-SERIAL state=idle battery=100
