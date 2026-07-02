@@ -16,7 +16,6 @@ from __future__ import annotations
 import time
 from unittest.mock import MagicMock, patch
 
-
 # --------------------------------------------------------------------- #
 # 1. pure parsers                                                       #
 # --------------------------------------------------------------------- #
@@ -187,9 +186,7 @@ def test_vehicle_state_change_bypasses_throttle() -> None:
 
 
 def _find_desc(key):
-    from custom_components.navimow.binary_sensor import (
-        BINARY_SENSOR_DESCRIPTIONS,
-    )
+    from custom_components.navimow.binary_sensor import BINARY_SENSOR_DESCRIPTIONS
 
     return next(d for d in BINARY_SENSOR_DESCRIPTIONS if d.key == key)
 
