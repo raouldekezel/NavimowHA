@@ -40,9 +40,7 @@ def list_malformed_subdirs() -> set[str]:
     return {
         p.name
         for p in DIAG_DIR.iterdir()
-        if p.is_dir()
-        and DATE_PREFIX_RE.match(p.name)
-        and not SUBDIR_RE.match(p.name)
+        if p.is_dir() and DATE_PREFIX_RE.match(p.name) and not SUBDIR_RE.match(p.name)
     }
 
 
