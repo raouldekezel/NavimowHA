@@ -52,6 +52,24 @@ HTTP_FALLBACK_MIN_INTERVAL: Final = 60
 # 2400 to 120 (BUG-01).
 MQTT_KEEPALIVE_SECONDS: Final = 120
 
+# === /location extensions (FEAT-01) ===
+
+# The position sensor throttles dispatcher emissions. The /location type 1
+# payload arrives every ~2 s while mowing; only one out of every N is pushed
+# to the entity to keep the recorder happy (the sensor is also excluded from
+# the recorder in the documented configuration).
+POSITION_THROTTLE_SECONDS: Final = 5
+
+# Dispatcher signal to push a new position to `NavimowPositionSensor` (suffixed
+# with the device_id).
+SIGNAL_POSITION_UPDATE: Final = "navimow_position_update"
+
+# `vehicleState` value that means "docked and charging". The /state MQTT topic
+# reports `isDocked` in both idle-on-dock and charging cases; only the /location
+# `vehicleState` field distinguishes the two.
+VEHICLE_STATE_CHARGING: Final = 2
+
+
 # MowerStatus 到 LawnMowerActivity 的映射
 MOWER_STATUS_TO_ACTIVITY = {
     "idle": "docked",

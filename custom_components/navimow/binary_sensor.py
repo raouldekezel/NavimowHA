@@ -17,7 +17,7 @@ from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN
+from .const import DOMAIN, VEHICLE_STATE_CHARGING
 from .coordinator import NavimowCoordinator
 
 
@@ -39,6 +39,20 @@ BINARY_SENSOR_DESCRIPTIONS: tuple[NavimowBinarySensorEntityDescription, ...] = (
         # moment the coordinator ticks (default 30 s).
         is_on_fn=lambda coordinator: bool(
             getattr(coordinator.sdk, "is_connected", False)
+        ),
+    ),
+    NavimowBinarySensorEntityDescription(
+        key="charging",
+        translation_key="charging",
+        device_class=BinarySensorDeviceClass.BATTERY_CHARGING,
+        # FEAT-01: only `vehicleState` (from the /location channel) distinguishes
+        # docked+charging (2) from docked+idle. The /state channel says
+        # `isDocked` in both cases. Returns None until the coordinator has
+        # seen at least one /location payload — HA renders that as "unknown".
+        is_on_fn=lambda coordinator: (
+            coordinator.vehicle_state == VEHICLE_STATE_CHARGING
+            if getattr(coordinator, "vehicle_state", None) is not None
+            else None
         ),
     ),
 )

@@ -33,9 +33,17 @@
     }
   },
   "entity": {
+    "sensor": {
+      "position": {
+        "name": "Position"
+      }
+    },
     "binary_sensor": {
       "cloud_connected": {
         "name": "Cloud connected"
+      },
+      "charging": {
+        "name": "Charging"
       }
     }
   }

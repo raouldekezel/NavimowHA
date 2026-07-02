@@ -40,11 +40,17 @@
     "sensor": {
       "battery": {
         "name": "Battery"
+      },
+      "position": {
+        "name": "Position"
       }
     },
     "binary_sensor": {
       "cloud_connected": {
         "name": "Cloud connected"
+      },
+      "charging": {
+        "name": "Charging"
       }
     }
   }

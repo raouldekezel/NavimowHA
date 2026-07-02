@@ -182,6 +182,44 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             mqtt = sdk._mqtt
             original_on_message = mqtt.on_message
 
+            def _subscribe_location() -> None:
+                # The /downlink/vehicle/{id}/realtimeDate/location channel
+                # carries real-time telemetry (pose + mowing stats) that the
+                # official SDK does NOT subscribe. The broker ACL accepts it.
+                # We subscribe it ourselves without patching the pip-installed
+                # SDK. FEAT-01.
+                for device in mqtt.records or []:
+                    did = getattr(device, "id", None)
+                    if not did:
+                        continue
+                    topic = f"/downlink/vehicle/{did}/realtimeDate/location"
+                    try:
+                        rc, mid = mqtt.client.subscribe(topic, qos=0)
+                        _LOGGER.info(
+                            "Subscribed /location: %s (rc=%s mid=%s)", topic, rc, mid
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        _LOGGER.warning("Failed to subscribe %s: %s", topic, e)
+
+            def _route_location(payload: bytes, device_id: str) -> None:
+                # Executes on the HA loop (called from _on_message which is
+                # scheduled via create_task). Decodes the /location payload
+                # and dispatches items to the coordinator by device_id.
+                from .location import parse_location_payload
+
+                items = parse_location_payload(payload)
+                if items is None:
+                    return
+                data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+                if not data:
+                    return
+                coordinator = data.get("coordinators", {}).get(device_id)
+                if coordinator is None:
+                    return
+                for it in items:
+                    if isinstance(it, dict):
+                        coordinator.handle_location_item(it)
+
             def _get_client_id() -> str:
                 client_id_bytes = getattr(mqtt.client, "_client_id", b"")
                 if isinstance(client_id_bytes, (bytes, bytearray)):
@@ -207,6 +245,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     mqtt.port,
                     _get_client_id(),
                 )
+                # SDK only subscribes state/event/attributes; add /location
+                # on every (re)connection. FEAT-01.
+                _subscribe_location()
 
             async def _on_disconnected() -> None:
                 _LOGGER.debug(
@@ -242,6 +283,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     device_id,
                     payload_text,
                 )
+                # /location carries a JSON array that the SDK ignores (it only
+                # routes state/event/attributes and rejects arrays). We handle
+                # it ourselves; the rest goes through the SDK. FEAT-01.
+                channel = topic.rsplit("/", 1)[-1] if topic else ""
+                if channel == "location":
+                    _route_location(payload, device_id)
+                    return
                 if original_on_message is not None:
                     await original_on_message(topic, payload, device_id)
 
@@ -265,6 +313,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
             mqtt.client.on_subscribe = _on_subscribe
             mqtt.client.on_log = _on_log
+
+            # The SDK's `sdk.connect()` triggers _on_connected → subscribe_all()
+            # BEFORE these hooks are attached, so _on_ready is never called for
+            # the initial connection. Subscribe /location inline. FEAT-01.
+            if mqtt.is_connected:
+                _LOGGER.info("Subscribing /location inline (already connected)")
+                _subscribe_location()
 
         async def _probe_mqtt_status(sdk: NavimowSDK) -> None:
             await asyncio.sleep(5)
