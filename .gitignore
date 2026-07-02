@@ -26,3 +26,5 @@ env/
 
 # Home Assistant
 *.log
+# Override: keep diagnostic-session log slices under docs/diag/.
+!docs/diag/**/*.mqtt.log
