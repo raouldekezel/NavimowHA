@@ -13,7 +13,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, UnitOfLength
+from homeassistant.const import PERCENTAGE, UnitOfArea, UnitOfLength
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import DeviceInfo
@@ -29,6 +29,7 @@ class NavimowSensorEntityDescription(SensorEntityDescription):
     """Describes Navimow sensor entity."""
 
     value_fn: Callable[[NavimowCoordinator], Any]
+    attrs_fn: Callable[[NavimowCoordinator], dict[str, Any] | None] | None = None
 
 
 SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
@@ -40,6 +41,43 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         value_fn=lambda coordinator: (
             state.battery if (state := coordinator.get_device_state()) else None
+        ),
+    ),
+    # === /location type 2 mowing metrics (FEAT-02) ===
+    NavimowSensorEntityDescription(
+        key="progression",
+        translation_key="progression",
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:progress-helper",
+        value_fn=lambda c: (c.stats or {}).get("mowing_percentage"),
+        attrs_fn=lambda c: (
+            {
+                "current_mow_progress": c.stats.get("current_mow_progress"),
+                "surface_session": c.stats.get("area_session"),
+                "action": c.stats.get("action"),
+            }
+            if c.stats
+            else None
+        ),
+    ),
+    NavimowSensorEntityDescription(
+        key="weekly_area",
+        translation_key="weekly_area",
+        native_unit_of_measurement=UnitOfArea.SQUARE_METERS,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        icon="mdi:grass",
+        value_fn=lambda c: (c.stats or {}).get("area_week"),
+    ),
+    NavimowSensorEntityDescription(
+        key="current_zone",
+        translation_key="current_zone",
+        icon="mdi:map-marker-radius",
+        value_fn=lambda c: (
+            f"#{b}" if (b := (c.stats or {}).get("boundary")) is not None else None
+        ),
+        attrs_fn=lambda c: (
+            {"boundary_id": c.stats.get("boundary")} if c.stats else None
         ),
     ),
 )
@@ -107,6 +145,12 @@ class NavimowSensor(CoordinatorEntity[NavimowCoordinator], SensorEntity):
     def native_value(self) -> Any:
         """Return sensor value from coordinator."""
         return self.entity_description.value_fn(self.coordinator)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        if self.entity_description.attrs_fn is None:
+            return None
+        return self.entity_description.attrs_fn(self.coordinator)
 
 
 class NavimowPositionSensor(SensorEntity):

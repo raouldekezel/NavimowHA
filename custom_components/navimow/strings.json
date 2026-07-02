@@ -36,6 +36,15 @@
     "sensor": {
       "position": {
         "name": "Position"
+      },
+      "progression": {
+        "name": "Progression"
+      },
+      "weekly_area": {
+        "name": "Weekly area"
+      },
+      "current_zone": {
+        "name": "Current zone"
       }
     },
     "binary_sensor": {

@@ -64,6 +64,35 @@ def parse_location_type_1(item: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def parse_location_type_2(item: dict[str, Any]) -> dict[str, Any] | None:
+    """Parse a location item of `type == 2` (mowing statistics).
+
+    Returns a dict with:
+    - `mowing_percentage` (int; overall run progression, 0..100)
+    - `current_mow_progress` (int; current zone progression, 0..10000)
+    - `area_session` (float; `subtotalArea`, m² — cumulative across the run)
+    - `area_week` (float; `mowingWeekArea`, m² — since ISO week start)
+    - `boundary` (int; `currentMowBoundary`, internal id, not sequential)
+    - `action` (int; sub-state code observed 5/8/-1, semantics TBD)
+
+    Returns `None` only when the item is not a mapping. The individual
+    fields fall back to `None` on parse errors — the operator's 2026-05-25
+    multizone run (diag #20) captured only full type-2 packets, but the
+    parser is defensively tolerant of sparse variants should another
+    Navimow firmware emit them.
+    """
+    if not isinstance(item, dict):
+        return None
+    return {
+        "mowing_percentage": _to_int(item.get("mowingPercentage")),
+        "current_mow_progress": _to_int(item.get("currentMowProgress")),
+        "area_session": _to_float(item.get("subtotalArea")),
+        "area_week": _to_float(item.get("mowingWeekArea")),
+        "boundary": _to_int(item.get("currentMowBoundary")),
+        "action": _to_int(item.get("action")),
+    }
+
+
 def parse_location_payload(payload: bytes) -> list[dict[str, Any]] | None:
     """Decode a raw MQTT payload from the /location topic.
 
