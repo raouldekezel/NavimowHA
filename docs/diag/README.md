@@ -12,7 +12,6 @@ either drives a feature design or validates it.
 
 | Date       | Bug | Question | Answer (TL;DR) | Link |
 | ---------- | --- | -------- | -------------- | ---- |
-| 2026-05-23 | [FEAT-01](https://github.com/raouldekezel/NavimowHA/issues/7) | Does the WSS broker accept a subscription on the SDK-ignored `/downlink/vehicle/<id>/realtimeDate/location` topic, and does the `mqtt.on_message` override route it end-to-end to a working `sensor.<slug>_position`? | Yes. Subscription returns `rc=0`; type-1 payloads (postureX/Y/Theta + vehicleState) reach the coordinator via the override; the position sensor renders state and attributes end-to-end. Type-3 heartbeats are correctly ignored. | [2026-05-23_feat-01_phase1-deployment](2026-05-23_feat-01_phase1-deployment/findings.md) |
 
 ## Layout
 
