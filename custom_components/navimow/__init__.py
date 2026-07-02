@@ -56,7 +56,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Navimow from a config entry."""
-    # 延迟导入 mower_sdk，避免在加载 config_flow 时触发依赖导入
+    # Import mower_sdk lazily to avoid pulling the dependency when loading config_flow
     from mower_sdk.api import MowerAPI
     from mower_sdk.errors import MowerAPIError
     from mower_sdk.sdk import NavimowSDK
@@ -73,7 +73,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         return f"{value[:2]}***{value[-2:]}"
 
     try:
-        # 获取 OAuth2 实现
+        # Get the OAuth2 implementation
         implementation = (
             await config_entry_oauth2_flow.async_get_config_entry_implementation(
                 hass, entry
@@ -82,7 +82,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not isinstance(implementation, NavimowOAuth2Implementation):
             raise ConfigEntryAuthFailed("Invalid OAuth2 implementation")
 
-        # 创建 OAuth2Session
+        # Create the OAuth2Session
         oauth_session = config_entry_oauth2_flow.OAuth2Session(
             hass, entry, implementation
         )
@@ -108,14 +108,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not access_token:
             raise ConfigEntryAuthFailed("No access token in token data")
 
-        # 创建 MowerAPI 实例
+        # Create the MowerAPI instance
         api = MowerAPI(
             session=async_get_clientsession(hass),
             token=access_token,
             base_url=entry.data.get("api_base_url", API_BASE_URL),
         )
 
-        # 发现设备
+        # Discover devices
         try:
             devices = await api.async_get_devices()
             _LOGGER.info("Discovered %d Navimow device(s)", len(devices))
@@ -175,7 +175,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
         _mqtt_refresh_lock = asyncio.Lock()
-        # 用列表作为可变标志容器，使 async_unload_entry（不同函数作用域）可以修改它
+        # Use a list as a mutable flag container so async_unload_entry (a different function scope) can modify it
         _unload_flag: list[bool] = [False]
 
         def _attach_mqtt_debug_hooks(sdk: NavimowSDK, api: MowerAPI) -> None:
@@ -260,8 +260,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 )
                 if _unload_flag[0]:
                     return
-                # 若已有刷新在进行中，跳过本次——broker 批量断连会并发触发多次回调，
-                # 只需执行一次凭据刷新即可，重复执行会导致 paho client 孤儿累积。
+                # If a refresh is already in progress, skip this one -- a batch broker disconnect fires several callbacks concurrently,
+                # and only one credential refresh is needed; running it repeatedly leaks orphaned paho clients.
                 if _mqtt_refresh_lock.locked():
                     _LOGGER.debug(
                         "MQTT credential refresh already in progress, skipping duplicate disconnect callback"
@@ -270,8 +270,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 async with _mqtt_refresh_lock:
                     if _unload_flag[0]:
                         return
-                    # 断连后重新从服务端拉取 MQTT 凭据（userName/pwdInfo 与 OAuth token 绑定，
-                    # token 刷新或过期后凭据会失效，直接用旧凭据重连会导致 CODE_OAUTH_INFO_ILLEGAL）
+                    # After a disconnect, re-fetch the MQTT credentials from the server (userName/pwdInfo are bound to the OAuth token;
+                    # once the token is refreshed or expires the credentials become invalid, and reconnecting with the old ones causes CODE_OAUTH_INFO_ILLEGAL)
                     await _async_refresh_mqtt_credentials(sdk, api)
 
             async def _on_message(topic: str, payload: bytes, device_id: str) -> None:
@@ -330,18 +330,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         async def _async_refresh_mqtt_credentials(
             sdk: NavimowSDK, api: MowerAPI
         ) -> None:
-            """Token 过期或 MQTT 断连后，重新获取 MQTT 凭据并更新 SDK。
+            """Re-fetch the MQTT credentials and update the SDK after a token expiry or MQTT disconnect.
 
-            服务端下发的 userName/pwdInfo 与 OAuth token 绑定，token 刷新后需同步更新，
-            否则 MQTT 重连时会收到 CODE_OAUTH_INFO_ILLEGAL。
+            The userName/pwdInfo issued by the server are bound to the OAuth token and must be updated in sync
+            when the token is refreshed, otherwise MQTT reconnection receives CODE_OAUTH_INFO_ILLEGAL.
 
-            必须先刷新 OAuth token：MQTT 断连往往正是因为 token 过期触发的，
-            此时 api._token 极可能也已失效，需先换新 token 再拉取 MQTT 凭据。
+            The OAuth token must be refreshed first: an MQTT disconnect is often triggered precisely by a token
+            expiry, so api._token is very likely stale too -- swap in a new token before fetching MQTT credentials.
             """
             new_access_token: str | None = None
             new_auth_headers: dict[str, str] | None = None
             try:
-                # 先刷新 OAuth token（oauth_session 来自外层闭包）
+                # Refresh the OAuth token first (oauth_session comes from the enclosing closure)
                 if hasattr(oauth_session, "async_ensure_token_valid"):
                     await oauth_session.async_ensure_token_valid()
                     fresh_token = oauth_session.token
@@ -368,9 +368,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             new_username = new_mqtt_info.get("userName")
             new_password = new_mqtt_info.get("pwdInfo")
             if new_auth_headers or new_username or new_password:
-                # update_credentials 在断连时会调用 loop_stop()/tls_set()/load_default_certs()
-                # 等阻塞 SSL 操作，必须在 executor 中执行，避免阻塞 HA 事件循环。
-                # auth_headers 更新与 username/password 更新合并为一次 executor 调用。
+                # On disconnect, update_credentials calls blocking SSL operations such as loop_stop()/tls_set()/load_default_certs(),
+                # which must run in an executor to avoid blocking the HA event loop.
+                # The auth_headers update is merged with the username/password update into a single executor call.
                 _new_auth_headers = new_auth_headers
                 _new_username = new_username
                 _new_password = new_password
@@ -431,7 +431,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             await coordinator.async_config_entry_first_refresh()
             coordinators[device.id] = coordinator
 
-        # 存储数据
+        # Store the data
         hass.data[DOMAIN][entry.entry_id] = {
             "sdk": sdk,
             "api": api,
@@ -441,7 +441,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "unload_flag": _unload_flag,
         }
 
-        # 转发到平台
+        # Forward to the platforms
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
         return True
@@ -458,10 +458,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
     if unload_ok:
-        # 清理数据
+        # Clean up the data
         if entry.entry_id in hass.data.get(DOMAIN, {}):
             data = hass.data[DOMAIN][entry.entry_id]
-            # 标记正在卸载，阻止断连回调触发新的凭据刷新
+            # Mark that we are unloading, to stop the disconnect callback from triggering a new credential refresh
             if "unload_flag" in data:
                 data["unload_flag"][0] = True
             sdk = data.get("sdk")
