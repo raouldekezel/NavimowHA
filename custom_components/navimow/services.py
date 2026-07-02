@@ -3,11 +3,9 @@
 import logging
 
 import voluptuous as vol
-
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
-
 from mower_sdk.api import MowerAPI
 
 from .const import DOMAIN
@@ -33,9 +31,7 @@ def async_setup_services(hass: HomeAssistant, _api: MowerAPI) -> None:
             device_id,
             height,
         )
-        raise HomeAssistantError(
-            "当前 REST API 不支持设置割草高度，服务未执行"
-        )
+        raise HomeAssistantError("当前 REST API 不支持设置割草高度，服务未执行")
 
     hass.services.async_register(
         DOMAIN,

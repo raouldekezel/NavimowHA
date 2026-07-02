@@ -25,9 +25,7 @@ LINK_TOKEN_RE = re.compile(r"\d{4}-\d{2}-\d{2}_[A-Za-z0-9-]+_[A-Za-z0-9-]+")
 
 def list_subdirs() -> set[str]:
     return {
-        p.name
-        for p in DIAG_DIR.iterdir()
-        if p.is_dir() and SUBDIR_RE.match(p.name)
+        p.name for p in DIAG_DIR.iterdir() if p.is_dir() and SUBDIR_RE.match(p.name)
     }
 
 
