@@ -49,16 +49,16 @@ class NavimowOAuth2Implementation(LocalOAuth2Implementation):
     async def _async_refresh_token(self, token: dict[str, Any]) -> dict[str, Any]:
         """Navimow-specific token refresh.
 
-        Navimow 的 OAuth token 有效期约为 1-2 天。到期后 HA 会尝试用
-        grant_type=refresh_token 换新 token。若服务端不支持此 grant type
-        或 refresh_token 本身已过期，会抛出异常。
+        Navimow OAuth tokens are valid for roughly 1-2 days. On expiry, HA tries to
+        exchange a new token using grant_type=refresh_token. If the server does not
+        support this grant type, or the refresh_token itself has expired, an exception is raised.
 
-        此处明确区分两种失败：
-        - 确定性认证失败（401/403、no refresh_token）→ ConfigEntryAuthFailed
-        - 瞬态失败（网络超时、DNS 等）→ 原样抛出，由上层决定是否重试
+        Here we explicitly distinguish two kinds of failure:
+        - Deterministic auth failure (401/403, no refresh_token) -> ConfigEntryAuthFailed
+        - Transient failure (network timeout, DNS, etc.) -> re-raised as-is, leaving the caller to decide whether to retry
         """
         if "refresh_token" not in token:
-            # Navimow 初始 token 不含 refresh_token，直接告知用户需重新认证
+            # The initial Navimow token has no refresh_token; tell the user to re-authenticate
             raise ConfigEntryAuthFailed(
                 "Navimow access token has expired and no refresh token is available. "
                 "Please re-authenticate."
@@ -69,7 +69,7 @@ class NavimowOAuth2Implementation(LocalOAuth2Implementation):
             raise
         except Exception as err:
             err_str = str(err).lower()
-            # 服务端明确拒绝（401/403/invalid/expired）→ 需要重新认证
+            # Server explicitly rejected (401/403/invalid/expired) -> re-authentication needed
             if any(
                 k in err_str
                 for k in (
@@ -88,7 +88,7 @@ class NavimowOAuth2Implementation(LocalOAuth2Implementation):
                 raise ConfigEntryAuthFailed(
                     f"Navimow refresh token has expired. Please re-authenticate: {err}"
                 ) from err
-            # 其他错误（网络等）原样抛出，不立即触发重新认证流程
+            # Other errors (network, etc.) are re-raised as-is; do not trigger the re-authentication flow immediately
             _LOGGER.warning(
                 "Navimow token refresh failed (possibly transient): %s", err
             )
