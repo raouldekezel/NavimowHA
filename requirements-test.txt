@@ -1,0 +1,13 @@
+# pytest CI dependencies.
+#
+# Pinning the harness is the safety anchor: pytest-homeassistant-custom-component
+# transitively pins Home Assistant (0.13.205 -> HA 2025.1.4) plus pytest and
+# pytest-asyncio, so a floating version could silently pull a newer HA and
+# break imports.
+#
+# navimow-sdk is imported at top level of custom_components/navimow/coordinator.py
+# (as mower_sdk), so tests exercising coordinator/services must import it.
+# Pin to the same >=0.1.2 that manifest.json requires; if a newer SDK breaks
+# things the CI fails visibly rather than silently at HACS install.
+pytest-homeassistant-custom-component==0.13.205
+navimow-sdk>=0.1.2

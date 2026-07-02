@@ -1,0 +1,14 @@
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# Defensive against future test files named *_test.py: enforce the single
+# convention test_*.py so pytest-homeassistant-custom-component's fixtures
+# stay discoverable.
+python_files = ["test_*.py"]
+testpaths = ["tests"]
+
+[tool.black]
+target-version = ["py311", "py312"]
+
+[tool.isort]
+profile = "black"
+known_first_party = ["custom_components", "tests"]
