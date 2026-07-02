@@ -96,6 +96,9 @@ def _make_coordinator(*, is_connected: bool, last_mqtt: float | None):
     coordinator._last_state = None
     coordinator._last_attributes = None
     coordinator._last_mqtt_update = last_mqtt
+    # BUG-03 introduces a state-specific clock; a "fresh MQTT" test setup
+    # means both clocks are recent.
+    coordinator._last_mqtt_state_update = last_mqtt
     coordinator._last_http_fetch = None
     coordinator._last_data_source = None
     coordinator.oauth_session = None
