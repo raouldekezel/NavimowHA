@@ -191,11 +191,11 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             else:
                 token = self.oauth_session.token
         except ConfigEntryAuthFailed:
-            # 确定性认证失败（refresh_token 缺失或被服务端拒绝）→ 直接上报，让 HA 引导用户重新认证
+            # Deterministic auth failure (refresh_token missing or rejected by the server) -> surface it directly so HA guides the user through re-authentication
             raise
         except Exception as err:
-            # 瞬态错误（网络超时、DNS 等）→ 不立即触发重新认证流程。
-            # 尝试沿用缓存中的 access_token；若缓存也不可用才升级为认证失败。
+            # Transient error (network timeout, DNS, etc.) -> do not trigger the re-authentication flow immediately.
+            # Try to reuse the cached access_token; only escalate to an auth failure if the cache is unavailable too.
             _LOGGER.warning(
                 "Token refresh failed (likely transient), falling back to cached token: %s",
                 err,
@@ -214,9 +214,9 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return access_token
 
     async def _async_update_data(self) -> dict[str, Any]:
-        # 每次 update 都主动刷新 token，确保 api._token 与 oauth_session 保持同步。
-        # 若仅在 HTTP fallback 时刷新，MQTT 正常推数据期间 token 长期不更新，
-        # 过期后用户下发指令会立即收到 CODE_OAUTH_INFO_ILLEGAL。
+        # Refresh the token on every update so api._token stays in sync with oauth_session.
+        # If we only refreshed during the HTTP fallback, the token would go stale while MQTT is pushing data normally,
+        # and once expired a user command would immediately get CODE_OAUTH_INFO_ILLEGAL.
         try:
             await self._async_ensure_valid_token()
         except ConfigEntryAuthFailed:
