@@ -1,0 +1,6 @@
+2026-05-22T08:00:31.891953754Z 2026-05-22 10:00:31.888 DEBUG (MainThread) [custom_components.navimow.coordinator] MQTT state received: device=REDACTED-ROBOT-SERIAL state=docked battery=23
+2026-05-27T12:04:30.465566561Z 2026-05-27 14:04:30.460 DEBUG (MainThread) [custom_components.navimow.coordinator] MQTT state received: device=REDACTED-ROBOT-SERIAL state=docked battery=100
+---
+# grep summary over 6.5 days (2026-05-22 08:00 UTC to 2026-05-28 12:24 UTC):
+# grep -c 'MQTT state received' = 478
+# grep -c 'MQTT attributes received' = 0
