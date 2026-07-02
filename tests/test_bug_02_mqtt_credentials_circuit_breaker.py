@@ -1,103 +1,188 @@
 """BUG-02 — MQTT credentials circuit-breaker fallback.
 
-When `api.async_get_mqtt_user_info()` fails, the setup path must not
-raise `ConfigEntryNotReady` (which would keep the integration in retry
-loop against a broken endpoint). Instead it must fall back to cached
-credentials from `entry.data`, so MQTT can attempt a reconnect using the
-last-known good values.
-
-These tests exercise the observable behaviour of the fallback in
-isolation without spinning up the full HA setup path.
+Tests hit the real production helpers in
+`custom_components.navimow._mqtt_credentials`. Each test is red against
+the unpatched code (the module didn't exist there) and green after the
+patch. No inline re-implementation of the logic — the helper is
+called with mocked API + hass and its return value + side effects are
+asserted.
 """
 
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 
-def test_cached_mqtt_credentials_survive_endpoint_failure() -> None:
-    """The fallback branch reads the four `cached_mqtt_*` keys from
-    entry.data. This test asserts the data structure that BUG-02
-    introduces is what the SDK constructor will consume when the API
-    call raises.
-    """
-    entry_data = {
+# --------------------------------------------------------------------- #
+# 1. pure data-shape helpers                                            #
+# --------------------------------------------------------------------- #
+
+
+def test_build_credentials_cache_maps_the_four_keys() -> None:
+    from custom_components.navimow._mqtt_credentials import build_credentials_cache
+
+    cache = build_credentials_cache(
+        {
+            "mqttHost": "mqtt-fra.navimow.com",
+            "mqttUrl": "wss://mqtt-fra.navimow.com/mqtt/REDACTED-MQTT-USERID",
+            "userName": "REDACTED-MQTT-USERID",
+            "pwdInfo": "REDACTED-MQTT-PASSWORD",
+        }
+    )
+    assert cache == {
         "cached_mqtt_host": "mqtt-fra.navimow.com",
         "cached_mqtt_url": "wss://mqtt-fra.navimow.com/mqtt/REDACTED-MQTT-USERID",
         "cached_mqtt_username": "REDACTED-MQTT-USERID",
         "cached_mqtt_password": "REDACTED-MQTT-PASSWORD",
     }
 
-    # Emulate the fallback branch: build `mqtt_info` from cache.
-    mqtt_info = {
-        "mqttHost": entry_data.get("cached_mqtt_host"),
-        "mqttUrl": entry_data.get("cached_mqtt_url"),
-        "userName": entry_data.get("cached_mqtt_username"),
-        "pwdInfo": entry_data.get("cached_mqtt_password"),
+
+def test_build_credentials_cache_null_safe_on_missing_keys() -> None:
+    from custom_components.navimow._mqtt_credentials import build_credentials_cache
+
+    cache = build_credentials_cache({"mqttHost": "x"})
+    assert cache == {
+        "cached_mqtt_host": "x",
+        "cached_mqtt_url": None,
+        "cached_mqtt_username": None,
+        "cached_mqtt_password": None,
     }
 
-    assert mqtt_info["mqttHost"] == "mqtt-fra.navimow.com"
-    assert mqtt_info["userName"] == "REDACTED-MQTT-USERID"
-    # None-safe: an empty entry.data still yields a dict, not a KeyError.
-    empty_fallback = {
-        "mqttHost": {}.get("cached_mqtt_host"),
-        "userName": {}.get("cached_mqtt_username"),
-    }
-    assert empty_fallback["mqttHost"] is None
-    assert empty_fallback["userName"] is None
 
-
-def test_successful_fetch_writes_credentials_to_entry() -> None:
-    """On a successful fetch, the four `cached_mqtt_*` keys are written
-    to entry.data via `async_update_entry`. Exercises the entry-writing
-    contract without wiring the whole setup path.
+def test_mqtt_info_from_cache_all_none_on_first_setup() -> None:
+    """First-ever setup that fails outright leaves entry.data without
+    any `cached_mqtt_*` keys. The rebuild must not crash and yield an
+    all-None mqtt_info so the SDK setup path can fall back to the hard-
+    coded defaults from const.py.
     """
+    from custom_components.navimow._mqtt_credentials import mqtt_info_from_cache
+
+    rebuilt = mqtt_info_from_cache({"unrelated": "value"})
+    assert rebuilt == {
+        "mqttHost": None,
+        "mqttUrl": None,
+        "userName": None,
+        "pwdInfo": None,
+    }
+
+
+# --------------------------------------------------------------------- #
+# 2. async resolver — success path                                      #
+# --------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_resolve_success_writes_cache_and_returns_fresh_info() -> None:
+    from custom_components.navimow._mqtt_credentials import resolve_mqtt_info
+
+    fresh = {
+        "mqttHost": "mqtt-fra.navimow.com",
+        "mqttUrl": "wss://mqtt-fra.navimow.com/mqtt/REDACTED-MQTT-USERID",
+        "userName": "REDACTED-MQTT-USERID",
+        "pwdInfo": "REDACTED-MQTT-PASSWORD",
+    }
+    api = MagicMock()
+    api.async_get_mqtt_user_info = AsyncMock(return_value=fresh)
+
     hass = MagicMock()
     hass.config_entries.async_update_entry = MagicMock()
 
     entry = MagicMock()
     entry.data = {"api_base_url": "https://navimow-fra.ninebot.com"}
 
-    mqtt_info = {
+    result = await resolve_mqtt_info(api, hass, entry)
+
+    # Contract 1: the fresh dict flows through unchanged.
+    assert result == fresh
+    # Contract 2: cache is written to entry.data with the four keys.
+    hass.config_entries.async_update_entry.assert_called_once()
+    _args, kwargs = hass.config_entries.async_update_entry.call_args
+    written = kwargs["data"]
+    assert written["cached_mqtt_host"] == "mqtt-fra.navimow.com"
+    assert written["cached_mqtt_username"] == "REDACTED-MQTT-USERID"
+    assert written["cached_mqtt_password"] == "REDACTED-MQTT-PASSWORD"
+    # Existing keys are preserved.
+    assert written["api_base_url"] == "https://navimow-fra.ninebot.com"
+
+
+# --------------------------------------------------------------------- #
+# 3. async resolver — circuit-breaker fallback path                     #
+# --------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_resolve_endpoint_failure_uses_cache_no_raise(caplog) -> None:
+    """Core BUG-02 contract: when the endpoint circuit-breaks, the
+    resolver must NOT raise ConfigEntryNotReady (which would keep HA in
+    a retry loop against the broken endpoint). Instead it returns the
+    cached credentials and logs a WARNING once.
+    """
+    import logging
+
+    from mower_sdk.errors import MowerAPIError
+
+    from custom_components.navimow._mqtt_credentials import resolve_mqtt_info
+
+    api = MagicMock()
+    api.async_get_mqtt_user_info = AsyncMock(side_effect=MowerAPIError("504 Gateway"))
+
+    hass = MagicMock()
+    hass.config_entries.async_update_entry = MagicMock()
+
+    entry = MagicMock()
+    entry.data = {
+        "cached_mqtt_host": "mqtt-fra.navimow.com",
+        "cached_mqtt_url": "wss://mqtt-fra.navimow.com/mqtt/REDACTED-MQTT-USERID",
+        "cached_mqtt_username": "REDACTED-MQTT-USERID",
+        "cached_mqtt_password": "REDACTED-MQTT-PASSWORD",
+    }
+
+    caplog.set_level(
+        logging.WARNING, logger="custom_components.navimow._mqtt_credentials"
+    )
+
+    result = await resolve_mqtt_info(api, hass, entry)
+
+    # No cache write — the endpoint failed.
+    hass.config_entries.async_update_entry.assert_not_called()
+    # Cached credentials returned in mqtt_info shape.
+    assert result == {
         "mqttHost": "mqtt-fra.navimow.com",
         "mqttUrl": "wss://mqtt-fra.navimow.com/mqtt/REDACTED-MQTT-USERID",
         "userName": "REDACTED-MQTT-USERID",
         "pwdInfo": "REDACTED-MQTT-PASSWORD",
     }
-
-    # Emulate the success branch.
-    _cached = {
-        "cached_mqtt_host": mqtt_info.get("mqttHost"),
-        "cached_mqtt_url": mqtt_info.get("mqttUrl"),
-        "cached_mqtt_username": mqtt_info.get("userName"),
-        "cached_mqtt_password": mqtt_info.get("pwdInfo"),
-    }
-    hass.config_entries.async_update_entry(entry, data={**entry.data, **_cached})
-
-    hass.config_entries.async_update_entry.assert_called_once()
-    (called_entry,), kwargs = hass.config_entries.async_update_entry.call_args
-    assert called_entry is entry
-    written = kwargs["data"]
-    assert written["cached_mqtt_host"] == "mqtt-fra.navimow.com"
-    assert written["cached_mqtt_username"] == "REDACTED-MQTT-USERID"
-    assert written["cached_mqtt_password"] == "REDACTED-MQTT-PASSWORD"
-    # Original keys are preserved.
-    assert written["api_base_url"] == "https://navimow-fra.ninebot.com"
+    # Warning logged exactly once.
+    warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "Failed to get MQTT user info" in r.message
+    ]
+    assert len(warnings) == 1
 
 
-def test_fetch_and_cache_side_effect_is_async_safe() -> None:
-    """Regression sanity: the fetch is awaited on an AsyncMock without
-    swallowing exceptions from the ConfigEntry writer.
+@pytest.mark.asyncio
+async def test_resolve_endpoint_failure_first_ever_setup_yields_null() -> None:
+    """No cache yet (first-ever setup during an outage): the resolver
+    returns an all-None mqtt_info shape so the SDK setup path falls
+    back to const.py defaults instead of raising.
     """
+    from mower_sdk.errors import MowerAPIError
+
+    from custom_components.navimow._mqtt_credentials import resolve_mqtt_info
+
     api = MagicMock()
-    api.async_get_mqtt_user_info = AsyncMock(
-        return_value={"mqttHost": "x", "userName": "u", "pwdInfo": "p", "mqttUrl": None}
-    )
+    api.async_get_mqtt_user_info = AsyncMock(side_effect=MowerAPIError("504"))
+    hass = MagicMock()
+    entry = MagicMock()
+    entry.data = {}
 
-    async def _driver() -> dict:
-        return await api.async_get_mqtt_user_info()
+    result = await resolve_mqtt_info(api, hass, entry)
 
-    import asyncio
-
-    result = asyncio.new_event_loop().run_until_complete(_driver())
-    assert result["mqttHost"] == "x"
+    assert result == {
+        "mqttHost": None,
+        "mqttUrl": None,
+        "userName": None,
+        "pwdInfo": None,
+    }

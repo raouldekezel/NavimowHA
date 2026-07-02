@@ -127,39 +127,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not devices:
             _LOGGER.warning("No Navimow devices found")
 
-        # 获取 MQTT 连接信息并创建 SDK
-        try:
-            mqtt_info = await api.async_get_mqtt_user_info()
-            # Cache credentials in entry.data so they survive transient outages
-            # of the /openapi/mqtt/userInfo/get/v2 endpoint (BUG-02).
-            _cached = {
-                "cached_mqtt_host": mqtt_info.get("mqttHost"),
-                "cached_mqtt_url": mqtt_info.get("mqttUrl"),
-                "cached_mqtt_username": mqtt_info.get("userName"),
-                "cached_mqtt_password": mqtt_info.get("pwdInfo"),
-            }
-            hass.config_entries.async_update_entry(
-                entry, data={**entry.data, **_cached}
-            )
-        except MowerAPIError as err:
-            # The Segway API applies a circuit-breaker pattern on this endpoint.
-            # Repeated HA retries (ConfigEntryNotReady every ~80 s) keep the
-            # breaker open indefinitely. Treat the failure as non-fatal: fall
-            # back to credentials cached from a previous successful call, or
-            # to the hardcoded defaults. The coordinator's HTTP fallback keeps
-            # the entity available even without MQTT (BUG-02).
-            _LOGGER.warning(
-                "Failed to get MQTT user info (%s) — falling back to cached/default "
-                "MQTT config. Real-time MQTT updates may be unavailable until the "
-                "Segway API recovers.",
-                err,
-            )
-            mqtt_info = {
-                "mqttHost": entry.data.get("cached_mqtt_host"),
-                "mqttUrl": entry.data.get("cached_mqtt_url"),
-                "userName": entry.data.get("cached_mqtt_username"),
-                "pwdInfo": entry.data.get("cached_mqtt_password"),
-            }
+        # Cache credentials on success + fall back to cached ones on
+        # MowerAPIError (BUG-02). Logic extracted into `_mqtt_credentials`
+        # so the observable behaviour is reachable from tests without
+        # spinning up the full HA harness.
+        from ._mqtt_credentials import resolve_mqtt_info
+
+        mqtt_info = await resolve_mqtt_info(api, hass, entry)
 
         mqtt_host = mqtt_info.get("mqttHost") or entry.data.get(
             "mqtt_broker", MQTT_BROKER
