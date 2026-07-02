@@ -149,8 +149,20 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         cached_state = self.sdk.get_cached_state(self.device.id)
         if cached_state is not None:
-            self._last_state = cached_state
-            self._last_data_source = "mqtt_cache"
+            # BUG-04: don't overwrite a fresher HTTP fallback state with the
+            # SDK's cached MQTT state. The SDK caches the last MQTT push
+            # indefinitely; when MQTT reports a stale value (e.g. battery=0
+            # after an over-discharge, or battery=100 while charging), that
+            # cache would keep clobbering the fresher HTTP status every tick.
+            # Skip re-applying the cache when HTTP is newer than the last
+            # observed MQTT state push. Ref segwaynavimow/NavimowHA#11.
+            http_is_newer = self._last_http_fetch is not None and (
+                self._last_mqtt_state_update is None
+                or self._last_http_fetch > self._last_mqtt_state_update
+            )
+            if not http_is_newer:
+                self._last_state = cached_state
+                self._last_data_source = "mqtt_cache"
 
         cached_attrs = self.sdk.get_cached_attributes(self.device.id)
         if cached_attrs is not None:
