@@ -125,14 +125,17 @@ def test_handle_location_item_type_1_populates_position() -> None:
     coordinator.async_set_updated_data.assert_called_once()
 
 
-def test_handle_location_item_ignores_non_type_1() -> None:
+def test_handle_location_item_ignores_type_3_heartbeat() -> None:
+    """type 3 is a heartbeat (`{time, type}`) with no pose payload — it
+    must be silently ignored and not affect coordinator.position or
+    vehicle_state. FEAT-02 handles type 2; FEAT-01 covers only that the
+    non-pose paths don't leak into the pose state.
+    """
     coordinator = _make_coordinator()
     with patch(
         "custom_components.navimow.coordinator.async_dispatcher_send"
     ) as dispatcher:
-        coordinator.handle_location_item(
-            {"type": 2, "mowingPercentage": 42, "subtotalArea": "12.3"}
-        )
+        coordinator.handle_location_item({"type": 3, "time": 1_779_570_004_762})
 
     assert coordinator.position is None
     assert coordinator.vehicle_state is None
