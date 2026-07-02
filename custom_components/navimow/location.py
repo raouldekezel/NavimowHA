@@ -76,9 +76,10 @@ def parse_location_type_2(item: dict[str, Any]) -> dict[str, Any] | None:
     - `action` (int; sub-state code observed 5/8/-1, semantics TBD)
 
     Returns `None` only when the item is not a mapping. The individual
-    fields fall back to `None` on parse errors — the /location channel
-    intermittently omits fields depending on activity, so a "sparse
-    type 2" is still a valid stats update.
+    fields fall back to `None` on parse errors — the operator's 2026-05-25
+    multizone run (diag #20) captured only full type-2 packets, but the
+    parser is defensively tolerant of sparse variants should another
+    Navimow firmware emit them.
     """
     if not isinstance(item, dict):
         return None

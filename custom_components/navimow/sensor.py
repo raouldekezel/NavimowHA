@@ -62,16 +62,16 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
         ),
     ),
     NavimowSensorEntityDescription(
-        key="surface_semaine",
-        translation_key="surface_semaine",
+        key="weekly_area",
+        translation_key="weekly_area",
         native_unit_of_measurement=UnitOfArea.SQUARE_METERS,
         state_class=SensorStateClass.TOTAL_INCREASING,
         icon="mdi:grass",
         value_fn=lambda c: (c.stats or {}).get("area_week"),
     ),
     NavimowSensorEntityDescription(
-        key="zone_courante",
-        translation_key="zone_courante",
+        key="current_zone",
+        translation_key="current_zone",
         icon="mdi:map-marker-radius",
         value_fn=lambda c: (
             f"#{b}" if (b := (c.stats or {}).get("boundary")) is not None else None

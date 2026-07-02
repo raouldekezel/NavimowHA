@@ -2,14 +2,13 @@
 
 Extends FEAT-01's parser and coordinator to handle mowing stats
 (mowingPercentage, currentMowProgress, subtotalArea, mowingWeekArea,
-currentMowBoundary). Adds three sensors: progression, surface_semaine,
-zone_courante.
+currentMowBoundary). Adds three sensors: progression, weekly_area,
+current_zone.
 """
 
 from __future__ import annotations
 
 from unittest.mock import MagicMock
-
 
 # --------------------------------------------------------------------- #
 # 1. parser                                                             #
@@ -41,9 +40,11 @@ def test_parse_location_type_2_full_payload() -> None:
 
 
 def test_parse_location_type_2_sparse_payload() -> None:
-    """Sparse type-2 packets (only mowingWeekArea, or only boundary) are
-    observed on the /location channel — the parser fills the rest with
-    None rather than dropping the item.
+    """Sparse type-2 packets (only mowingWeekArea, or only boundary) were
+    NOT observed in the operator's 2026-05-25 multizone run (diag #20),
+    but the parser is defensively tolerant should another Navimow
+    firmware emit them: fill omitted fields with None instead of
+    dropping the item.
     """
     from custom_components.navimow.location import parse_location_type_2
 
@@ -159,21 +160,21 @@ def test_progression_sensor_reads_mowing_percentage() -> None:
     assert attrs["action"] == 5
 
 
-def test_surface_semaine_sensor_reads_area_week() -> None:
-    desc = _find_sensor("surface_semaine")
+def test_weekly_area_sensor_reads_area_week() -> None:
+    desc = _find_sensor("weekly_area")
     coordinator = MagicMock()
     coordinator.stats = {"area_week": 620.75}
 
     assert desc.value_fn(coordinator) == 620.75
 
 
-def test_zone_courante_sensor_renders_hash_prefixed() -> None:
+def test_current_zone_sensor_renders_hash_prefixed() -> None:
     """Boundary id is not sequential (1 = zone 1, 2 = tunnel/transit, 3 =
     zone 2 on the operator's install). Rendered as `#<id>` so the user
     can't confuse it with a sequential zone number. FEAT-04 (zone
     registry) will resolve the label later.
     """
-    desc = _find_sensor("zone_courante")
+    desc = _find_sensor("current_zone")
     coordinator = MagicMock()
     coordinator.stats = {"boundary": 3}
 
@@ -190,6 +191,6 @@ def test_sensors_return_none_when_stats_empty() -> None:
     coordinator = MagicMock()
     coordinator.stats = None
 
-    for key in ("progression", "surface_semaine", "zone_courante"):
+    for key in ("progression", "weekly_area", "current_zone"):
         desc = _find_sensor(key)
         assert desc.value_fn(coordinator) is None

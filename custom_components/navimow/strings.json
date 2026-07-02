@@ -40,10 +40,10 @@
       "progression": {
         "name": "Progression"
       },
-      "surface_semaine": {
+      "weekly_area": {
         "name": "Weekly area"
       },
-      "zone_courante": {
+      "current_zone": {
         "name": "Current zone"
       }
     },
