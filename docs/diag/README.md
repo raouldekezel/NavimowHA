@@ -12,6 +12,7 @@ either drives a feature design or validates it.
 
 | Date       | Bug | Question | Answer (TL;DR) | Link |
 | ---------- | --- | -------- | -------------- | ---- |
+| 2026-05-22 | [BUG-01](https://github.com/raouldekezel/NavimowHA/issues/3) | With upstream v1.1.0 timings (`HTTP_FALLBACK_MIN_INTERVAL=3600`), how long does HA actually stay stale after a routine MQTT disconnect? | 55 minutes measured in vivo (10:07:34 → 11:03 CEST): `http_ts=3722293.595...` frozen across ~110 coordinator ticks because the fallback poll is throttled to 1 h. Reducing to 60 s (BUG-01) shrinks the same gap ~60×. | [2026-05-22_bug-01_silent-mqtt-stale-pre-fix](2026-05-22_bug-01_silent-mqtt-stale-pre-fix/findings.md) |
 
 ## Layout
 
