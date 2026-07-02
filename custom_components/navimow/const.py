@@ -36,11 +36,21 @@ MQTT_PASSWORD: Final | None = None
 # 更新间隔（秒）
 UPDATE_INTERVAL: Final = 30
 
-# MQTT 超时时间（秒），超过该时间未收到消息则走 HTTP 兜底
-MQTT_STALE_SECONDS: Final = 300
+# MQTT staleness threshold (seconds). Beyond this without an MQTT push, the
+# coordinator falls back to an HTTP poll. Reduced from 300 to 90 so silent
+# MQTT outages surface in HA within ~90 s instead of ~5 min (BUG-01).
+MQTT_STALE_SECONDS: Final = 90
 
-# HTTP 兜底最小拉取间隔（秒），避免频繁请求
-HTTP_FALLBACK_MIN_INTERVAL: Final = 3600
+# HTTP fallback minimum interval (seconds) — throttles the fallback poll to
+# avoid hammering the cloud when MQTT is intermittently degraded. Reduced from
+# 3600 (1 h) to 60 so a stuck HA entity recovers in ~1 min instead of ~1 h
+# (BUG-01).
+HTTP_FALLBACK_MIN_INTERVAL: Final = 60
+
+# MQTT protocol-layer keepalive (seconds), used to detect half-open connections
+# faster than the cloud's own 1-hour connection drop. Reduced from an implicit
+# 2400 to 120 (BUG-01).
+MQTT_KEEPALIVE_SECONDS: Final = 120
 
 # MowerStatus 到 LawnMowerActivity 的映射
 MOWER_STATUS_TO_ACTIVITY = {

@@ -81,7 +81,25 @@ the unpatched code and green after the patch.
 
 **No source tests.** A test asserts observable behaviour (return values,
 log records, `hasattr`, entity state changes), not the text of a source
-file. `inspect.getsource(...) + re.search(...)` is forbidden.
+file. Forbidden: `inspect.getsource(...) + re.search(...)`,
+`Path(src).read_text() + re.findall`, any `open("...py").read()` grep.
+
+| Invariant to pin | Correct alternative |
+| --- | --- |
+| Attribute / method removed | `assert not hasattr(Cls, "X")` |
+| SDK called with the right value | `unittest.mock.patch(...)` + `.assert_called_with(...)` |
+| Log emitted | `caplog.records` filtered by level/message |
+| Data structure (translations, manifests, YAML) | read the **data file** (JSON/YAML) — that's not source, it's the contract |
+| Structural import (« symbol no longer referenced anywhere ») | AST tooling (`ast.parse` + walk), not a textual grep |
+
+Source-level greps lock the *syntax* rather than the *semantics*: a
+whitespace-equivalent refactor breaks the test, and a semantically
+equivalent workaround (rename, aliased constant) passes the test
+without preserving the behaviour. Neither is what we want.
+
+Rare exception: an audit-secrets tripwire, filed as its own decision
+with a clear rationale (see the sibling S2000 fork's `test_sec_debug_secrets.py`
+kept under CHORE-02 / issue #77).
 
 ## Diagnostic sessions
 

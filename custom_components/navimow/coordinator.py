@@ -55,6 +55,12 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_mqtt_update: float | None = None
         self._last_http_fetch: float | None = None
         self._last_data_source: str | None = None
+        # BUG-01: edge-trigger the MQTT disconnect WARNING/reconnect INFO
+        # pair, so a routine 1 h outage produces one WARNING (on entry) and
+        # one INFO (when the SDK reports the WSS session back up), not
+        # ~120 identical lines. Flag flips True once we have emitted the
+        # WARNING; flips False once we have emitted the paired INFO.
+        self._mqtt_disconnect_warned: bool = False
 
     async def async_setup(self) -> None:
         """Register callbacks from SDK."""
@@ -153,12 +159,38 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._last_http_fetch is None
             or now - self._last_http_fetch > HTTP_FALLBACK_MIN_INTERVAL
         )
+        # Edge-triggered MQTT connectivity log — WARNING when we first
+        # notice the WSS is down AND the state has aged past the stale
+        # threshold (i.e. this is an actionable outage, not a routine
+        # reconnect blip), INFO when the SDK reports the WSS back up.
+        # Prevents log spam (~120 identical lines over a 1 h outage) and
+        # decouples "connectivity recovered" from "state is fresh again"
+        # so a lingering HTTP-fallback-only mode still reports the
+        # reconnect the moment it happens.
+        if (
+            not self._mqtt_disconnect_warned
+            and is_mqtt_stale
+            and not self.sdk.is_connected
+        ):
+            _LOGGER.warning(
+                "MQTT appears disconnected for device %s; relying on HTTP fallback",
+                self.device.id,
+            )
+            self._mqtt_disconnect_warned = True
+        elif self._mqtt_disconnect_warned and self.sdk.is_connected:
+            _LOGGER.info("MQTT reconnected for device %s", self.device.id)
+            self._mqtt_disconnect_warned = False
+
         if is_mqtt_stale and can_http_fetch:
             try:
                 status = await self.api.async_get_device_status(self.device.id)
                 self._last_state = self._device_status_to_state(status)
                 self._last_http_fetch = now
                 self._last_data_source = "http_fallback"
+                _LOGGER.info(
+                    "HTTP fallback succeeded for device %s (MQTT stale)",
+                    self.device.id,
+                )
             except ConfigEntryAuthFailed:
                 raise
             except Exception as err:
