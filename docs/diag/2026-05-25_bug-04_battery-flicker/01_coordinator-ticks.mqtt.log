@@ -1,0 +1,38 @@
+2026-05-25T13:00:29.379695804Z 2026-05-25 15:00:29.376 INFO (MainThread) [custom_components.navimow.coordinator] HTTP fallback succeeded for device REDACTED-ROBOT-SERIAL (MQTT stale)
+2026-05-25T13:00:29.381464090Z 2026-05-25 15:00:29.376 DEBUG (MainThread) [custom_components.navimow.coordinator] Manually updated navimow data
+2026-05-25T13:00:29.382478756Z 2026-05-25 15:00:29.377 DEBUG (MainThread) [custom_components.navimow.coordinator] Coordinator update: device=REDACTED-ROBOT-SERIAL source=http_fallback mqtt_ts=3998732.670363963 mqtt_state_ts=3998732.670363963 http_ts=3999068.168502428
+2026-05-25T13:00:29.383731598Z 2026-05-25 15:00:29.378 DEBUG (MainThread) [custom_components.navimow.coordinator] Finished fetching navimow data in 0.135 seconds (success: True)
+2026-05-25T13:00:59.245954634Z 2026-05-25 15:00:59.244 DEBUG (MainThread) [custom_components.navimow.coordinator] Coordinator update: device=REDACTED-ROBOT-SERIAL source=http_fallback mqtt_ts=3998732.670363963 mqtt_state_ts=3998732.670363963 http_ts=3999068.168502428
+2026-05-25T13:00:59.246497883Z 2026-05-25 15:00:59.244 DEBUG (MainThread) [custom_components.navimow.coordinator] Finished fetching navimow data in 0.000 seconds (success: True)
+2026-05-25T13:01:29.433847302Z 2026-05-25 15:01:29.430 INFO (MainThread) [custom_components.navimow.coordinator] HTTP fallback succeeded for device REDACTED-ROBOT-SERIAL (MQTT stale)
+2026-05-25T13:01:29.437056634Z 2026-05-25 15:01:29.431 DEBUG (MainThread) [custom_components.navimow.coordinator] Manually updated navimow data
+2026-05-25T13:01:29.437604989Z 2026-05-25 15:01:29.432 DEBUG (MainThread) [custom_components.navimow.coordinator] Coordinator update: device=REDACTED-ROBOT-SERIAL source=http_fallback mqtt_ts=3998732.670363963 mqtt_state_ts=3998732.670363963 http_ts=3999128.168520327
+2026-05-25T13:01:29.438452014Z 2026-05-25 15:01:29.432 DEBUG (MainThread) [custom_components.navimow.coordinator] Finished fetching navimow data in 0.189 seconds (success: True)
+2026-05-25T13:01:31.938672349Z 2026-05-25 15:01:31.931 DEBUG (MainThread) [custom_components.navimow.coordinator] Manually updated navimow data
+2026-05-25T13:02:01.245937680Z 2026-05-25 15:02:01.244 DEBUG (MainThread) [custom_components.navimow.coordinator] Coordinator update: device=REDACTED-ROBOT-SERIAL source=http_fallback mqtt_ts=3998732.670363963 mqtt_state_ts=3998732.670363963 http_ts=3999128.168520327
+2026-05-25T13:02:01.246375360Z 2026-05-25 15:02:01.244 DEBUG (MainThread) [custom_components.navimow.coordinator] Finished fetching navimow data in 0.000 seconds (success: True)
+2026-05-25T13:02:31.376994073Z 2026-05-25 15:02:31.374 INFO (MainThread) [custom_components.navimow.coordinator] HTTP fallback succeeded for device REDACTED-ROBOT-SERIAL (MQTT stale)
+2026-05-25T13:02:31.378848808Z 2026-05-25 15:02:31.374 DEBUG (MainThread) [custom_components.navimow.coordinator] Manually updated navimow data
+2026-05-25T13:02:31.380653328Z 2026-05-25 15:02:31.375 DEBUG (MainThread) [custom_components.navimow.coordinator] Coordinator update: device=REDACTED-ROBOT-SERIAL source=http_fallback mqtt_ts=3998732.670363963 mqtt_state_ts=3998732.670363963 http_ts=3999190.168221279
+2026-05-25T13:02:31.381594650Z 2026-05-25 15:02:31.375 DEBUG (MainThread) [custom_components.navimow.coordinator] Finished fetching navimow data in 0.132 seconds (success: True)
+2026-05-25T13:02:35.946768785Z 2026-05-25 15:02:35.939 DEBUG (MainThread) [custom_components.navimow.coordinator] Manually updated navimow data
+2026-05-25T13:03:05.244433552Z 2026-05-25 15:03:05.243 DEBUG (MainThread) [custom_components.navimow.coordinator] Coordinator update: device=REDACTED-ROBOT-SERIAL source=http_fallback mqtt_ts=3998732.670363963 mqtt_state_ts=3998732.670363963 http_ts=3999190.168221279
+2026-05-25T13:03:05.245647588Z 2026-05-25 15:03:05.243 DEBUG (MainThread) [custom_components.navimow.coordinator] Finished fetching navimow data in 0.000 seconds (success: True)
+2026-05-25T13:03:35.394751135Z 2026-05-25 15:03:35.390 INFO (MainThread) [custom_components.navimow.coordinator] HTTP fallback succeeded for device REDACTED-ROBOT-SERIAL (MQTT stale)
+2026-05-25T13:03:35.397071039Z 2026-05-25 15:03:35.390 DEBUG (MainThread) [custom_components.navimow.coordinator] Manually updated navimow data
+2026-05-25T13:03:35.398650654Z 2026-05-25 15:03:35.391 DEBUG (MainThread) [custom_components.navimow.coordinator] Coordinator update: device=REDACTED-ROBOT-SERIAL source=http_fallback mqtt_ts=3998732.670363963 mqtt_state_ts=3998732.670363963 http_ts=3999254.168293547
+2026-05-25T13:03:35.399072192Z 2026-05-25 15:03:35.391 DEBUG (MainThread) [custom_components.navimow.coordinator] Finished fetching navimow data in 0.148 seconds (success: True)
+2026-05-25T13:03:55.896908373Z 2026-05-25 15:03:55.890 DEBUG (MainThread) [custom_components.navimow.coordinator] Manually updated navimow data
+2026-05-25T13:04:25.246123160Z 2026-05-25 15:04:25.244 DEBUG (MainThread) [custom_components.navimow.coordinator] Coordinator update: device=REDACTED-ROBOT-SERIAL source=http_fallback mqtt_ts=3998732.670363963 mqtt_state_ts=3998732.670363963 http_ts=3999254.168293547
+2026-05-25T13:04:25.246517315Z 2026-05-25 15:04:25.244 DEBUG (MainThread) [custom_components.navimow.coordinator] Finished fetching navimow data in 0.000 seconds (success: True)
+2026-05-25T13:04:55.365065565Z 2026-05-25 15:04:55.363 INFO (MainThread) [custom_components.navimow.coordinator] HTTP fallback succeeded for device REDACTED-ROBOT-SERIAL (MQTT stale)
+2026-05-25T13:04:55.365765622Z 2026-05-25 15:04:55.363 DEBUG (MainThread) [custom_components.navimow.coordinator] Manually updated navimow data
+2026-05-25T13:04:55.366125260Z 2026-05-25 15:04:55.364 DEBUG (MainThread) [custom_components.navimow.coordinator] Coordinator update: device=REDACTED-ROBOT-SERIAL source=http_fallback mqtt_ts=3998732.670363963 mqtt_state_ts=3998732.670363963 http_ts=3999334.169301655
+2026-05-25T13:04:55.366328816Z 2026-05-25 15:04:55.364 DEBUG (MainThread) [custom_components.navimow.coordinator] Finished fetching navimow data in 0.120 seconds (success: True)
+2026-05-25T13:05:25.246248362Z 2026-05-25 15:05:25.244 DEBUG (MainThread) [custom_components.navimow.coordinator] Coordinator update: device=REDACTED-ROBOT-SERIAL source=http_fallback mqtt_ts=3998732.670363963 mqtt_state_ts=3998732.670363963 http_ts=3999334.169301655
+2026-05-25T13:05:25.246771349Z 2026-05-25 15:05:25.244 DEBUG (MainThread) [custom_components.navimow.coordinator] Finished fetching navimow data in 0.000 seconds (success: True)
+2026-05-25T13:05:26.011032674Z 2026-05-25 15:05:26.001 DEBUG (MainThread) [custom_components.navimow.coordinator] Manually updated navimow data
+2026-05-25T13:05:55.244441399Z 2026-05-25 15:05:55.243 DEBUG (MainThread) [custom_components.navimow.coordinator] Coordinator update: device=REDACTED-ROBOT-SERIAL source=http_fallback mqtt_ts=3998732.670363963 mqtt_state_ts=3998732.670363963 http_ts=3999334.169301655
+2026-05-25T13:05:55.244733018Z 2026-05-25 15:05:55.243 DEBUG (MainThread) [custom_components.navimow.coordinator] Finished fetching navimow data in 0.000 seconds (success: True)
+2026-05-25T13:05:56.001611464Z 2026-05-25 15:05:55.996 DEBUG (MainThread) [custom_components.navimow.coordinator] MQTT state received: device=REDACTED-ROBOT-SERIAL state=mowing battery=46
+2026-05-25T13:05:56.001733209Z 2026-05-25 15:05:55.996 DEBUG (MainThread) [custom_components.navimow.coordinator] Manually updated navimow data
