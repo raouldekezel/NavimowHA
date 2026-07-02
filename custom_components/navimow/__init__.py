@@ -1,4 +1,5 @@
 """The Navimow integration."""
+
 import asyncio
 import logging
 from typing import Any
@@ -13,14 +14,14 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .auth import NavimowOAuth2Implementation
 from .const import (
-    DOMAIN,
+    API_BASE_URL,
     CLIENT_ID,
     CLIENT_SECRET,
-    API_BASE_URL,
+    DOMAIN,
     MQTT_BROKER,
+    MQTT_PASSWORD,
     MQTT_PORT,
     MQTT_USERNAME,
-    MQTT_PASSWORD,
 )
 from .services import async_setup_services
 
@@ -54,9 +55,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     from mower_sdk.api import MowerAPI
     from mower_sdk.errors import MowerAPIError
     from mower_sdk.sdk import NavimowSDK
-    
+
     from .coordinator import NavimowCoordinator
-    
+
     hass.data.setdefault(DOMAIN, {})
 
     def _mask_secret(value: str | None) -> str:
@@ -68,8 +69,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     try:
         # 获取 OAuth2 实现
-        implementation = await config_entry_oauth2_flow.async_get_config_entry_implementation(
-            hass, entry
+        implementation = (
+            await config_entry_oauth2_flow.async_get_config_entry_implementation(
+                hass, entry
+            )
         )
         if not isinstance(implementation, NavimowOAuth2Implementation):
             raise ConfigEntryAuthFailed("Invalid OAuth2 implementation")
@@ -172,10 +175,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         def _attach_mqtt_debug_hooks(sdk: NavimowSDK, api: MowerAPI) -> None:
             mqtt = sdk._mqtt
             original_on_message = mqtt.on_message
+
             def _get_client_id() -> str:
                 client_id_bytes = getattr(mqtt.client, "_client_id", b"")
                 if isinstance(client_id_bytes, (bytes, bytearray)):
-                    return client_id_bytes.decode("utf-8", errors="replace") or "<empty>"
+                    return (
+                        client_id_bytes.decode("utf-8", errors="replace") or "<empty>"
+                    )
                 return str(client_id_bytes) if client_id_bytes else "<empty>"
 
             async def _on_connected() -> None:
@@ -210,7 +216,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 # 若已有刷新在进行中，跳过本次——broker 批量断连会并发触发多次回调，
                 # 只需执行一次凭据刷新即可，重复执行会导致 paho client 孤儿累积。
                 if _mqtt_refresh_lock.locked():
-                    _LOGGER.debug("MQTT credential refresh already in progress, skipping duplicate disconnect callback")
+                    _LOGGER.debug(
+                        "MQTT credential refresh already in progress, skipping duplicate disconnect callback"
+                    )
                     return
                 async with _mqtt_refresh_lock:
                     if _unload_flag[0]:
@@ -258,7 +266,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             await asyncio.sleep(25)
             _LOGGER.info("MQTT status probe (30s): connected=%s", sdk.is_connected)
 
-        async def _async_refresh_mqtt_credentials(sdk: NavimowSDK, api: MowerAPI) -> None:
+        async def _async_refresh_mqtt_credentials(
+            sdk: NavimowSDK, api: MowerAPI
+        ) -> None:
             """Token 过期或 MQTT 断连后，重新获取 MQTT 凭据并更新 SDK。
 
             服务端下发的 userName/pwdInfo 与 OAuth token 绑定，token 刷新后需同步更新，
@@ -284,7 +294,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     api.set_token(new_access_token)
                     new_auth_headers = {"Authorization": f"Bearer {new_access_token}"}
             except Exception as err:
-                _LOGGER.warning("Failed to refresh OAuth token before MQTT credential refresh: %s", err)
+                _LOGGER.warning(
+                    "Failed to refresh OAuth token before MQTT credential refresh: %s",
+                    err,
+                )
 
             try:
                 new_mqtt_info = await api.async_get_mqtt_user_info()
@@ -300,12 +313,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 _new_auth_headers = new_auth_headers
                 _new_username = new_username
                 _new_password = new_password
+
                 def _do_credential_update() -> None:
                     sdk.update_mqtt_credentials(
                         auth_headers=_new_auth_headers,
                         username=_new_username,
                         password=_new_password,
                     )
+
                 await hass.async_add_executor_job(_do_credential_update)
                 _LOGGER.info(
                     "MQTT credentials refreshed from server: username=%s",
@@ -397,5 +412,3 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.data[DOMAIN].pop(entry.entry_id)
 
     return unload_ok
-
-

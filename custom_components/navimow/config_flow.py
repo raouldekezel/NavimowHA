@@ -1,5 +1,7 @@
 """Config flow for Navimow integration."""
+
 from __future__ import annotations
+
 import logging
 from typing import Any
 
@@ -10,14 +12,14 @@ from homeassistant.helpers import config_entry_oauth2_flow
 
 from .auth import NavimowOAuth2Implementation
 from .const import (
-    DOMAIN,
+    API_BASE_URL,
     CLIENT_ID,
     CLIENT_SECRET,
-    API_BASE_URL,
+    DOMAIN,
     MQTT_BROKER,
+    MQTT_PASSWORD,
     MQTT_PORT,
     MQTT_USERNAME,
-    MQTT_PASSWORD,
 )
 
 _LOGGER = logging.getLogger(__name__)

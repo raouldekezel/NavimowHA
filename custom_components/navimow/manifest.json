@@ -2,11 +2,11 @@
   "domain": "navimow",
   "name": "Navimow",
   "codeowners": [
-    "@segwaynavimow"
+    "@raouldekezel"
   ],
   "config_flow": true,
-  "documentation": "https://github.com/segwaynavimow/NavimowHA",
-  "issue_tracker": "https://github.com/segwaynavimow/NavimowHA/issues",
+  "documentation": "https://github.com/raouldekezel/NavimowHA",
+  "issue_tracker": "https://github.com/raouldekezel/NavimowHA/issues",
   "iot_class": "cloud_polling",
   "requirements": [
     "navimow-sdk>=0.1.2"

@@ -1,0 +1,30 @@
+name: Check diag index
+
+# Enforces that the ## Sessions table in docs/diag/README.md stays in sync
+# with the actual docs/diag/YYYY-MM-DD_*/ subdirectory list. Mandated by
+# docs/diag/README.md (the table IS the index — drift breaks discoverability).
+# Skips when neither the index nor the diag tree is touched, so it adds no
+# latency to PRs that don't change docs/diag/.
+
+# yamllint disable-line rule:truthy
+on:
+  push:
+    paths:
+      - "docs/diag/**"
+      - "scripts/check_diag_index.py"
+      - ".github/workflows/check-diag-index.yaml"
+  pull_request:
+    paths:
+      - "docs/diag/**"
+      - "scripts/check_diag_index.py"
+      - ".github/workflows/check-diag-index.yaml"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python3 scripts/check_diag_index.py

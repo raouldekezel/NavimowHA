@@ -1,4 +1,5 @@
 """DataUpdateCoordinator for Navimow integration."""
+
 import logging
 import time
 from datetime import timedelta
@@ -8,7 +9,6 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import config_entry_oauth2_flow
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
-
 from mower_sdk.api import MowerAPI
 from mower_sdk.models import (
     Device,
@@ -110,7 +110,8 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # 瞬态错误（网络超时、DNS 等）→ 不立即触发重新认证流程。
             # 尝试沿用缓存中的 access_token；若缓存也不可用才升级为认证失败。
             _LOGGER.warning(
-                "Token refresh failed (likely transient), falling back to cached token: %s", err
+                "Token refresh failed (likely transient), falling back to cached token: %s",
+                err,
             )
             cached = getattr(self.oauth_session, "token", None)
             if cached and cached.get("access_token"):

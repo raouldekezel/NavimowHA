@@ -1,4 +1,5 @@
 """OAuth2 implementation for Navimow integration."""
+
 import logging
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -69,7 +70,17 @@ class NavimowOAuth2Implementation(LocalOAuth2Implementation):
         except Exception as err:
             err_str = str(err).lower()
             # 服务端明确拒绝（401/403/invalid/expired）→ 需要重新认证
-            if any(k in err_str for k in ("401", "403", "invalid", "expired", "unauthorized", "forbidden")):
+            if any(
+                k in err_str
+                for k in (
+                    "401",
+                    "403",
+                    "invalid",
+                    "expired",
+                    "unauthorized",
+                    "forbidden",
+                )
+            ):
                 _LOGGER.warning(
                     "Navimow refresh token rejected by server (%s). Re-authentication required.",
                     err,
@@ -78,5 +89,7 @@ class NavimowOAuth2Implementation(LocalOAuth2Implementation):
                     f"Navimow refresh token has expired. Please re-authenticate: {err}"
                 ) from err
             # 其他错误（网络等）原样抛出，不立即触发重新认证流程
-            _LOGGER.warning("Navimow token refresh failed (possibly transient): %s", err)
+            _LOGGER.warning(
+                "Navimow token refresh failed (possibly transient): %s", err
+            )
             raise
