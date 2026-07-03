@@ -508,6 +508,12 @@ class RunTracker:
         p_sub = parsed.get("area_session")
         p_wk = parsed.get("area_week")
 
+        # `p_sub > c_sub` (STRICT — Fable review 2 on #49): allowing
+        # `>=` lets a repeat of the same poison packet confirm its own
+        # predecessor, destroying the live run. Strictness costs
+        # nothing on the observed data (any genuine mowing successor
+        # advances `sub` in a single 30-90 s cadence at 2.0-2.7 m²/min);
+        # a frozen-transit corner heals in transit duration + 1 packet.
         coherent = (
             c_time is not None
             and c_sub is not None
@@ -516,7 +522,7 @@ class RunTracker:
             and p_sub is not None
             and p_wk is not None
             and p_time > c_time
-            and p_sub >= c_sub
+            and p_sub > c_sub
             and abs((p_wk - p_sub) - (c_wk - c_sub)) <= INVARIANT_TOLERANCE_M2
         )
 

@@ -833,7 +833,8 @@ def test_mixed_epoch_packet_does_not_destroy_open_run() -> None:
 def test_pending_reset_confirmed_by_coherent_successor() -> None:
     """A pending reset above `RESET_SUB_CEILING` is promoted to a real
     reset iff the next accepted packet coherently continues the
-    candidate: strictly later `time`, `sub ≥` candidate, and the
+    candidate: strictly later `time`, `sub >` candidate (strict, so an
+    identical repeat cannot confirm — Fable review 2 on #49), and the
     candidate's implied anchor (`wk - sub`) matches within the layer-3
     tolerance. Emits `run_finished(interrupted)` + `run_started`
     retroactively, with the new run anchored at the candidate.
@@ -1041,3 +1042,190 @@ def test_tick_arms_interrupt_timer_when_paused_docked() -> None:
     events = tracker.tick()
     assert [e.kind for e in events] == [EVENT_RUN_FINISHED]
     assert events[0].payload["result"] == RESULT_INTERRUPTED
+
+
+# --------------------------------------------------------------------- #
+# 16. Pending reset — identical repeat cannot confirm (strict `>`)      #
+# --------------------------------------------------------------------- #
+
+
+def test_identical_repeat_pending_packets_never_confirm() -> None:
+    """Fable review 2 on #49: two mixed-epoch packets with identical
+    content and successive fresh timestamps used to confirm each other
+    under `p_sub >= c_sub`, destroying the live run. With strict
+    `p_sub > c_sub` the second poison merely supersedes the stash, the
+    run stays intact, and the next genuine packet discards the
+    candidate via the anchor check.
+
+    Values lifted from Fable's reproduction: mid-run at `sub=200,
+    wk=500 → wk₀=300`, two poisons at `sub=150, wk=500`
+    (implied anchor 350), then a genuine `sub=205, wk=505`
+    (anchor 300 — original run continues).
+    """
+    tracker = RunTracker()
+
+    # Healthy run to sub=200, wk₀ = 300.
+    _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 40,
+                "subtotalArea": "200.0",
+                "mowingWeekArea": "500.0",
+                "mowStartType": 1,
+                "time": 2_000_000_000_000,
+            }
+        ],
+    )
+    original_start = tracker.current_run["start_time"]
+    assert tracker.current_run["wk0"] == 300.0
+
+    # Two identical poisons with successive `time`.
+    poison_a = {
+        "type": 2,
+        "currentMowBoundary": 1,
+        "mowingPercentage": 40,
+        "subtotalArea": "150.0",
+        "mowingWeekArea": "500.0",
+        "mowStartType": 1,
+        "time": 2_000_000_120_000,
+    }
+    poison_b = dict(poison_a, time=2_000_000_240_000)
+    events_ab = _feed(tracker, [poison_a, poison_b])
+    assert events_ab == []
+    assert tracker.state == STATE_RUNNING
+    assert tracker.current_run["start_time"] == original_start
+    assert tracker.current_run["last_sub"] == 200.0
+    # Both stashed (the second superseded the first).
+    assert tracker.drops["pending_reset_holds"] == 2
+
+    # Genuine packet from the real stream — discards the candidate,
+    # continues the original run without incident.
+    events_g = _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 41,
+                "subtotalArea": "205.0",
+                "mowingWeekArea": "505.0",  # 505 - 205 = 300 = wk₀
+                "mowStartType": 1,
+                "time": 2_000_000_360_000,
+            }
+        ],
+    )
+    assert events_g == []
+    assert tracker._pending_reset is None
+    assert tracker.state == STATE_RUNNING
+    assert tracker.current_run["start_time"] == original_start
+    assert tracker.current_run["last_sub"] == 205.0
+    # Layer 3 must NOT have rejected the genuine packet — the phantom
+    # anchor is gone, the original wk₀ is intact.
+    assert tracker.drops["layer_3"] == 0
+
+
+# --------------------------------------------------------------------- #
+# 17. Layer 3 rejection path (mutation-testing gap flagged on #49)      #
+# --------------------------------------------------------------------- #
+
+
+def test_layer_3_rejects_invariant_violating_continuation() -> None:
+    """The replays only *confirm* the invariant, so an accidental
+    neutering of `_passes_layer_3` (e.g. `return True` unconditionally)
+    would ship green. Feed a mid-run continuation whose `|wk - sub -
+    wk₀| = 5 m² > INVARIANT_TOLERANCE_M2` and assert the drop counter,
+    the untouched accumulator, and the untouched cursor.
+
+    Concrete values: open at `sub=10, wk=110 → wk₀=100`. Poison packet
+    at `sub=20, wk=125` gives `125 - 20 = 105`, off the anchor by 5 m².
+    `sub` grows (no reset path), `wk` grows (layer 2 passes), only the
+    anchor invariant fails.
+    """
+    tracker = RunTracker()
+
+    _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 5,
+                "subtotalArea": "10.0",
+                "mowingWeekArea": "110.0",
+                "mowStartType": 1,
+                "time": 2_000_000_000_000,
+            }
+        ],
+    )
+    assert tracker.current_run["wk0"] == 100.0
+    baseline_last_sub = tracker.current_run["last_sub"]
+    baseline_last_wk = tracker._last_accepted_wk
+
+    events = _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 8,
+                "subtotalArea": "20.0",
+                "mowingWeekArea": "125.0",  # 125 - 20 = 105, offset 5
+                "mowStartType": 1,
+                "time": 2_000_000_060_000,
+            }
+        ],
+    )
+
+    assert events == []
+    assert tracker.state == STATE_RUNNING
+    assert tracker.drops["layer_3"] == 1
+    # Rejected packet touches no state.
+    assert tracker.current_run["last_sub"] == baseline_last_sub
+    assert tracker._last_accepted_wk == baseline_last_wk
+
+
+def test_layer_3_within_tolerance_still_accepted() -> None:
+    """Regression guard on the tolerance itself: a packet exactly on
+    the `wk - sub` anchor line (offset 0) is accepted, and one within
+    `INVARIANT_TOLERANCE_M2` (say offset 0.3) is also accepted. Makes
+    sure the guard does not overshoot into the healthy-data range.
+    """
+    tracker = RunTracker()
+
+    _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 5,
+                "subtotalArea": "10.0",
+                "mowingWeekArea": "110.0",  # wk₀ = 100
+                "mowStartType": 1,
+                "time": 2_000_000_000_000,
+            }
+        ],
+    )
+
+    # Offset 0.3 — within tolerance.
+    events = _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 8,
+                "subtotalArea": "20.0",
+                "mowingWeekArea": "120.3",  # 120.3 - 20 = 100.3, offset 0.3
+                "mowStartType": 1,
+                "time": 2_000_000_060_000,
+            }
+        ],
+    )
+
+    assert events == []
+    assert tracker.drops["layer_3"] == 0
+    assert tracker.current_run["last_sub"] == 20.0
