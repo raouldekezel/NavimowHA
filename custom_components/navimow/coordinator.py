@@ -32,6 +32,8 @@ from .const import (
     UPDATE_INTERVAL,
 )
 from .location import parse_location_type_1, parse_location_type_2
+from .run_tracker import Event as RunEvent
+from .run_tracker import RunTracker
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -107,6 +109,12 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # stuck cursor without log flooding.
         self._type1_drop_streak: int = 0
         self._type2_drop_streak: int = 0
+        # FEAT-05 (b): pure state machine that turns the accepted
+        # /location stream into run/zone events. HA-facing plumbing
+        # (event bus, entities, `Store` persistence) lands in step (c);
+        # here we just log the emitted events at DEBUG so we can trace
+        # the tracker without user-visible side effects yet.
+        self.run_tracker = RunTracker()
 
     async def async_setup(self) -> None:
         """Register callbacks from SDK."""
@@ -180,6 +188,10 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._last_accepted_time_type2 = self._clamp_cursor(incoming_time)
             self._type2_drop_streak = 0
         self.stats = parsed
+        # FEAT-05 (b): feed the run tracker downstream of layer-1 so it
+        # only sees ordering-clean packets. Emitted events are just
+        # logged here; step (c) will fire them on the HA event bus.
+        self._forward_run_events(self.run_tracker.process_type2(parsed))
         # Stats belong to the coordinator's shared data dict, so refresh
         # entities via the standard path (they are on the ~30 s tick anyway;
         # this just makes updates land immediately when a payload arrives).
@@ -229,6 +241,12 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         vs_changed = vehicle_state is not None and vehicle_state != self.vehicle_state
         if vs_changed:
             self.vehicle_state = vehicle_state
+            # FEAT-05 (b): forward the vs change to the tracker so it can
+            # move an open run into PAUSED_DOCKED / arm the sustained-60 s
+            # interruption timer.
+            self._forward_run_events(
+                self.run_tracker.process_vehicle_state(vehicle_state)
+            )
             self.async_set_updated_data(self._build_data())
 
         # Position pushes go through a dedicated dispatcher (throttled to
@@ -258,6 +276,18 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "last_http_fetch_monotonic": self._last_http_fetch,
             },
         }
+
+    def _forward_run_events(self, events: list[RunEvent]) -> None:
+        """Consume events emitted by the tracker.
+
+        Step (b) only logs them at DEBUG — the HA event bus dispatch
+        and the entity state changes land in step (c). Kept as a
+        dedicated seam so (c)'s diff is small and localised.
+        """
+        for event in events:
+            _LOGGER.debug(
+                "run_tracker event: kind=%s payload=%s", event.kind, event.payload
+            )
 
     def _device_status_to_state(self, status: DeviceStatus) -> DeviceStateMessage:
         error: dict[str, Any] | None = None
@@ -419,6 +449,11 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._last_mqtt_state_update,
             self._last_http_fetch,
         )
+        # FEAT-05 (b): tick the tracker so the sustained-docked
+        # interruption detector fires even when no MQTT traffic is
+        # arriving (the whole point of the timer is to catch a run that
+        # has silently ended).
+        self._forward_run_events(self.run_tracker.tick())
         self.data = self._build_data()
         return self.data
 

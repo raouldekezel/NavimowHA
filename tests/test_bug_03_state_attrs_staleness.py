@@ -53,6 +53,10 @@ def _make_coordinator():
     coordinator._device_status_to_state = MagicMock(return_value=MagicMock())
     coordinator._build_data = MagicMock(return_value={})
     coordinator.async_set_updated_data = MagicMock()
+    # FEAT-05 (b): run tracker (idle, emits nothing until fed).
+    from custom_components.navimow.run_tracker import RunTracker
+
+    coordinator.run_tracker = RunTracker()
     return coordinator, api
 
 
