@@ -31,7 +31,10 @@ def async_setup_services(hass: HomeAssistant, _api: MowerAPI) -> None:
             device_id,
             height,
         )
-        raise HomeAssistantError("Setting the blade height is not supported via the REST API; the service was not executed.")
+        raise HomeAssistantError(
+            "Setting the blade height is not supported via the REST API; "
+            "the service was not executed."
+        )
 
     hass.services.async_register(
         DOMAIN,
