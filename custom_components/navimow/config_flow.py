@@ -77,7 +77,7 @@ class NavimowOAuth2FlowHandler(
             return self.async_abort(
                 reason="missing_config",
                 description_placeholders={
-                    "error": "CLIENT_ID 或 CLIENT_SECRET 未配置，请在 const.py 中配置"
+                    "error": "CLIENT_ID or CLIENT_SECRET is not configured. Please set them in const.py."
                 },
             )
 
