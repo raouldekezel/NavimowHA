@@ -63,11 +63,11 @@ class NavimowOAuth2FlowHandler(
     ) -> FlowResult:
         """Handle a flow initiated by the user."""
         _LOGGER.debug("Starting OAuth2 flow: source=%s", self.source)
-        # 检查是否已经配置
+        # Check whether it is already configured
         await self.async_set_unique_id(DOMAIN)
         self._abort_if_unique_id_configured()
 
-        # 检查必要的配置
+        # Check the required configuration
         if not CLIENT_ID or not CLIENT_SECRET:
             _LOGGER.error(
                 "Missing OAuth2 client configuration: client_id_set=%s, client_secret_set=%s",
@@ -84,7 +84,7 @@ class NavimowOAuth2FlowHandler(
         # Ensure implementation is registered before authorize step.
         _LOGGER.debug("Registering OAuth2 implementation before authorize step")
         _ = self.oauth2_implementation
-        # 仅一个 OAuth2 实现，直接进入授权步骤
+        # Only one OAuth2 implementation; go straight to the authorization step
         _LOGGER.debug("Proceeding to OAuth2 authorize step")
         return await super().async_step_user()
 
@@ -113,31 +113,31 @@ class NavimowOAuth2FlowHandler(
                 data_schema=None,
             )
 
-        # 仅一个 OAuth2 实现，直接进入授权步骤
+        # Only one OAuth2 implementation; go straight to the authorization step
         return await super().async_step_user()
 
     async def async_oauth_create_entry(self, data: dict[str, Any]) -> FlowResult:
         """Create an entry for the flow, or update existing entry for reauth."""
-        # HA 已经自动处理了 token 交换，data["token"] 已包含 token 信息
-        # 如果是 reauth，HA 会自动更新 entry
+        # HA has already handled the token exchange; data["token"] already contains the token info
+        # For a reauth, HA updates the entry automatically
         if self.source == config_entries.SOURCE_REAUTH:
             existing_entry = self.entry
             self.hass.config_entries.async_update_entry(
                 existing_entry,
                 data={
                     **existing_entry.data,
-                    **data,  # 包含新的 token
+                    **data,  # contains the new token
                 },
             )
             await self.hass.config_entries.async_reload(existing_entry.entry_id)
             return self.async_abort(reason="reauth_successful")
 
-        # 保存配置和 token（HA 已自动处理 token 交换）
+        # Save the config and token (HA has already handled the token exchange)
         return self.async_create_entry(
             title="Navimow",
             data={
                 "auth_implementation": DOMAIN,
-                **data,  # 包含 token（由 HA 自动处理）
+                **data,  # contains the token (handled automatically by HA)
                 "api_base_url": API_BASE_URL,
                 "mqtt_broker": MQTT_BROKER,
                 "mqtt_port": MQTT_PORT,
