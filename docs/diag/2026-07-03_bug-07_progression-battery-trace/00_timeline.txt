@@ -1,0 +1,11 @@
+Session A launched  11:39:33 UTC (13:39:33 CEST)
+first `mowing` state 11:39:41 UTC (13:39:41 CEST)
+first fresh /location type-2  11:40:40 UTC (13:40:40 CEST)  ← trompeur ends
+battery-hiccup #1   11:58:24 UTC (13:58:24 CEST)  MQTT state received battery=100 while real=94
+battery-hiccup #2   12:38:24 UTC (14:38:24 CEST)  MQTT state received battery=68 while real=72
+Session A dock cmd  12:04:33 UTC — no effect (robot still mowing)
+Session B start cmd 12:19:35 UTC — no effect (still mowing)
+Session B dock cmd  12:29:35 UTC — accepted
+returning transition 12:29:41 UTC
+docked              12:31:27 UTC
+trace ended         12:44:35 UTC
