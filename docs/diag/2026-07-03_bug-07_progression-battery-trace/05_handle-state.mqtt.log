@@ -1,0 +1,7 @@
+2026-07-03 13:39:34.510 DEBUG (MainThread) [custom_components.navimow.coordinator] MQTT state received: device=REDACTED-ROBOT-SERIAL state=mowing battery=100
+2026-07-03 13:58:24.551 DEBUG (MainThread) [custom_components.navimow.coordinator] MQTT state received: device=REDACTED-ROBOT-SERIAL state=mowing battery=100
+2026-07-03 14:29:37.166 DEBUG (MainThread) [custom_components.navimow.coordinator] MQTT state received: device=REDACTED-ROBOT-SERIAL state=returning battery=69
+2026-07-03 14:31:21.753 DEBUG (MainThread) [custom_components.navimow.coordinator] MQTT state received: device=REDACTED-ROBOT-SERIAL state=docked battery=68
+2026-07-03 14:31:24.680 DEBUG (MainThread) [custom_components.navimow.coordinator] MQTT state received: device=REDACTED-ROBOT-SERIAL state=idle battery=68
+2026-07-03 14:31:25.313 DEBUG (MainThread) [custom_components.navimow.coordinator] MQTT state received: device=REDACTED-ROBOT-SERIAL state=docked battery=68
+2026-07-03 14:38:24.795 DEBUG (MainThread) [custom_components.navimow.coordinator] MQTT state received: device=REDACTED-ROBOT-SERIAL state=docked battery=68
