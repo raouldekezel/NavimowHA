@@ -89,6 +89,13 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # the last observed values rather than showing "unknown" until the
         # next mowing session.
         self.stats: dict[str, Any] | None = None
+        # FEAT-05: firmware `time` (epoch ms) of the last accepted /location
+        # type-2 packet. Feeds the ordering guard in `_handle_location_stats`.
+        # Ordering matters because the accumulators the tracker will consume
+        # (subtotalArea, mowingPercentage, currentMowProgress) regress if a
+        # late-delivered packet lands (2026-05-25 diag: one type-2 arrived
+        # 1 h 37 min out of order, same pathology family as BUG-05 on /state).
+        self._last_location_stats_time: int | None = None
 
     async def async_setup(self) -> None:
         """Register callbacks from SDK."""
@@ -117,6 +124,25 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         parsed = parse_location_type_2(item)
         if parsed is None:
             return
+        # FEAT-05: /location ordering guard. Drop items whose firmware `time`
+        # is not strictly greater than the last accepted item's — a late
+        # delivery would otherwise regress the accumulators (subtotal, mp,
+        # cmp) and mislead the tracker. Guard only fires when both times are
+        # known: if the incoming or the stored time is missing the payload
+        # is accepted, matching the parser's defensively-tolerant spirit.
+        incoming_time = parsed.get("time")
+        if incoming_time is not None:
+            last_time = self._last_location_stats_time
+            if last_time is not None and incoming_time <= last_time:
+                _LOGGER.debug(
+                    "MQTT location type-2 DROPPED as out-of-order: "
+                    "incoming_time=%s last_time=%s device=%s",
+                    incoming_time,
+                    last_time,
+                    self.device.id,
+                )
+                return
+            self._last_location_stats_time = incoming_time
         self.stats = parsed
         # Stats belong to the coordinator's shared data dict, so refresh
         # entities via the standard path (they are on the ~30 s tick anyway;

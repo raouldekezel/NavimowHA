@@ -45,6 +45,7 @@ def parse_location_type_1(item: dict[str, Any]) -> dict[str, Any] | None:
     - `theta` (float, radians, -π..π; None if firmware omitted it)
     - `vehicle_state` (int; None if firmware omitted it)
     - `distance` (float, meters, √(x²+y²))
+    - `time` (int, firmware epoch ms; None if firmware omitted it)
 
     Returns `None` when the payload lacks the mandatory `postureX` /
     `postureY` fields (a defensive drop, not a crash — the cloud has
@@ -61,6 +62,7 @@ def parse_location_type_1(item: dict[str, Any]) -> dict[str, Any] | None:
         "theta": _to_float(item.get("postureTheta")),
         "vehicle_state": _to_int(item.get("vehicleState")),
         "distance": round(math.hypot(x, y), 2),
+        "time": _to_int(item.get("time")),
     }
 
 
@@ -74,6 +76,10 @@ def parse_location_type_2(item: dict[str, Any]) -> dict[str, Any] | None:
     - `area_week` (float; `mowingWeekArea`, m² — since ISO week start)
     - `boundary` (int; `currentMowBoundary`, internal id, not sequential)
     - `action` (int; sub-state code observed 5/8/-1, semantics TBD)
+    - `time` (int, firmware epoch ms; None if firmware omitted it)
+    - `mow_start_type` (int; 0 = scheduled, 1 = manual observed so far)
+    - `sub_action` (int; only present when `action == 8`, value 6 in every
+      committed sample — see the SPIKE-02 note on #43)
 
     Returns `None` only when the item is not a mapping. The individual
     fields fall back to `None` on parse errors — the operator's 2026-05-25
@@ -90,6 +96,9 @@ def parse_location_type_2(item: dict[str, Any]) -> dict[str, Any] | None:
         "area_week": _to_float(item.get("mowingWeekArea")),
         "boundary": _to_int(item.get("currentMowBoundary")),
         "action": _to_int(item.get("action")),
+        "time": _to_int(item.get("time")),
+        "mow_start_type": _to_int(item.get("mowStartType")),
+        "sub_action": _to_int(item.get("subAction")),
     }
 
 

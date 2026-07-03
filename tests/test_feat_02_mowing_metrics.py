@@ -29,14 +29,17 @@ def test_parse_location_type_2_full_payload() -> None:
             "mowingWeekArea": "1234.75",
         }
     )
-    assert parsed == {
-        "mowing_percentage": 62,
-        "current_mow_progress": 4321,
-        "area_session": 180.5,
-        "area_week": 1234.75,
-        "boundary": 3,
-        "action": -1,
-    }
+    # Per-field asserts (not exact dict equality) so FEAT-05 shape
+    # extensions (`time`, `mow_start_type`, `sub_action`) do not force
+    # this earlier test to churn — those fields have their own guards
+    # in test_feat_05a_location_ordering_guard.py.
+    assert parsed is not None
+    assert parsed["mowing_percentage"] == 62
+    assert parsed["current_mow_progress"] == 4321
+    assert parsed["area_session"] == 180.5
+    assert parsed["area_week"] == 1234.75
+    assert parsed["boundary"] == 3
+    assert parsed["action"] == -1
 
 
 def test_parse_location_type_2_sparse_payload() -> None:
@@ -85,6 +88,9 @@ def _make_coordinator():
     coordinator.vehicle_state = None
     coordinator._last_position_dispatch = 0.0
     coordinator.stats = None
+    # FEAT-05: ordering guard state — initialised here so tests that use
+    # `__new__` (skipping `__init__`) can invoke `_handle_location_stats`.
+    coordinator._last_location_stats_time = None
     coordinator._build_data = MagicMock(return_value={})
     coordinator.async_set_updated_data = MagicMock()
     return coordinator
