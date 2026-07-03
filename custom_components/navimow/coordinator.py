@@ -2,6 +2,7 @@
 
 import logging
 import time
+from dataclasses import replace
 from datetime import timedelta
 from typing import Any
 
@@ -238,13 +239,19 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # We still take the other fields (state, error, position,
             # signal_strength, timestamp) from the cache — the trace shows
             # they stay coherent with reality — but we thread the previously
-            # held battery back into the new object.
+            # held battery back into a fresh object. `replace()` is essential
+            # here: the SDK holds `cached_state` by reference in its own cache
+            # dict and hands the same reference to the callback, so any
+            # in-place mutation would corrupt `sdk._state_cache` from another
+            # thread.
             prev_battery = (
                 self._last_state.battery if self._last_state is not None else None
             )
-            self._last_state = cached_state
-            if prev_battery is not None:
-                self._last_state.battery = prev_battery
+            self._last_state = (
+                replace(cached_state, battery=prev_battery)
+                if prev_battery is not None
+                else cached_state
+            )
             self._last_data_source = "mqtt_cache"
 
         cached_attrs = self.sdk.get_cached_attributes(self.device.id)
@@ -355,13 +362,16 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # topic occasionally forwards a stale battery reading — same class
         # of clobbering as BUG-04's SDK cache, hitting the callback path
         # instead of the poll path. Preserve the previously held battery so
-        # only the HTTP fallback ever writes it.
+        # only the HTTP fallback ever writes it. `replace()` is essential
+        # here: the SDK caches `state` by reference before invoking the
+        # callback, so an in-place mutation would corrupt `sdk._state_cache`
+        # from the HA loop thread.
         prev_battery = (
             self._last_state.battery if self._last_state is not None else None
         )
-        self._last_state = state
-        if prev_battery is not None:
-            self._last_state.battery = prev_battery
+        self._last_state = (
+            replace(state, battery=prev_battery) if prev_battery is not None else state
+        )
         self._last_data_source = "mqtt_push"
         self.async_set_updated_data(self._build_data())
 

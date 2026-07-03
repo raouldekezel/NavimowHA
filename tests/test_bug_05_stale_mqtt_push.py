@@ -17,15 +17,19 @@ flips backward for ~60-90 s until the next HTTP-fallback tick.
 BUG-08 retires the timestamp guard and replaces it with a stronger
 invariant: HTTP is the sole source of truth for `battery`. Every
 `/state` push is accepted — for its state/error/timestamp fields — but
-the previously held `battery` value is threaded through, so a stale
-battery from any MQTT source can never land in `_last_state.battery`.
+the previously held `battery` value is threaded through via
+`dataclasses.replace()`, so a stale battery from any MQTT source can
+never land in `_last_state.battery` AND the SDK's shared cache object
+that backs `state` is never mutated in place.
 
-These tests lock in that invariant.
+These tests lock in that invariant on both angles.
 """
 
 from __future__ import annotations
 
 from unittest.mock import MagicMock
+
+from mower_sdk.models import DeviceStateMessage
 
 
 def _make_coordinator():
@@ -55,13 +59,19 @@ def _make_coordinator():
     return coordinator
 
 
-def _make_state(*, timestamp: int | None, battery: int, state: str = "isRunning"):
-    msg = MagicMock()
-    msg.device_id = "REDACTED-ROBOT-SERIAL"
-    msg.timestamp = timestamp
-    msg.battery = battery
-    msg.state = state
-    return msg
+def _state(
+    *,
+    battery: int | None,
+    timestamp: int | None = 1_000_000_000_000,
+    state: str = "isRunning",
+    device_id: str = "REDACTED-ROBOT-SERIAL",
+):
+    return DeviceStateMessage(
+        device_id=device_id,
+        timestamp=timestamp,
+        state=state,
+        battery=battery,
+    )
 
 
 # --------------------------------------------------------------------- #
@@ -77,7 +87,7 @@ def test_handle_state_schedules_update_and_bumps_clock() -> None:
     `_update_from_state`.
     """
     coordinator = _make_coordinator()
-    fresh = _make_state(timestamp=1_000_000_000_000, battery=85)
+    fresh = _state(battery=85)
 
     coordinator._handle_state(fresh)
 
@@ -94,9 +104,9 @@ def test_handle_state_older_timestamp_no_longer_dropped() -> None:
     (`battery = HTTP`) is what actually protects the sensor.
     """
     coordinator = _make_coordinator()
-    coordinator._last_state = _make_state(timestamp=1_000_000_000_000, battery=85)
+    coordinator._last_state = _state(battery=85, timestamp=1_000_000_000_000)
 
-    stale = _make_state(timestamp=999_000_000_000, battery=100)
+    stale = _state(battery=100, timestamp=999_000_000_000)
     coordinator._handle_state(stale)
 
     coordinator.hass.loop.call_soon_threadsafe.assert_called_once_with(
@@ -109,14 +119,13 @@ def test_handle_state_wrong_device_id_still_dropped() -> None:
     payload never reaches the scheduler.
     """
     coordinator = _make_coordinator()
-    coordinator._last_state = _make_state(timestamp=1_000_000_000_000, battery=85)
+    coordinator._last_state = _state(battery=85)
 
-    foreign = MagicMock()
-    foreign.device_id = "OTHER-ROBOT"
-    foreign.timestamp = 2_000_000_000_000
-    foreign.battery = 42
-    foreign.state = "isRunning"
-
+    foreign = _state(
+        battery=42,
+        timestamp=2_000_000_000_000,
+        device_id="OTHER-ROBOT",
+    )
     coordinator._handle_state(foreign)
 
     coordinator.hass.loop.call_soon_threadsafe.assert_not_called()
@@ -134,14 +143,13 @@ def test_update_from_state_preserves_battery_from_previous_state() -> None:
     must stay at `87`; non-battery fields land freshly.
     """
     coordinator = _make_coordinator()
-    coordinator._last_state = _make_state(
-        timestamp=1_000_000_000_000, battery=87, state="isRunning"
+    coordinator._last_state = _state(
+        battery=87, timestamp=1_000_000_000_000, state="isRunning"
     )
 
-    replay = _make_state(timestamp=1_000_000_030_000, battery=100, state="isRunning")
+    replay = _state(battery=100, timestamp=1_000_000_030_000, state="isRunning")
     coordinator._update_from_state(replay)
 
-    assert coordinator._last_state is replay
     assert coordinator._last_state.battery == 87  # HTTP truth preserved
     assert coordinator._last_state.state == "isRunning"
 
@@ -153,9 +161,11 @@ def test_update_from_state_first_ever_uses_payload_battery() -> None:
     """
     coordinator = _make_coordinator()
 
-    first = _make_state(timestamp=1_000_000_000_000, battery=42)
+    first = _state(battery=42, timestamp=1_000_000_000_000)
     coordinator._update_from_state(first)
 
+    # No prev battery to thread through, so the payload reference lands
+    # verbatim — no `replace()` call in the cold-start path.
     assert coordinator._last_state is first
     assert coordinator._last_state.battery == 42
 
@@ -166,11 +176,11 @@ def test_update_from_state_fresh_content_battery_still_ignored() -> None:
     the sole writer, whatever the payload happens to say.
     """
     coordinator = _make_coordinator()
-    coordinator._last_state = _make_state(
-        timestamp=1_000_000_000_000, battery=87, state="isRunning"
+    coordinator._last_state = _state(
+        battery=87, timestamp=1_000_000_000_000, state="isRunning"
     )
 
-    plausible = _make_state(timestamp=1_000_000_030_000, battery=86, state="isRunning")
+    plausible = _state(battery=86, timestamp=1_000_000_030_000, state="isRunning")
     coordinator._update_from_state(plausible)
 
     assert coordinator._last_state.battery == 87
@@ -181,8 +191,31 @@ def test_update_from_state_marks_source_as_mqtt_push() -> None:
     diagnostics when reasoning about which path last wrote the state.
     """
     coordinator = _make_coordinator()
-    coordinator._last_state = _make_state(timestamp=1_000_000_000_000, battery=90)
+    coordinator._last_state = _state(battery=90, timestamp=1_000_000_000_000)
 
-    coordinator._update_from_state(_make_state(timestamp=1_000_000_030_000, battery=42))
+    coordinator._update_from_state(_state(battery=42, timestamp=1_000_000_030_000))
 
     assert coordinator._last_data_source == "mqtt_push"
+
+
+def test_update_from_state_does_not_mutate_incoming_payload() -> None:
+    """The SDK caches the payload before invoking the callback and
+    returns the same reference from `get_cached_state()`. In-place
+    mutation would corrupt the SDK cache from the HA loop thread.
+    `replace()` must produce a fresh object; the incoming payload's
+    battery stays at what it arrived with.
+    """
+    coordinator = _make_coordinator()
+    coordinator._last_state = _state(
+        battery=87, timestamp=1_000_000_000_000, state="isRunning"
+    )
+
+    replay = _state(battery=100, timestamp=1_000_000_030_000, state="isRunning")
+    coordinator._update_from_state(replay)
+
+    # Coordinator saw the preserved HTTP battery.
+    assert coordinator._last_state.battery == 87
+    # But the payload object we passed in stayed at battery=100 — the
+    # SDK's cache reference is untouched.
+    assert replay.battery == 100
+    assert coordinator._last_state is not replay
