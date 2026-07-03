@@ -52,6 +52,34 @@
       },
       "current_zone": {
         "name": "Current zone"
+      },
+      "run_progress": {
+        "name": "Run progress"
+      },
+      "zone_progress": {
+        "name": "Zone progress"
+      },
+      "run_state": {
+        "name": "Run state",
+        "state": {
+          "idle": "Idle",
+          "running": "Running",
+          "paused": "Paused",
+          "returning": "Returning"
+        }
+      },
+      "last_run_started": {
+        "name": "Last run started"
+      },
+      "last_run_duration": {
+        "name": "Last run duration"
+      },
+      "last_run_result": {
+        "name": "Last run result",
+        "state": {
+          "completed": "Completed",
+          "interrupted": "Interrupted"
+        }
       }
     },
     "binary_sensor": {

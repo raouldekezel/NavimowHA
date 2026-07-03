@@ -18,7 +18,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import PERCENTAGE, UnitOfArea, UnitOfLength, UnitOfTime
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity import DeviceInfo, EntityCategory
+from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -172,11 +172,16 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
         ),
     ),
     # `run_state`: enum idle/running/paused/returning. `returning`
-    # heuristic documented in `_run_state_display`.
+    # heuristic documented in `_run_state_display`. `options` must
+    # match every value the display fn can return — HA's enum-checks
+    # block short-circuits when `options is None` (no error raised),
+    # so declaring them here enables value-in-options validation and
+    # exposes the OPTIONS capability attribute for the frontend.
     NavimowSensorEntityDescription(
         key="run_state",
         translation_key="run_state",
         device_class=SensorDeviceClass.ENUM,
+        options=["idle", "running", "paused", "returning"],
         icon="mdi:state-machine",
         value_fn=_run_state_display,
     ),
@@ -215,6 +220,7 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
         key="last_run_result",
         translation_key="last_run_result",
         device_class=SensorDeviceClass.ENUM,
+        options=["completed", "interrupted"],
         icon="mdi:flag-checkered",
         value_fn=lambda c: (
             c.last_finished_run.get("result") if c.last_finished_run else None

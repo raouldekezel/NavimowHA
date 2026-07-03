@@ -1,5 +1,6 @@
 """DataUpdateCoordinator for Navimow integration."""
 
+import copy
 import logging
 import time
 from dataclasses import replace
@@ -190,14 +191,19 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.last_finished_run = payload.get("last_finished_run")
 
     def _build_store_payload(self) -> dict[str, Any]:
+        # `snapshot()` already deep-copies `current_run` for us; the
+        # history / last_finished_run are cheap to deep-copy at save
+        # time and the copy decouples the fire-and-forget Store save
+        # (which serialises in an executor) from any subsequent mutation
+        # on the HA loop.
         return {
             "tracker": self.run_tracker.snapshot(),
             "cursors": {
                 "type1": self._last_accepted_time_type1,
                 "type2": self._last_accepted_time_type2,
             },
-            "history": self.history,
-            "last_finished_run": self.last_finished_run,
+            "history": copy.deepcopy(self.history),
+            "last_finished_run": copy.deepcopy(self.last_finished_run),
         }
 
     def _schedule_store_save(self) -> None:

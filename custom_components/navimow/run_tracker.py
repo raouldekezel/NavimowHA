@@ -58,6 +58,7 @@ still updates run accumulators.
 
 from __future__ import annotations
 
+import copy
 import logging
 import time
 from collections.abc import Callable
@@ -707,12 +708,19 @@ class RunTracker:
     def snapshot(self) -> dict[str, Any]:
         """Serialize enough state for `restore()` to resume a mid-run
         tracker after an HA restart. Consumed by step (c) `Store`.
+
+        `current_run` is `deepcopy`'d so the returned dict is a true
+        point-in-time capture. Step (c) schedules the `Store.async_save`
+        fire-and-forget and serialises the payload in an executor; a
+        shared reference would let a packet processed between
+        scheduling and the dump mutate the live `current_run` cross-
+        thread mid-serialisation.
         """
         return {
             "version": SNAPSHOT_VERSION,
             "state": self.state,
             "vehicle_state": self.vehicle_state,
-            "current_run": self.current_run,
+            "current_run": copy.deepcopy(self.current_run),
             "last_accepted_wk": self._last_accepted_wk,
             "last_accepted_time_ms": self._last_accepted_time_ms,
             "drops": dict(self.drops),
