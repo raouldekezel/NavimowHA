@@ -101,6 +101,12 @@ def _make_coordinator():
     coordinator.position = None
     coordinator.vehicle_state = None
     coordinator._last_position_dispatch = 0.0
+    # FEAT-05 layer-1 guard cursors + drop streaks, initialised so
+    # `__new__`-built test coordinators can invoke the /location handlers.
+    coordinator._last_accepted_time_type1 = None
+    coordinator._last_accepted_time_type2 = None
+    coordinator._type1_drop_streak = 0
+    coordinator._type2_drop_streak = 0
     coordinator._build_data = MagicMock(return_value={})
     coordinator.async_set_updated_data = MagicMock()
     return coordinator

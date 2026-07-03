@@ -77,6 +77,20 @@ SIGNAL_POSITION_UPDATE: Final = "navimow_position_update"
 # `vehicleState` field distinguishes the two.
 VEHICLE_STATE_CHARGING: Final = 2
 
+# FEAT-05 layer-1 guard tolerance for future-stamped packets. The cursor is
+# clamped to `now + FUTURE_TIMESTAMP_TOLERANCE_MS` before storage, so a packet
+# stamped anomalously far in the future (BUG-08-style content/timestamp
+# mismatch, or a robot RTC skewed ahead pre-GPS-fix) cannot poison the guard
+# for longer than this window. 5 min covers realistic clock skew while
+# keeping the recovery time short.
+FUTURE_TIMESTAMP_TOLERANCE_MS: Final = 300_000
+
+# FEAT-05 observability: after this many consecutive drops on a stream, emit
+# one WARNING so a poisoned cursor surfaces in the log. Observed pathology
+# rate is 1 gross delay per 81 committed packets, so a healthy stream never
+# reaches this threshold; a truly poisoned cursor will.
+STALE_DROP_STREAK_TO_WARN: Final = 25
+
 
 # Mapping from MowerStatus to LawnMowerActivity
 MOWER_STATUS_TO_ACTIVITY = {
