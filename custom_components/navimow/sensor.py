@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from homeassistant.components.sensor import (
+    RestoreSensor,
     SensorDeviceClass,
     SensorEntity,
     SensorEntityDescription,
@@ -30,6 +31,14 @@ class NavimowSensorEntityDescription(SensorEntityDescription):
 
     value_fn: Callable[[NavimowCoordinator], Any]
     attrs_fn: Callable[[NavimowCoordinator], dict[str, Any] | None] | None = None
+    # HARD-02: opt-in HA state persistence. When True, the sensor inherits
+    # RestoreSensor behaviour — the last observed value is written to
+    # `.storage/core.restore_state` and re-applied at HA startup, so a
+    # cumulative counter (e.g. `area_week`) survives a restart even though
+    # the cloud is silent on /location while the robot is docked. Session-
+    # scoped sensors (progression, current_zone) leave this False so a
+    # stale value never masks the "idle" reality.
+    restore: bool = False
 
 
 SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
@@ -68,6 +77,11 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
         state_class=SensorStateClass.TOTAL_INCREASING,
         icon="mdi:grass",
         value_fn=lambda c: (c.stats or {}).get("area_week"),
+        # HARD-02: cumulative weekly counter must survive an HA restart.
+        # The cloud stops publishing /location type-2 while the robot is
+        # docked (FEAT-02 diag), so without RestoreSensor the value would
+        # sit at `unknown` for potentially days until the next mow.
+        restore=True,
     ),
     # BUG-06: filter `boundary=0` as the session-init sentinel. The very
     # first type-2 payload of a fresh mow carries `currentMowBoundary=0`
@@ -119,8 +133,15 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-class NavimowSensor(CoordinatorEntity[NavimowCoordinator], SensorEntity):
-    """Representation of a Navimow sensor."""
+class NavimowSensor(CoordinatorEntity[NavimowCoordinator], RestoreSensor):
+    """Representation of a Navimow sensor.
+
+    Inherits `RestoreSensor` so descriptions that opt in via
+    `entity_description.restore=True` (HARD-02) survive HA restarts. For
+    non-restoring descriptions the behaviour is unchanged: `native_value`
+    returns whatever `value_fn` computes from the coordinator, `None`
+    included.
+    """
 
     entity_description: NavimowSensorEntityDescription
     _attr_has_entity_name = True
@@ -144,6 +165,15 @@ class NavimowSensor(CoordinatorEntity[NavimowCoordinator], SensorEntity):
             serial_number=device.serial_number or device.id,
         )
 
+    async def async_added_to_hass(self) -> None:
+        """Seed the restore cache from the last stored value (HARD-02)."""
+        await super().async_added_to_hass()
+        if not self.entity_description.restore:
+            return
+        last = await self.async_get_last_sensor_data()
+        if last is not None and last.native_value is not None:
+            self._attr_native_value = last.native_value
+
     @property
     def available(self) -> bool:
         if self.coordinator.get_device_state() is not None:
@@ -152,8 +182,21 @@ class NavimowSensor(CoordinatorEntity[NavimowCoordinator], SensorEntity):
 
     @property
     def native_value(self) -> Any:
-        """Return sensor value from coordinator."""
-        return self.entity_description.value_fn(self.coordinator)
+        """Return the live coordinator value, or the restored fallback.
+
+        Live values always win — and they refresh the internal cache so
+        the next restart resumes from the freshest value we ever saw. The
+        restored fallback only fires when both `value_fn` returns `None`
+        *and* the description opts in to restoration; otherwise `None`
+        passes through unchanged (HA renders `unknown`).
+        """
+        live = self.entity_description.value_fn(self.coordinator)
+        if live is not None:
+            self._attr_native_value = live
+            return live
+        if self.entity_description.restore:
+            return self._attr_native_value
+        return None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
