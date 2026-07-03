@@ -2,6 +2,7 @@
 
 import logging
 import time
+from dataclasses import replace
 from datetime import timedelta
 from typing import Any
 
@@ -231,20 +232,27 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         cached_state = self.sdk.get_cached_state(self.device.id)
         if cached_state is not None:
-            # BUG-04: don't overwrite a fresher HTTP fallback state with the
-            # SDK's cached MQTT state. The SDK caches the last MQTT push
-            # indefinitely; when MQTT reports a stale value (e.g. battery=0
-            # after an over-discharge, or battery=100 while charging), that
-            # cache would keep clobbering the fresher HTTP status every tick.
-            # Skip re-applying the cache when HTTP is newer than the last
-            # observed MQTT state push. Ref segwaynavimow/NavimowHA#11.
-            http_is_newer = self._last_http_fetch is not None and (
-                self._last_mqtt_state_update is None
-                or self._last_http_fetch > self._last_mqtt_state_update
+            # BUG-08: HTTP is the source of truth for `battery`. The SDK's
+            # cached /state can carry a stale battery reading (e.g. battery=0
+            # from a past over-discharge, battery=100 forwarded by the cloud
+            # mid-mow) that would clobber the fresh HTTP value on every tick.
+            # We still take the other fields (state, error, position,
+            # signal_strength, timestamp) from the cache — the trace shows
+            # they stay coherent with reality — but we thread the previously
+            # held battery back into a fresh object. `replace()` is essential
+            # here: the SDK holds `cached_state` by reference in its own cache
+            # dict and hands the same reference to the callback, so any
+            # in-place mutation would corrupt `sdk._state_cache` from another
+            # thread.
+            prev_battery = (
+                self._last_state.battery if self._last_state is not None else None
             )
-            if not http_is_newer:
-                self._last_state = cached_state
-                self._last_data_source = "mqtt_cache"
+            self._last_state = (
+                replace(cached_state, battery=prev_battery)
+                if prev_battery is not None
+                else cached_state
+            )
+            self._last_data_source = "mqtt_cache"
 
         cached_attrs = self.sdk.get_cached_attributes(self.device.id)
         if cached_attrs is not None:
@@ -326,34 +334,6 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _handle_state(self, state: DeviceStateMessage) -> None:
         if state.device_id != self.device.id:
             return
-        # BUG-05: the Navimow cloud replays the last-buffered `/state` payload
-        # verbatim at every WSS reconnect (~40 min), overwriting a fresher
-        # state with the pre-reconnect one. Drop the push if its own
-        # payload-embedded `timestamp` (epoch ms) is strictly older than the
-        # timestamp of the state we already hold. Payloads without a timestamp
-        # (defensive `None`) fall through unchanged.
-        new_ts = getattr(state, "timestamp", None)
-        prev = self._last_state
-        prev_ts = getattr(prev, "timestamp", None) if prev is not None else None
-        # Only compare when BOTH sides expose an actual numeric epoch — any
-        # missing/non-numeric value falls through to the pre-BUG-05 accept
-        # path (defensive for firmwares that omit the field, and safe for
-        # tests that pass MagicMock-shaped states).
-        if (
-            isinstance(new_ts, (int, float))
-            and isinstance(prev_ts, (int, float))
-            and new_ts < prev_ts
-        ):
-            _LOGGER.debug(
-                "MQTT state DROPPED as stale: device=%s state=%s battery=%s "
-                "new_ts=%s < prev_ts=%s",
-                state.device_id,
-                state.state,
-                state.battery,
-                new_ts,
-                prev_ts,
-            )
-            return
         _LOGGER.debug(
             "MQTT state received: device=%s state=%s battery=%s",
             state.device_id,
@@ -378,7 +358,20 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.hass.loop.call_soon_threadsafe(self._update_from_attributes, attrs)
 
     def _update_from_state(self, state: DeviceStateMessage) -> None:
-        self._last_state = state
+        # BUG-08: HTTP is the source of truth for `battery`. The MQTT /state
+        # topic occasionally forwards a stale battery reading — same class
+        # of clobbering as BUG-04's SDK cache, hitting the callback path
+        # instead of the poll path. Preserve the previously held battery so
+        # only the HTTP fallback ever writes it. `replace()` is essential
+        # here: the SDK caches `state` by reference before invoking the
+        # callback, so an in-place mutation would corrupt `sdk._state_cache`
+        # from the HA loop thread.
+        prev_battery = (
+            self._last_state.battery if self._last_state is not None else None
+        )
+        self._last_state = (
+            replace(state, battery=prev_battery) if prev_battery is not None else state
+        )
         self._last_data_source = "mqtt_push"
         self.async_set_updated_data(self._build_data())
 
