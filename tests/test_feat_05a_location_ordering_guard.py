@@ -61,9 +61,7 @@ def test_parse_location_type_1_exposes_time() -> None:
 def test_parse_location_type_1_time_defaults_to_none() -> None:
     from custom_components.navimow.location import parse_location_type_1
 
-    parsed = parse_location_type_1(
-        {"type": 1, "postureX": "0", "postureY": "0"}
-    )
+    parsed = parse_location_type_1({"type": 1, "postureX": "0", "postureY": "0"})
     assert parsed is not None
     assert parsed["time"] is None
 
@@ -145,8 +143,14 @@ def _make_coordinator():
     return coordinator
 
 
-def _type_2(*, time: int | None, mp: int = 5, subtotal: str = "10.0",
-            wk: str = "100.0", boundary: int = 1):
+def _type_2(
+    *,
+    time: int | None,
+    mp: int = 5,
+    subtotal: str = "10.0",
+    wk: str = "100.0",
+    boundary: int = 1,
+):
     """Minimal type-2 shape; `time` is the axis under test."""
     item = {
         "type": 2,
@@ -188,9 +192,7 @@ def test_strictly_newer_type_2_is_accepted() -> None:
     coordinator = _make_coordinator()
     coordinator._last_accepted_time_type2 = 1779694531266
 
-    coordinator.handle_location_item(
-        _type_2(time=1779694541261, mp=2, subtotal="20.0")
-    )
+    coordinator.handle_location_item(_type_2(time=1779694541261, mp=2, subtotal="20.0"))
 
     assert coordinator.stats["mowing_percentage"] == 2
     assert coordinator._last_accepted_time_type2 == 1779694541261
@@ -236,9 +238,9 @@ def test_late_delivered_type_2_is_dropped(caplog) -> None:
     # Cursor untouched by the drop.
     assert coordinator._last_accepted_time_type2 == 1779716245448
     # DEBUG line emitted with the BUG-05-style wording.
-    assert any(
-        "DROPPED as stale" in rec.getMessage() for rec in caplog.records
-    ), [rec.getMessage() for rec in caplog.records]
+    assert any("DROPPED as stale" in rec.getMessage() for rec in caplog.records), [
+        rec.getMessage() for rec in caplog.records
+    ]
 
 
 def test_equal_timestamp_type_2_is_dropped() -> None:
@@ -246,10 +248,14 @@ def test_equal_timestamp_type_2_is_dropped() -> None:
     not spuriously refresh downstream entities.
     """
     coordinator = _make_coordinator()
-    coordinator.handle_location_item(_type_2(time=1779694531266, mp=10, subtotal="50.0"))
+    coordinator.handle_location_item(
+        _type_2(time=1779694531266, mp=10, subtotal="50.0")
+    )
     coordinator.async_set_updated_data.reset_mock()
 
-    coordinator.handle_location_item(_type_2(time=1779694531266, mp=99, subtotal="99.0"))
+    coordinator.handle_location_item(
+        _type_2(time=1779694531266, mp=99, subtotal="99.0")
+    )
 
     assert coordinator.stats["mowing_percentage"] == 10  # unchanged
     assert coordinator.stats["area_session"] == 50.0
@@ -423,8 +429,9 @@ def test_future_stamped_type_2_is_accepted_but_cursor_is_clamped() -> None:
     coordinator = _make_coordinator()
 
     future_time = _NOW_MS + 24 * 3600 * 1000  # +24 h
-    with patch("custom_components.navimow.coordinator.time.time",
-               return_value=_NOW_MS / 1000):
+    with patch(
+        "custom_components.navimow.coordinator.time.time", return_value=_NOW_MS / 1000
+    ):
         coordinator.handle_location_item(_type_2(time=future_time, mp=1))
 
     # Packet was accepted (stats populated).
@@ -442,8 +449,9 @@ def test_present_time_type_2_is_stamped_unchanged() -> None:
     """
     coordinator = _make_coordinator()
 
-    with patch("custom_components.navimow.coordinator.time.time",
-               return_value=_NOW_MS / 1000):
+    with patch(
+        "custom_components.navimow.coordinator.time.time", return_value=_NOW_MS / 1000
+    ):
         coordinator.handle_location_item(_type_2(time=_NOW_MS - 10_000, mp=1))
 
     assert coordinator._last_accepted_time_type2 == _NOW_MS - 10_000
@@ -460,15 +468,17 @@ def test_cursor_self_heals_after_future_clamp() -> None:
     coordinator = _make_coordinator()
 
     future_time = _NOW_MS + 24 * 3600 * 1000
-    with patch("custom_components.navimow.coordinator.time.time",
-               return_value=_NOW_MS / 1000):
+    with patch(
+        "custom_components.navimow.coordinator.time.time", return_value=_NOW_MS / 1000
+    ):
         coordinator.handle_location_item(_type_2(time=future_time, mp=1))
 
     # Elapse enough wall-clock that a legitimate packet has `time` above
     # the clamped ceiling.
     later = _NOW_MS + FUTURE_TIMESTAMP_TOLERANCE_MS + 60_000
-    with patch("custom_components.navimow.coordinator.time.time",
-               return_value=later / 1000):
+    with patch(
+        "custom_components.navimow.coordinator.time.time", return_value=later / 1000
+    ):
         coordinator.handle_location_item(_type_2(time=later, mp=2, subtotal="20.0"))
 
     assert coordinator.stats["mowing_percentage"] == 2
@@ -484,8 +494,10 @@ def test_future_stamped_type_1_cursor_is_clamped() -> None:
     future_time = _NOW_MS + 24 * 3600 * 1000
     with (
         patch("custom_components.navimow.coordinator.async_dispatcher_send"),
-        patch("custom_components.navimow.coordinator.time.time",
-              return_value=_NOW_MS / 1000),
+        patch(
+            "custom_components.navimow.coordinator.time.time",
+            return_value=_NOW_MS / 1000,
+        ),
     ):
         coordinator.handle_location_item(_type_1(time=future_time))
 
@@ -515,13 +527,17 @@ def test_streak_warning_fires_at_threshold_type_2(caplog) -> None:
         for _ in range(STALE_DROP_STREAK_TO_WARN - 1):
             coordinator.handle_location_item(_type_2(time=500, mp=1))
         # N-1 drops → no WARNING yet.
-        assert not any("dropped" in r.getMessage() for r in caplog.records), \
-            [r.getMessage() for r in caplog.records]
+        assert not any("dropped" in r.getMessage() for r in caplog.records), [
+            r.getMessage() for r in caplog.records
+        ]
 
         coordinator.handle_location_item(_type_2(time=500, mp=1))  # Nth drop
 
-    warns = [r for r in caplog.records if r.levelname == "WARNING"
-             and "type-2" in r.getMessage()]
+    warns = [
+        r
+        for r in caplog.records
+        if r.levelname == "WARNING" and "type-2" in r.getMessage()
+    ]
     assert len(warns) == 1, [r.getMessage() for r in warns]
     assert coordinator._type2_drop_streak == STALE_DROP_STREAK_TO_WARN
 
@@ -537,8 +553,11 @@ def test_streak_warning_does_not_repeat_after_threshold_type_2(caplog) -> None:
         for _ in range(STALE_DROP_STREAK_TO_WARN + 10):
             coordinator.handle_location_item(_type_2(time=500, mp=1))
 
-    warns = [r for r in caplog.records if r.levelname == "WARNING"
-             and "type-2" in r.getMessage()]
+    warns = [
+        r
+        for r in caplog.records
+        if r.levelname == "WARNING" and "type-2" in r.getMessage()
+    ]
     assert len(warns) == 1
 
 
@@ -574,8 +593,11 @@ def test_streak_warning_fires_at_threshold_type_1(caplog) -> None:
         for _ in range(STALE_DROP_STREAK_TO_WARN):
             coordinator.handle_location_item(_type_1(time=500))
 
-    warns = [r for r in caplog.records if r.levelname == "WARNING"
-             and "type-1" in r.getMessage()]
+    warns = [
+        r
+        for r in caplog.records
+        if r.levelname == "WARNING" and "type-1" in r.getMessage()
+    ]
     assert len(warns) == 1
     assert coordinator._type1_drop_streak == STALE_DROP_STREAK_TO_WARN
 
