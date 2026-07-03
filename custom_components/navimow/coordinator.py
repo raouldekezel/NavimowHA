@@ -89,13 +89,14 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # the last observed values rather than showing "unknown" until the
         # next mowing session.
         self.stats: dict[str, Any] | None = None
-        # FEAT-05: firmware `time` (epoch ms) of the last accepted /location
-        # type-2 packet. Feeds the ordering guard in `_handle_location_stats`.
-        # Ordering matters because the accumulators the tracker will consume
-        # (subtotalArea, mowingPercentage, currentMowProgress) regress if a
-        # late-delivered packet lands (2026-05-25 diag: one type-2 arrived
-        # 1 h 37 min out of order, same pathology family as BUG-05 on /state).
-        self._last_location_stats_time: int | None = None
+        # FEAT-05 layer-1 guard: firmware `time` (epoch ms) of the last
+        # accepted /location packet, tracked per stream (type-1 poses at
+        # ~2 s and type-2 stats at ~30-90 s have independent cadences).
+        # Same pathology family as BUG-05 on /state; the tracker in step (b)
+        # layers `wk` monotonicity + wk₀+sub invariant on top. In-memory
+        # only in (a); persistence arrives in (c).
+        self._last_accepted_time_type1: int | None = None
+        self._last_accepted_time_type2: int | None = None
 
     async def async_setup(self) -> None:
         """Register callbacks from SDK."""
@@ -124,25 +125,25 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         parsed = parse_location_type_2(item)
         if parsed is None:
             return
-        # FEAT-05: /location ordering guard. Drop items whose firmware `time`
-        # is not strictly greater than the last accepted item's — a late
-        # delivery would otherwise regress the accumulators (subtotal, mp,
-        # cmp) and mislead the tracker. Guard only fires when both times are
-        # known: if the incoming or the stored time is missing the payload
-        # is accepted, matching the parser's defensively-tolerant spirit.
+        # FEAT-05 layer-1: drop items whose firmware `time` is not strictly
+        # greater than the last accepted type-2's — catches ordering
+        # regressions and duplicates. Guard is intentionally ordering-only;
+        # the tracker in step (b) layers `wk` monotonicity + wk₀+sub
+        # invariant on top for content-level checks. Guard is skipped when
+        # `time` is missing (defensive tolerance — never observed on i210
+        # over ~180 committed packets but the parser accepts the shape).
         incoming_time = parsed.get("time")
         if incoming_time is not None:
-            last_time = self._last_location_stats_time
+            last_time = self._last_accepted_time_type2
             if last_time is not None and incoming_time <= last_time:
                 _LOGGER.debug(
-                    "MQTT location type-2 DROPPED as out-of-order: "
-                    "incoming_time=%s last_time=%s device=%s",
+                    "MQTT location type-2 DROPPED as stale (time=%s <= last=%s) device=%s",
                     incoming_time,
                     last_time,
                     self.device.id,
                 )
                 return
-            self._last_location_stats_time = incoming_time
+            self._last_accepted_time_type2 = incoming_time
         self.stats = parsed
         # Stats belong to the coordinator's shared data dict, so refresh
         # entities via the standard path (they are on the ~30 s tick anyway;
@@ -154,6 +155,24 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         parsed = parse_location_type_1(item)
         if parsed is None:
             return
+
+        # FEAT-05 layer-1: same ordering guard on the type-1 stream. Cursor
+        # is independent from type-2 (`_last_accepted_time_type2`) because
+        # the two streams have distinct cadences (~2 s vs ~30-90 s) and a
+        # single shared cursor would drop the whole slower stream after
+        # every faster-stream update.
+        incoming_time = parsed.get("time")
+        if incoming_time is not None:
+            last_time = self._last_accepted_time_type1
+            if last_time is not None and incoming_time <= last_time:
+                _LOGGER.debug(
+                    "MQTT location type-1 DROPPED as stale (time=%s <= last=%s) device=%s",
+                    incoming_time,
+                    last_time,
+                    self.device.id,
+                )
+                return
+            self._last_accepted_time_type1 = incoming_time
 
         self.position = parsed
         vehicle_state = parsed["vehicle_state"]

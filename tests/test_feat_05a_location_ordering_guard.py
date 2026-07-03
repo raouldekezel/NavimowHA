@@ -1,31 +1,38 @@
-"""FEAT-05 step (a) — /location parser extension + type-2 ordering guard.
+"""FEAT-05 step (a) — /location parser extension + layer-1 ordering guard.
 
 Prerequisite for the run tracker (#43). Two shifts on the /location
 plumbing that the tracker will consume:
 
 1. Parser exposes the firmware `time` field on both type-1 and type-2
    items, plus `mow_start_type` and `sub_action` on type-2. These were
-   silently dropped by the FEAT-01/02 parsers; the tracker's ordering
+   silently dropped by the FEAT-01/02 parsers; the tracker's layered
    guard and per-run metadata need them.
-2. `NavimowCoordinator._handle_location_stats` drops a type-2 whose
-   firmware `time` is not strictly greater than the last accepted
-   type-2's. The 2026-05-25 diag (#20) contains a real out-of-order
-   packet — firmware time 2026-05-25T12:01:15 UTC delivered at
-   13:38:59 UTC, 1 h 37 min late. Its content is a valid *earlier* run
-   snapshot; without the guard the accumulators (subtotal, mp, cmp)
-   regress and the downstream tracker would misfire.
+2. `NavimowCoordinator` drops a /location item whose firmware `time`
+   is not strictly greater than the last accepted item's — layer-1 of
+   the three-layer guard the tracker in step (b) completes with `wk`
+   monotonicity + wk₀+sub invariant. Cursors are per-stream because
+   type-1 (~2 s) and type-2 (~30-90 s) have independent cadences: a
+   single shared cursor would drop the whole slower stream after every
+   faster-stream update.
 
-Guard is intentionally *ordering-only*, not shape-based. The SPIKE-02
+Guard is intentionally *ordering-only*, not shape-based. The SPIKE
 answer on #43 shows a shape filter (e.g. "reject mp=0 mid-run") would
 misfire on the legitimate first packet of a fresh run (BUG-07 trace).
+
+Fixture note (Fable brief 2026-07-03): the committed 2026-05-25
+sequence alone does *not* exercise any guard — within it, `time` and
+`wk` both advance across the late packet. The realistic reproduction
+of live conditions needs one synthetic predecessor stamped at the
+findings-timeline (~13:37:25 UTC, `wk ≈ 338`), followed by the real
+late packet (fw time 12:01:15 UTC, `wk 124.15`).
 """
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 # --------------------------------------------------------------------- #
-# 1. parser — new fields exposed on type-1                              #
+# 1. parser — new fields on type-1                                      #
 # --------------------------------------------------------------------- #
 
 
@@ -57,13 +64,13 @@ def test_parse_location_type_1_time_defaults_to_none() -> None:
 
 
 # --------------------------------------------------------------------- #
-# 2. parser — new fields exposed on type-2                              #
+# 2. parser — new fields on type-2                                      #
 # --------------------------------------------------------------------- #
 
 
 def test_parse_location_type_2_exposes_time_mowstarttype_subaction() -> None:
-    """The exact 2026-05-25 late-delivery packet (diag #20, line 18) — the
-    canonical fixture for the SPIKE-02 ordering-guard argument.
+    """The exact 2026-05-25 late-delivery packet (diag `#20`, line 18) —
+    the canonical fixture for the SPIKE ordering-guard argument.
     """
     from custom_components.navimow.location import parse_location_type_2
 
@@ -88,6 +95,10 @@ def test_parse_location_type_2_exposes_time_mowstarttype_subaction() -> None:
 
 
 def test_parse_location_type_2_new_fields_default_to_none() -> None:
+    """`sub_action` in particular must stay `None` when the JSON field is
+    absent — the packed `mapWorkPosition` word uses 0 for "absent" but
+    the parser stays faithful to the JSON (Fable brief).
+    """
     from custom_components.navimow.location import parse_location_type_2
 
     parsed = parse_location_type_2({"type": 2, "mowingWeekArea": "42.0"})
@@ -98,7 +109,7 @@ def test_parse_location_type_2_new_fields_default_to_none() -> None:
 
 
 # --------------------------------------------------------------------- #
-# 3. coordinator — ordering guard                                       #
+# 3. coordinator — layer-1 guard on type-2                              #
 # --------------------------------------------------------------------- #
 
 
@@ -120,13 +131,15 @@ def _make_coordinator():
     coordinator.vehicle_state = None
     coordinator._last_position_dispatch = 0.0
     coordinator.stats = None
-    coordinator._last_location_stats_time = None
+    coordinator._last_accepted_time_type1 = None
+    coordinator._last_accepted_time_type2 = None
     coordinator._build_data = MagicMock(return_value={})
     coordinator.async_set_updated_data = MagicMock()
     return coordinator
 
 
-def _type_2(*, time: int | None, mp: int = 5, subtotal: str = "10.0", boundary: int = 1):
+def _type_2(*, time: int | None, mp: int = 5, subtotal: str = "10.0",
+            wk: str = "100.0", boundary: int = 1):
     """Minimal type-2 shape; `time` is the axis under test."""
     item = {
         "type": 2,
@@ -134,7 +147,19 @@ def _type_2(*, time: int | None, mp: int = 5, subtotal: str = "10.0", boundary: 
         "currentMowProgress": 500,
         "mowingPercentage": mp,
         "subtotalArea": subtotal,
-        "mowingWeekArea": "100.0",
+        "mowingWeekArea": wk,
+    }
+    if time is not None:
+        item["time"] = time
+    return item
+
+
+def _type_1(*, time: int | None, x: str = "1.0", y: str = "2.0", vs: int = 4):
+    item = {
+        "type": 1,
+        "postureX": x,
+        "postureY": y,
+        "vehicleState": vs,
     }
     if time is not None:
         item["time"] = time
@@ -148,57 +173,69 @@ def test_first_type_2_is_accepted_and_stamps_the_clock() -> None:
 
     assert coordinator.stats is not None
     assert coordinator.stats["mowing_percentage"] == 1
-    assert coordinator._last_location_stats_time == 1779694531266
+    assert coordinator._last_accepted_time_type2 == 1779694531266
     coordinator.async_set_updated_data.assert_called_once()
 
 
 def test_strictly_newer_type_2_is_accepted() -> None:
     coordinator = _make_coordinator()
-    coordinator._last_location_stats_time = 1779694531266
+    coordinator._last_accepted_time_type2 = 1779694531266
 
     coordinator.handle_location_item(
         _type_2(time=1779694541261, mp=2, subtotal="20.0")
     )
 
     assert coordinator.stats["mowing_percentage"] == 2
-    assert coordinator._last_location_stats_time == 1779694541261
+    assert coordinator._last_accepted_time_type2 == 1779694541261
 
 
-def test_late_delivery_type_2_is_dropped(caplog) -> None:
-    """The canonical fixture: after accepting the resumption packet
-    (`time=1779724117341` = 2026-05-25T15:48:37 UTC), a *later-delivered*
-    packet whose firmware `time=1779710475448` is 3 h 46 min in the past
-    must not overwrite the accumulators.
+def test_late_delivered_type_2_is_dropped(caplog) -> None:
+    """Reproduce live conditions: after the coordinator has accepted a
+    packet stamped at the findings-timeline live values (~13:37:25 UTC
+    `2026-05-25`, `wk ≈ 338`), inject the *real* late-delivered packet
+    from the committed log — fw `time=1779710475448` (12:01:15 UTC),
+    `wk 124.15`, `sub 0.39`. Its `time` is 1 h 36 min in the past
+    relative to the synthetic predecessor, so layer-1 must drop it.
+    Stats and the type-2 cursor stay untouched.
+
+    The synthetic predecessor is necessary because the committed
+    sequence alone leaves the late packet with `time > all prior
+    committed times` and would pass the guard — see the Fable brief
+    fixture caveat.
     """
     coordinator = _make_coordinator()
-    # Prime with the "fresh" resumption packet.
+    # Synthetic predecessor at findings-timeline live values.
     coordinator.handle_location_item(
-        _type_2(time=1779724117341, mp=63, subtotal="227.82", boundary=1)
+        _type_2(time=1779716245448, mp=48, subtotal="180.0", wk="338.0")
     )
-    assert coordinator.stats["mowing_percentage"] == 63
+    assert coordinator.stats["mowing_percentage"] == 48
 
     caplog.clear()
-    # Now inject the late-delivered packet — same run marker but earlier
-    # firmware timestamp.
     with caplog.at_level("DEBUG", logger="custom_components.navimow.coordinator"):
+        # Real late packet from docs/diag/2026-05-25_feat-02_multizone-run/.
         coordinator.handle_location_item(
-            _type_2(time=1779710475448, mp=0, subtotal="0.39", boundary=1)
+            _type_2(
+                time=1779710475448,
+                mp=0,
+                subtotal="0.39",
+                wk="124.15",
+                boundary=1,
+            )
         )
 
     # Stats untouched by the drop.
-    assert coordinator.stats["mowing_percentage"] == 63
-    assert coordinator.stats["area_session"] == 227.82
-    # Clock untouched by the drop.
-    assert coordinator._last_location_stats_time == 1779724117341
-    # DEBUG line emitted.
+    assert coordinator.stats["mowing_percentage"] == 48
+    assert coordinator.stats["area_session"] == 180.0
+    # Cursor untouched by the drop.
+    assert coordinator._last_accepted_time_type2 == 1779716245448
+    # DEBUG line emitted with the BUG-05-style wording.
     assert any(
-        "DROPPED as out-of-order" in rec.getMessage() for rec in caplog.records
+        "DROPPED as stale" in rec.getMessage() for rec in caplog.records
     ), [rec.getMessage() for rec in caplog.records]
 
 
 def test_equal_timestamp_type_2_is_dropped() -> None:
-    """Strict-less-than: a re-delivered packet with the same firmware
-    `time` as the last accepted one carries no new information and must
+    """Strict-less-than: a duplicate carries no new information and must
     not spuriously refresh downstream entities.
     """
     coordinator = _make_coordinator()
@@ -213,7 +250,7 @@ def test_equal_timestamp_type_2_is_dropped() -> None:
 
 
 def test_guard_recovers_after_drop() -> None:
-    """A dropped packet must not corrupt the clock: the next fresh
+    """A dropped packet does not corrupt the cursor: the next fresh
     packet (strictly greater `time` than the *last accepted*) still
     lands.
     """
@@ -224,15 +261,13 @@ def test_guard_recovers_after_drop() -> None:
 
     assert coordinator.stats["mowing_percentage"] == 7
     assert coordinator.stats["area_session"] == 30.0
-    assert coordinator._last_location_stats_time == 2000
+    assert coordinator._last_accepted_time_type2 == 2000
 
 
-def test_type_2_without_time_is_accepted_and_leaves_clock_alone() -> None:
-    """Defensive tolerance: a firmware variant that omits `time`
-    entirely (never observed on i210 in ~180 committed packets, but
-    the parser tolerates the shape) still populates stats. The
-    ordering clock stays at whatever the last *timestamped* packet
-    left it at.
+def test_type_2_without_time_is_accepted_and_leaves_cursor_alone() -> None:
+    """Defensive tolerance: a firmware variant that omits `time` still
+    populates stats. The ordering cursor stays at whatever the last
+    *timestamped* packet left it at.
     """
     coordinator = _make_coordinator()
     coordinator.handle_location_item(_type_2(time=1000, mp=5))
@@ -241,17 +276,125 @@ def test_type_2_without_time_is_accepted_and_leaves_clock_alone() -> None:
 
     assert coordinator.stats["mowing_percentage"] == 6
     assert coordinator.stats["area_session"] == 12.0
-    assert coordinator._last_location_stats_time == 1000  # unchanged
+    assert coordinator._last_accepted_time_type2 == 1000  # unchanged
 
 
 def test_first_type_2_without_time_is_accepted() -> None:
     """Cold start with a time-less payload: no ordering signal to gate
-    on, but data lands and the clock stays None until a timestamped
-    packet arrives.
+    on, data lands, cursor stays None until a timestamped packet
+    arrives.
     """
     coordinator = _make_coordinator()
 
     coordinator.handle_location_item(_type_2(time=None, mp=3))
 
     assert coordinator.stats["mowing_percentage"] == 3
-    assert coordinator._last_location_stats_time is None
+    assert coordinator._last_accepted_time_type2 is None
+
+
+# --------------------------------------------------------------------- #
+# 4. coordinator — layer-1 guard on type-1                              #
+# --------------------------------------------------------------------- #
+
+
+def test_first_type_1_is_accepted_and_stamps_the_clock() -> None:
+    coordinator = _make_coordinator()
+
+    with patch("custom_components.navimow.coordinator.async_dispatcher_send"):
+        coordinator.handle_location_item(_type_1(time=1779521583454))
+
+    assert coordinator.position is not None
+    assert coordinator.position["x"] == 1.0
+    assert coordinator._last_accepted_time_type1 == 1779521583454
+
+
+def test_late_delivered_type_1_is_dropped(caplog) -> None:
+    coordinator = _make_coordinator()
+    coordinator._last_accepted_time_type1 = 2000
+
+    caplog.clear()
+    with (
+        patch("custom_components.navimow.coordinator.async_dispatcher_send") as disp,
+        caplog.at_level("DEBUG", logger="custom_components.navimow.coordinator"),
+    ):
+        coordinator.handle_location_item(_type_1(time=1000, x="99.0"))
+
+    # Position untouched.
+    assert coordinator.position is None
+    # Dispatch not called.
+    disp.assert_not_called()
+    # DEBUG line emitted.
+    assert any(
+        "type-1 DROPPED as stale" in rec.getMessage() for rec in caplog.records
+    ), [rec.getMessage() for rec in caplog.records]
+
+
+def test_equal_timestamp_type_1_is_dropped() -> None:
+    coordinator = _make_coordinator()
+    coordinator._last_accepted_time_type1 = 1000
+
+    with patch("custom_components.navimow.coordinator.async_dispatcher_send") as disp:
+        coordinator.handle_location_item(_type_1(time=1000, x="99.0"))
+
+    assert coordinator.position is None
+    disp.assert_not_called()
+
+
+def test_type_1_without_time_is_accepted_and_leaves_cursor_alone() -> None:
+    coordinator = _make_coordinator()
+    coordinator._last_accepted_time_type1 = 1000
+
+    with patch("custom_components.navimow.coordinator.async_dispatcher_send"):
+        coordinator.handle_location_item(_type_1(time=None, x="3.0"))
+
+    assert coordinator.position is not None
+    assert coordinator.position["x"] == 3.0
+    assert coordinator._last_accepted_time_type1 == 1000  # unchanged
+
+
+# --------------------------------------------------------------------- #
+# 5. cursors independence                                               #
+# --------------------------------------------------------------------- #
+
+
+def test_type_1_and_type_2_cursors_are_independent() -> None:
+    """The two streams have independent cadences (~2 s vs ~30-90 s). A
+    fresh type-1 must not push the type-2 cursor forward, and vice
+    versa — otherwise the slower stream would be drop-flooded.
+    """
+    coordinator = _make_coordinator()
+
+    with patch("custom_components.navimow.coordinator.async_dispatcher_send"):
+        coordinator.handle_location_item(_type_1(time=5000))
+        coordinator.handle_location_item(_type_2(time=1000, mp=1))
+
+    # Each cursor stamped by its own stream only.
+    assert coordinator._last_accepted_time_type1 == 5000
+    assert coordinator._last_accepted_time_type2 == 1000
+    # Type-2 packet with time=1000 was NOT dropped by the type-1 cursor
+    # (would happen with a single shared cursor).
+    assert coordinator.stats is not None
+    assert coordinator.stats["mowing_percentage"] == 1
+
+
+def test_type_1_flood_does_not_starve_type_2() -> None:
+    """A realistic sequence: type-1 arrives at 2 s cadence, type-2 at
+    30-90 s. Interleave them and verify each stream keeps making
+    progress under the per-stream guard.
+    """
+    coordinator = _make_coordinator()
+
+    with patch("custom_components.navimow.coordinator.async_dispatcher_send"):
+        # type-1 at 1000, 3000, 5000 (fast cadence)
+        coordinator.handle_location_item(_type_1(time=1000))
+        coordinator.handle_location_item(_type_1(time=3000))
+        coordinator.handle_location_item(_type_1(time=5000))
+        # type-2 at 2000, 60000 (slower — some type-2 times fall BEFORE
+        # some type-1 times; per-stream cursors let both land)
+        coordinator.handle_location_item(_type_2(time=2000, mp=1))
+        coordinator.handle_location_item(_type_2(time=60000, mp=2, subtotal="20.0"))
+
+    assert coordinator._last_accepted_time_type1 == 5000
+    assert coordinator._last_accepted_time_type2 == 60000
+    assert coordinator.stats["mowing_percentage"] == 2
+    assert coordinator.position["x"] == 1.0  # last type-1 accepted
