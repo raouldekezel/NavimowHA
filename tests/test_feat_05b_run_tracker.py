@@ -665,6 +665,16 @@ def test_coordinator_instantiates_run_tracker() -> None:
     coordinator.async_set_updated_data = MagicMock()
     coordinator.run_tracker = RunTracker()
 
+    # FEAT-05 (c) persistence + history attributes.
+
+    coordinator.history = []
+
+    coordinator.last_finished_run = None
+
+    coordinator._store = None
+
+    coordinator._last_store_save_monotonic = 0.0
+
     coordinator.handle_location_item(
         {
             "type": 2,
