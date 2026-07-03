@@ -48,6 +48,7 @@ def _make_coordinator():
     coordinator._last_data_source = None
     coordinator.oauth_session = None
     coordinator._mqtt_disconnect_warned = False  # introduced by BUG-01
+    coordinator._mqtt_disconnect_ticks = 0  # introduced by HARD-04
 
     coordinator._device_status_to_state = MagicMock(return_value=MagicMock())
     coordinator._build_data = MagicMock(return_value={})

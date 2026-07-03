@@ -22,6 +22,7 @@ from mower_sdk.sdk import NavimowSDK
 from .const import (
     DOMAIN,
     HTTP_FALLBACK_MIN_INTERVAL,
+    MQTT_DISCONNECT_TICKS_TO_WARN,
     MQTT_STALE_SECONDS,
     POSITION_THROTTLE_SECONDS,
     SIGNAL_POSITION_UPDATE,
@@ -70,6 +71,12 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # ~120 identical lines. Flag flips True once we have emitted the
         # WARNING; flips False once we have emitted the paired INFO.
         self._mqtt_disconnect_warned: bool = False
+        # HARD-04: debounce the WARNING so a routine sub-second token-refresh
+        # reconnect that happens to span a tick does not raise it. Counter
+        # increments each tick that observes `is_connected=False`, resets to
+        # 0 on any tick that observes True. WARN fires only when the counter
+        # reaches MQTT_DISCONNECT_TICKS_TO_WARN.
+        self._mqtt_disconnect_ticks: int = 0
         # FEAT-01: live pose from the /realtimeDate/location channel that
         # the SDK does not subscribe. Stored separately from `_last_state`
         # so it does NOT interfere with the HTTP fallback freshness logic.
@@ -264,19 +271,29 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # decouples "connectivity recovered" from "state is fresh again"
         # so a lingering HTTP-fallback-only mode still reports the
         # reconnect the moment it happens. (BUG-01)
+        #
+        # HARD-04 extends this: the WARN is further debounced by a counter
+        # of consecutive `is_connected=False` ticks, so a routine sub-second
+        # reconnect (~40 min token refresh, per FEAT-03 diag) that spans a
+        # tick does not raise it. The counter resets on any True observation.
+        if not self.sdk.is_connected:
+            self._mqtt_disconnect_ticks += 1
+        else:
+            if self._mqtt_disconnect_warned:
+                _LOGGER.info("MQTT reconnected for device %s", self.device.id)
+                self._mqtt_disconnect_warned = False
+            self._mqtt_disconnect_ticks = 0
+
         if (
             not self._mqtt_disconnect_warned
+            and self._mqtt_disconnect_ticks >= MQTT_DISCONNECT_TICKS_TO_WARN
             and is_state_stale
-            and not self.sdk.is_connected
         ):
             _LOGGER.warning(
                 "MQTT appears disconnected for device %s; relying on HTTP fallback",
                 self.device.id,
             )
             self._mqtt_disconnect_warned = True
-        elif self._mqtt_disconnect_warned and self.sdk.is_connected:
-            _LOGGER.info("MQTT reconnected for device %s", self.device.id)
-            self._mqtt_disconnect_warned = False
 
         if is_state_stale and can_http_fetch:
             try:
