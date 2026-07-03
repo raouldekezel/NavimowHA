@@ -31,6 +31,11 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+# Fixed wall-clock instant used across the clamp/streak tests (2026-07-03
+# 12:00:00 UTC). Keeping it constant avoids `time.time()` drift between
+# invocations within a single test and matches the diag session dates.
+_NOW_MS = 1783080000000
+
 # --------------------------------------------------------------------- #
 # 1. parser — new fields on type-1                                      #
 # --------------------------------------------------------------------- #
@@ -133,6 +138,8 @@ def _make_coordinator():
     coordinator.stats = None
     coordinator._last_accepted_time_type1 = None
     coordinator._last_accepted_time_type2 = None
+    coordinator._type1_drop_streak = 0
+    coordinator._type2_drop_streak = 0
     coordinator._build_data = MagicMock(return_value={})
     coordinator.async_set_updated_data = MagicMock()
     return coordinator
@@ -398,3 +405,197 @@ def test_type_1_flood_does_not_starve_type_2() -> None:
     assert coordinator._last_accepted_time_type2 == 60000
     assert coordinator.stats["mowing_percentage"] == 2
     assert coordinator.position["x"] == 1.0  # last type-1 accepted
+
+
+# --------------------------------------------------------------------- #
+# 6. cursor clamp — future-stamped packets can't poison the guard       #
+# --------------------------------------------------------------------- #
+
+
+def test_future_stamped_type_2_is_accepted_but_cursor_is_clamped() -> None:
+    """A packet 24 h in the future must not lock the guard until HA
+    restarts. Content-level judgement lives in step (b); the accept-
+    but-clamp behaviour in (a) makes the guard self-heal within the
+    tolerance window (5 min) of a subsequent legitimate packet.
+    """
+    from custom_components.navimow.const import FUTURE_TIMESTAMP_TOLERANCE_MS
+
+    coordinator = _make_coordinator()
+
+    future_time = _NOW_MS + 24 * 3600 * 1000  # +24 h
+    with patch("custom_components.navimow.coordinator.time.time",
+               return_value=_NOW_MS / 1000):
+        coordinator.handle_location_item(_type_2(time=future_time, mp=1))
+
+    # Packet was accepted (stats populated).
+    assert coordinator.stats["mowing_percentage"] == 1
+    # But the cursor is clamped, not stamped at the future value.
+    assert coordinator._last_accepted_time_type2 == (
+        _NOW_MS + FUTURE_TIMESTAMP_TOLERANCE_MS
+    )
+
+
+def test_present_time_type_2_is_stamped_unchanged() -> None:
+    """The clamp is a ceiling, not a rewriter: a packet whose `time` is
+    below the ceiling stamps the cursor at its own value (not the
+    ceiling).
+    """
+    coordinator = _make_coordinator()
+
+    with patch("custom_components.navimow.coordinator.time.time",
+               return_value=_NOW_MS / 1000):
+        coordinator.handle_location_item(_type_2(time=_NOW_MS - 10_000, mp=1))
+
+    assert coordinator._last_accepted_time_type2 == _NOW_MS - 10_000
+
+
+def test_cursor_self_heals_after_future_clamp() -> None:
+    """The recovery contract: after a future-stamped packet clamps the
+    cursor to `now + 5 min`, a subsequent packet whose `time` exceeds
+    that ceiling is accepted and restamps the cursor. No indefinite
+    freeze on the stream.
+    """
+    from custom_components.navimow.const import FUTURE_TIMESTAMP_TOLERANCE_MS
+
+    coordinator = _make_coordinator()
+
+    future_time = _NOW_MS + 24 * 3600 * 1000
+    with patch("custom_components.navimow.coordinator.time.time",
+               return_value=_NOW_MS / 1000):
+        coordinator.handle_location_item(_type_2(time=future_time, mp=1))
+
+    # Elapse enough wall-clock that a legitimate packet has `time` above
+    # the clamped ceiling.
+    later = _NOW_MS + FUTURE_TIMESTAMP_TOLERANCE_MS + 60_000
+    with patch("custom_components.navimow.coordinator.time.time",
+               return_value=later / 1000):
+        coordinator.handle_location_item(_type_2(time=later, mp=2, subtotal="20.0"))
+
+    assert coordinator.stats["mowing_percentage"] == 2
+    # Cursor advanced to the healing packet's own value.
+    assert coordinator._last_accepted_time_type2 == later
+
+
+def test_future_stamped_type_1_cursor_is_clamped() -> None:
+    from custom_components.navimow.const import FUTURE_TIMESTAMP_TOLERANCE_MS
+
+    coordinator = _make_coordinator()
+
+    future_time = _NOW_MS + 24 * 3600 * 1000
+    with (
+        patch("custom_components.navimow.coordinator.async_dispatcher_send"),
+        patch("custom_components.navimow.coordinator.time.time",
+              return_value=_NOW_MS / 1000),
+    ):
+        coordinator.handle_location_item(_type_1(time=future_time))
+
+    assert coordinator.position is not None
+    assert coordinator._last_accepted_time_type1 == (
+        _NOW_MS + FUTURE_TIMESTAMP_TOLERANCE_MS
+    )
+
+
+# --------------------------------------------------------------------- #
+# 7. streak WARNING — observability without spam                        #
+# --------------------------------------------------------------------- #
+
+
+def test_streak_warning_fires_at_threshold_type_2(caplog) -> None:
+    """Fires exactly once, at the threshold — not earlier, not once per
+    subsequent drop.
+    """
+    from custom_components.navimow.const import STALE_DROP_STREAK_TO_WARN
+
+    coordinator = _make_coordinator()
+    # Prime the cursor at 1000 so all subsequent time<=1000 packets drop.
+    coordinator._last_accepted_time_type2 = 1000
+
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="custom_components.navimow.coordinator"):
+        for _ in range(STALE_DROP_STREAK_TO_WARN - 1):
+            coordinator.handle_location_item(_type_2(time=500, mp=1))
+        # N-1 drops → no WARNING yet.
+        assert not any("dropped" in r.getMessage() for r in caplog.records), \
+            [r.getMessage() for r in caplog.records]
+
+        coordinator.handle_location_item(_type_2(time=500, mp=1))  # Nth drop
+
+    warns = [r for r in caplog.records if r.levelname == "WARNING"
+             and "type-2" in r.getMessage()]
+    assert len(warns) == 1, [r.getMessage() for r in warns]
+    assert coordinator._type2_drop_streak == STALE_DROP_STREAK_TO_WARN
+
+
+def test_streak_warning_does_not_repeat_after_threshold_type_2(caplog) -> None:
+    from custom_components.navimow.const import STALE_DROP_STREAK_TO_WARN
+
+    coordinator = _make_coordinator()
+    coordinator._last_accepted_time_type2 = 1000
+
+    with caplog.at_level("WARNING", logger="custom_components.navimow.coordinator"):
+        # Push past the threshold — additional drops must not re-fire.
+        for _ in range(STALE_DROP_STREAK_TO_WARN + 10):
+            coordinator.handle_location_item(_type_2(time=500, mp=1))
+
+    warns = [r for r in caplog.records if r.levelname == "WARNING"
+             and "type-2" in r.getMessage()]
+    assert len(warns) == 1
+
+
+def test_streak_resets_on_acceptance_type_2() -> None:
+    """A single legitimate packet zeroes the counter, so the next drop
+    starts a fresh streak rather than compounding with the old one.
+    """
+    coordinator = _make_coordinator()
+    coordinator._last_accepted_time_type2 = 1000
+
+    for _ in range(10):
+        coordinator.handle_location_item(_type_2(time=500, mp=1))
+    assert coordinator._type2_drop_streak == 10
+
+    # A fresh packet: streak resets to 0.
+    coordinator.handle_location_item(_type_2(time=2000, mp=2, subtotal="20.0"))
+    assert coordinator._type2_drop_streak == 0
+
+    coordinator.handle_location_item(_type_2(time=500, mp=1))
+    assert coordinator._type2_drop_streak == 1  # not 11
+
+
+def test_streak_warning_fires_at_threshold_type_1(caplog) -> None:
+    from custom_components.navimow.const import STALE_DROP_STREAK_TO_WARN
+
+    coordinator = _make_coordinator()
+    coordinator._last_accepted_time_type1 = 1000
+
+    with (
+        patch("custom_components.navimow.coordinator.async_dispatcher_send"),
+        caplog.at_level("WARNING", logger="custom_components.navimow.coordinator"),
+    ):
+        for _ in range(STALE_DROP_STREAK_TO_WARN):
+            coordinator.handle_location_item(_type_1(time=500))
+
+    warns = [r for r in caplog.records if r.levelname == "WARNING"
+             and "type-1" in r.getMessage()]
+    assert len(warns) == 1
+    assert coordinator._type1_drop_streak == STALE_DROP_STREAK_TO_WARN
+
+
+def test_streak_counters_are_independent_across_streams() -> None:
+    """Draining type-2 does not zero the type-1 counter and vice versa."""
+    coordinator = _make_coordinator()
+    coordinator._last_accepted_time_type1 = 1000
+    coordinator._last_accepted_time_type2 = 1000
+
+    with patch("custom_components.navimow.coordinator.async_dispatcher_send"):
+        # 5 drops on type-1
+        for _ in range(5):
+            coordinator.handle_location_item(_type_1(time=500))
+        # 3 drops on type-2
+        for _ in range(3):
+            coordinator.handle_location_item(_type_2(time=500, mp=1))
+
+        # Accepting a type-1 must not zero the type-2 counter.
+        coordinator.handle_location_item(_type_1(time=2000))
+
+    assert coordinator._type1_drop_streak == 0
+    assert coordinator._type2_drop_streak == 3

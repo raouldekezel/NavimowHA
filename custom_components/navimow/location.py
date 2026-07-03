@@ -77,9 +77,11 @@ def parse_location_type_2(item: dict[str, Any]) -> dict[str, Any] | None:
     - `boundary` (int; `currentMowBoundary`, internal id, not sequential)
     - `action` (int; sub-state code observed 5/8/-1, semantics TBD)
     - `time` (int, firmware epoch ms; None if firmware omitted it)
-    - `mow_start_type` (int; 0 = scheduled, 1 = manual observed so far)
+    - `mow_start_type` (int; 1 = manual (two controlled observations,
+      2026-05-25 afternoon + 2026-07-03); 0 presumed scheduled but
+      unconfirmed — single uncontrolled morning-run observation)
     - `sub_action` (int; only present when `action == 8`, value 6 in every
-      committed sample — see the SPIKE-02 note on #43)
+      committed sample — see the FEAT-05 SPIKE record on #43)
 
     Returns `None` only when the item is not a mapping. The individual
     fields fall back to `None` on parse errors — the operator's 2026-05-25

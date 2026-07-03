@@ -22,11 +22,13 @@ from mower_sdk.sdk import NavimowSDK
 
 from .const import (
     DOMAIN,
+    FUTURE_TIMESTAMP_TOLERANCE_MS,
     HTTP_FALLBACK_MIN_INTERVAL,
     MQTT_DISCONNECT_TICKS_TO_WARN,
     MQTT_STALE_SECONDS,
     POSITION_THROTTLE_SECONDS,
     SIGNAL_POSITION_UPDATE,
+    STALE_DROP_STREAK_TO_WARN,
     UPDATE_INTERVAL,
 )
 from .location import parse_location_type_1, parse_location_type_2
@@ -94,9 +96,17 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # ~2 s and type-2 stats at ~30-90 s have independent cadences).
         # Same pathology family as BUG-05 on /state; the tracker in step (b)
         # layers `wk` monotonicity + wk₀+sub invariant on top. In-memory
-        # only in (a); persistence arrives in (c).
+        # only in (a); persistence arrives in (c). The stamped value is
+        # clamped to `now + FUTURE_TIMESTAMP_TOLERANCE_MS` to keep a
+        # future-stamped packet from poisoning the cursor indefinitely.
         self._last_accepted_time_type1: int | None = None
         self._last_accepted_time_type2: int | None = None
+        # Consecutive-drop counters, one per stream. Increment on drop,
+        # reset on any acceptance. A single WARNING fires when a counter
+        # reaches `STALE_DROP_STREAK_TO_WARN` so an operator notices a
+        # stuck cursor without log flooding.
+        self._type1_drop_streak: int = 0
+        self._type2_drop_streak: int = 0
 
     async def async_setup(self) -> None:
         """Register callbacks from SDK."""
@@ -120,6 +130,20 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         elif msg_type == 2:
             self._handle_location_stats(item)
 
+    def _clamp_cursor(self, incoming_time_ms: int) -> int:
+        """Cap a firmware timestamp at `now + FUTURE_TIMESTAMP_TOLERANCE_MS`
+        before storing it as an ordering cursor.
+
+        A packet stamped anomalously far in the future (BUG-08-style
+        content/timestamp mismatch, or a robot RTC skewed ahead) is still
+        accepted — content-level judgement belongs to the step-(b) tracker
+        layers — but the cursor it stamps is clamped, so a subsequent
+        stream of legitimate (present-time) packets self-heals the guard
+        within the tolerance window.
+        """
+        now_ms = int(time.time() * 1000)
+        return min(incoming_time_ms, now_ms + FUTURE_TIMESTAMP_TOLERANCE_MS)
+
     @callback
     def _handle_location_stats(self, item: dict[str, Any]) -> None:
         parsed = parse_location_type_2(item)
@@ -136,14 +160,25 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if incoming_time is not None:
             last_time = self._last_accepted_time_type2
             if last_time is not None and incoming_time <= last_time:
+                self._type2_drop_streak += 1
                 _LOGGER.debug(
                     "MQTT location type-2 DROPPED as stale (time=%s <= last=%s) device=%s",
                     incoming_time,
                     last_time,
                     self.device.id,
                 )
+                if self._type2_drop_streak == STALE_DROP_STREAK_TO_WARN:
+                    _LOGGER.warning(
+                        "MQTT location type-2 dropped %d consecutive packets as stale "
+                        "for device %s; cursor may be poisoned by a future-stamped "
+                        "packet — will self-heal within ~%ds of a legitimate packet",
+                        self._type2_drop_streak,
+                        self.device.id,
+                        FUTURE_TIMESTAMP_TOLERANCE_MS // 1000,
+                    )
                 return
-            self._last_accepted_time_type2 = incoming_time
+            self._last_accepted_time_type2 = self._clamp_cursor(incoming_time)
+            self._type2_drop_streak = 0
         self.stats = parsed
         # Stats belong to the coordinator's shared data dict, so refresh
         # entities via the standard path (they are on the ~30 s tick anyway;
@@ -165,14 +200,25 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if incoming_time is not None:
             last_time = self._last_accepted_time_type1
             if last_time is not None and incoming_time <= last_time:
+                self._type1_drop_streak += 1
                 _LOGGER.debug(
                     "MQTT location type-1 DROPPED as stale (time=%s <= last=%s) device=%s",
                     incoming_time,
                     last_time,
                     self.device.id,
                 )
+                if self._type1_drop_streak == STALE_DROP_STREAK_TO_WARN:
+                    _LOGGER.warning(
+                        "MQTT location type-1 dropped %d consecutive packets as stale "
+                        "for device %s; cursor may be poisoned by a future-stamped "
+                        "packet — will self-heal within ~%ds of a legitimate packet",
+                        self._type1_drop_streak,
+                        self.device.id,
+                        FUTURE_TIMESTAMP_TOLERANCE_MS // 1000,
+                    )
                 return
-            self._last_accepted_time_type1 = incoming_time
+            self._last_accepted_time_type1 = self._clamp_cursor(incoming_time)
+            self._type1_drop_streak = 0
 
         self.position = parsed
         vehicle_state = parsed["vehicle_state"]

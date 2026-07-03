@@ -88,11 +88,13 @@ def _make_coordinator():
     coordinator.vehicle_state = None
     coordinator._last_position_dispatch = 0.0
     coordinator.stats = None
-    # FEAT-05 layer-1 guard cursors, per-stream — initialised here so
-    # tests that use `__new__` (skipping `__init__`) can invoke the
-    # /location handlers.
+    # FEAT-05 layer-1 guard cursors + drop streaks, per-stream — set
+    # here so tests that use `__new__` (skipping `__init__`) can invoke
+    # the /location handlers.
     coordinator._last_accepted_time_type1 = None
     coordinator._last_accepted_time_type2 = None
+    coordinator._type1_drop_streak = 0
+    coordinator._type2_drop_streak = 0
     coordinator._build_data = MagicMock(return_value={})
     coordinator.async_set_updated_data = MagicMock()
     return coordinator
