@@ -69,12 +69,21 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
         icon="mdi:grass",
         value_fn=lambda c: (c.stats or {}).get("area_week"),
     ),
+    # BUG-06: filter `boundary=0` as the session-init sentinel. The very
+    # first type-2 payload of a fresh mow carries `currentMowBoundary=0`
+    # with every other field also zero (`currentMowProgress=0`,
+    # `mowingPercentage=0`, `action=-1`, ...); the cloud only publishes
+    # the real boundary in the second packet ~60 s later. See the FEAT-02
+    # diag payload at `docs/diag/2026-05-25_feat-02_multizone-run/`
+    # (line 1, `time=1779694241252`). Falsy filter (`else None`) collapses
+    # both `None` and `0` into HA "unknown". `attrs_fn` keeps the raw
+    # numeric so `#0` remains inspectable in developer tools.
     NavimowSensorEntityDescription(
         key="current_zone",
         translation_key="current_zone",
         icon="mdi:map-marker-radius",
         value_fn=lambda c: (
-            f"#{b}" if (b := (c.stats or {}).get("boundary")) is not None else None
+            f"#{b}" if (b := (c.stats or {}).get("boundary")) else None
         ),
         attrs_fn=lambda c: (
             {"boundary_id": c.stats.get("boundary")} if c.stats else None
