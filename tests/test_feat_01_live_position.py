@@ -107,6 +107,10 @@ def _make_coordinator():
     coordinator._last_accepted_time_type2 = None
     coordinator._type1_drop_streak = 0
     coordinator._type2_drop_streak = 0
+    # FEAT-05 (b): run tracker (idle, emits nothing until fed).
+    from custom_components.navimow.run_tracker import RunTracker
+
+    coordinator.run_tracker = RunTracker()
     coordinator._build_data = MagicMock(return_value={})
     coordinator.async_set_updated_data = MagicMock()
     return coordinator

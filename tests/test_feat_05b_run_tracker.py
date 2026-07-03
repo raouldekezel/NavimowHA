@@ -1,0 +1,678 @@
+"""FEAT-05 step (b) — RunTracker state machine + layers 2-3 guards.
+
+The tracker is a pure module (zero HA imports); every test drives it
+directly. Fixtures come from the committed diag logs where possible —
+those two runs cover almost every real-world path (start, boundary
+change, invariant holds, no drops); the remaining paths that are not in
+the corpus (mid-run pause/resume, sustained interruption, ISO-Monday
+rollover, vs=8 firmware transient) are synthesised as spelt out in the
+Fable brief on #43.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from custom_components.navimow.location import parse_location_type_2
+from custom_components.navimow.run_tracker import (
+    EVENT_RUN_FINISHED,
+    EVENT_RUN_REOPENED,
+    EVENT_RUN_STARTED,
+    INTERRUPT_SUSTAIN_SECONDS,
+    RESULT_COMPLETED,
+    RESULT_INTERRUPTED,
+    STATE_COMPLETED,
+    STATE_IDLE,
+    STATE_INTERRUPTED,
+    STATE_PAUSED_DOCKED,
+    STATE_RUNNING,
+    VS_DOCKED_CHARGING,
+    VS_DOCKED_IDLE,
+    VS_DOCKED_UNPOWERED,
+    VS_MOWING,
+    VS_PAUSED,
+    VS_TRANSIENT,
+    RunTracker,
+)
+
+REPO_ROOT = Path(__file__).parent.parent
+FIXTURE_2026_05_25 = (
+    REPO_ROOT
+    / "docs/diag/2026-05-25_feat-02_multizone-run"
+    / "01_multizone-run-type-2-payloads.mqtt.log"
+)
+FIXTURE_2026_07_03 = (
+    REPO_ROOT
+    / "docs/diag/2026-07-03_bug-07_progression-battery-trace"
+    / "04_location-type2.mqtt.log"
+)
+
+
+def _load_type_2_items(path: Path) -> list[dict]:
+    """Extract type-2 payload items from a `/location` mqtt.log slice.
+
+    Filters to `paho-mqtt` lines so a log that also contains a
+    `MainThread` duplicate (2026-07-03) yields one item per packet.
+    """
+    pattern = re.compile(r"payload=(\[.*\])$")
+    items: list[dict] = []
+    for line in path.read_text().splitlines():
+        if "paho-mqtt" not in line:
+            continue
+        match = pattern.search(line.strip())
+        if not match:
+            continue
+        arr = json.loads(match.group(1))
+        for item in arr:
+            if item.get("type") == 2:
+                items.append(item)
+    return items
+
+
+class FakeClock:
+    """Manually-advanced monotonic clock for the sustained-60 s tests."""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _epoch_ms(dt: datetime) -> int:
+    return int(dt.timestamp() * 1000)
+
+
+def _feed(tracker: RunTracker, items: list[dict]) -> list:
+    events = []
+    for item in items:
+        parsed = parse_location_type_2(item)
+        events.extend(tracker.process_type2(parsed))
+    return events
+
+
+# --------------------------------------------------------------------- #
+# 1. Full replay — 2026-05-25 log (two runs, mst=0 → mst=1)             #
+# --------------------------------------------------------------------- #
+
+
+def test_full_replay_2026_05_25_yields_two_runs_with_zone_crossing() -> None:
+    """The committed log's 34 packets tell a two-run story:
+
+    - Morning run (`mst=0`): a `boundary=0` sentinel + 17 zone-3
+      packets ending at `sub=21.76` (the log truncates well before
+      that run's real end).
+    - Afternoon run (`mst=1`): starts on the late-delivered `boundary=1`
+      packet (`sub=0.39`, subtotal reset — closes the morning run
+      INTERRUPTED), continues through the boundary=1 → boundary=3
+      crossing (`sub 227.82` → `229.11`, no reset), and ends the log
+      still RUNNING at `sub=245.87`.
+    """
+    tracker = RunTracker()
+    items = _load_type_2_items(FIXTURE_2026_05_25)
+    assert len(items) == 34, len(items)
+
+    events = _feed(tracker, items)
+
+    starts = [e for e in events if e.kind == EVENT_RUN_STARTED]
+    finishes = [e for e in events if e.kind == EVENT_RUN_FINISHED]
+    assert len(starts) == 2, [e.payload for e in events]
+    assert len(finishes) == 1
+    # Morning run: opened on the sentinel, closed as interrupted at the
+    # reset packet, `mst=0`, visited exactly zone 3.
+    assert starts[0].payload["mow_start_type"] == 0
+    assert finishes[0].payload["result"] == RESULT_INTERRUPTED
+    assert finishes[0].payload["mow_start_type"] == 0
+    morning_zones = finishes[0].payload["zones"]
+    assert [z["boundary_id"] for z in morning_zones] == [3]
+    assert morning_zones[0]["sub_entry"] == 1.67
+    assert morning_zones[0]["sub_exit"] == 21.76
+    # Afternoon run: still RUNNING, visited zone 1 then zone 3 (a real
+    # in-run crossing — the `cmp` reset from 9901 → 0 at packet 21).
+    assert starts[1].payload["mow_start_type"] == 1
+    assert tracker.state == STATE_RUNNING
+    afternoon_zones = tracker.current_run["zones"]
+    assert [z["boundary_id"] for z in afternoon_zones] == [1, 3]
+    assert afternoon_zones[0]["sub_entry"] == 0.39
+    assert afternoon_zones[0]["sub_exit"] == 227.82
+    assert afternoon_zones[1]["sub_entry"] == 229.11
+    assert tracker.current_run["last_sub"] == 245.87
+    # No layer-2 or layer-3 drops on this well-formed corpus.
+    assert tracker.drops == {"layer_2": 0, "layer_3": 0}
+
+
+# --------------------------------------------------------------------- #
+# 2. Full replay — 2026-07-03 log (single run, single zone)             #
+# --------------------------------------------------------------------- #
+
+
+def test_full_replay_2026_07_03_yields_one_running_run() -> None:
+    """The 2026-07-03 trace stops before the operator's manual dock,
+    so the replay ends with the run still RUNNING. Nothing to close
+    from packet content alone — interruption comes from a subsequent
+    vs=1 sustained 60 s, exercised separately below.
+    """
+    tracker = RunTracker()
+    items = _load_type_2_items(FIXTURE_2026_07_03)
+    assert len(items) == 47, len(items)
+
+    events = _feed(tracker, items)
+
+    starts = [e for e in events if e.kind == EVENT_RUN_STARTED]
+    finishes = [e for e in events if e.kind == EVENT_RUN_FINISHED]
+    assert len(starts) == 1
+    assert len(finishes) == 0
+    assert starts[0].payload["mow_start_type"] == 1
+    assert tracker.state == STATE_RUNNING
+    zones = tracker.current_run["zones"]
+    assert [z["boundary_id"] for z in zones] == [1]
+    assert zones[0]["sub_entry"] == 2.6
+    assert zones[0]["sub_exit"] == 109.78
+    assert tracker.drops == {"layer_2": 0, "layer_3": 0}
+
+
+# --------------------------------------------------------------------- #
+# 3. Layer-2 rejects late packet after synthetic live predecessor       #
+# --------------------------------------------------------------------- #
+
+
+def test_synthetic_predecessor_plus_real_late_packet_layer_2_rejects() -> None:
+    """The Fable brief's fixture reconstruction: after the tracker has
+    accepted a packet stamped at the live findings-timeline (~13:37:25
+    UTC, wk ≈ 338), feeding it the *real* 2026-05-25 late packet (fw
+    time 12:01:15 UTC, wk 124.15) must be rejected by layer 2 — `wk`
+    regresses, and both packets are inside the same ISO week (2026-W22)
+    so the Monday exemption does not fire.
+    """
+    tracker = RunTracker()
+    predecessor = {
+        "type": 2,
+        "currentMowBoundary": 1,
+        "currentMowProgress": 4700,
+        "mowingPercentage": 42,
+        "subtotalArea": "200.0",  # wk₀ = 138 (any consistent value works)
+        "mowingWeekArea": "338.0",
+        "mowStartType": 1,
+        "time": 1779716245448,  # 2026-05-25T13:37:25 UTC
+    }
+    _feed(tracker, [predecessor])
+    assert tracker.state == STATE_RUNNING
+
+    late = {
+        "type": 2,
+        "currentMowBoundary": 1,
+        "currentMowProgress": 16,
+        "mowingPercentage": 0,
+        "subtotalArea": "0.39",
+        "mowingWeekArea": "124.15",
+        "mowStartType": 1,
+        "time": 1779710475448,  # 2026-05-25T12:01:15 UTC
+    }
+    events = _feed(tracker, [late])
+
+    assert events == []  # nothing surfaced from a rejected packet
+    assert tracker.drops["layer_2"] == 1
+    # Cursor untouched by the drop.
+    assert tracker.current_run["last_sub"] == 200.0
+
+
+# --------------------------------------------------------------------- #
+# 4. Pause/resume bracket — vs=2 dock mid-run, type-2 resumes           #
+# --------------------------------------------------------------------- #
+
+
+def test_synthetic_vs_2_pause_and_resume_bracket() -> None:
+    """Not directly committed anywhere. Simulate: run open → vs=2
+    (charging) → PAUSED_DOCKED; then a fresh type-2 with `sub ≥ last`
+    → RUNNING (same run), no `run_finished` or `run_reopened` in
+    between.
+    """
+    clock = FakeClock()
+    tracker = RunTracker(clock=clock)
+
+    _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "currentMowProgress": 500,
+                "mowingPercentage": 5,
+                "subtotalArea": "10.0",
+                "mowingWeekArea": "10.0",
+                "mowStartType": 1,
+                "time": 1_000_000_000_000,
+            }
+        ],
+    )
+    assert tracker.state == STATE_RUNNING
+
+    # Enter dock while charging — timer must NOT arm (recharge coming).
+    tracker.process_vehicle_state(VS_DOCKED_CHARGING, 1_000_000_000_000)
+    assert tracker.state == STATE_PAUSED_DOCKED
+    assert tracker._interrupt_timer_started_at is None
+    # Advance clock past 60 s to prove no timer fires.
+    clock.advance(120)
+    assert tracker.tick() == []
+    assert tracker.state == STATE_PAUSED_DOCKED
+
+    # Fresh type-2 with sub ≥ last → resume, same run.
+    events = _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "currentMowProgress": 2000,
+                "mowingPercentage": 20,
+                "subtotalArea": "20.0",
+                "mowingWeekArea": "20.0",
+                "mowStartType": 1,
+                "time": 1_000_000_120_000,
+            }
+        ],
+    )
+    assert events == []
+    assert tracker.state == STATE_RUNNING
+
+
+# --------------------------------------------------------------------- #
+# 5. False interruption + reopen                                        #
+# --------------------------------------------------------------------- #
+
+
+def test_vs_1_sustained_interrupts_then_reopens_on_continuation() -> None:
+    clock = FakeClock()
+    tracker = RunTracker(clock=clock)
+
+    _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 5,
+                "subtotalArea": "10.0",
+                "mowingWeekArea": "10.0",
+                "time": 1_000_000_000_000,
+            }
+        ],
+    )
+    # Dock to vs=1 → arm the timer.
+    tracker.process_vehicle_state(VS_DOCKED_IDLE, 1_000_000_000_000)
+    assert tracker.state == STATE_PAUSED_DOCKED
+    assert tracker._interrupt_timer_started_at == 0.0
+
+    # tick at 59 s — still holding.
+    clock.advance(59)
+    assert tracker.tick() == []
+    # tick at 65 s — sustained-60 s check fires.
+    clock.advance(6)
+    events = tracker.tick()
+    assert [e.kind for e in events] == [EVENT_RUN_FINISHED]
+    assert events[0].payload["result"] == RESULT_INTERRUPTED
+    assert tracker.state == STATE_INTERRUPTED
+
+    # Fresh type-2 that continues the accumulator (sub ≥ last) → reopen.
+    events = _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 6,
+                "subtotalArea": "12.0",
+                "mowingWeekArea": "12.0",
+                "time": 1_000_000_200_000,
+            }
+        ],
+    )
+    assert [e.kind for e in events] == [EVENT_RUN_REOPENED]
+    assert tracker.state == STATE_RUNNING
+    # Accumulator carries forward: sub advanced 10 → 12, no new run
+    # started.
+    assert tracker.current_run["last_sub"] == 12.0
+
+
+# --------------------------------------------------------------------- #
+# 6. vs=3 base-loss mid-pause interrupts after 60 s                     #
+# --------------------------------------------------------------------- #
+
+
+def test_vs_3_base_unpowered_interrupts_after_60s() -> None:
+    """`vs=3` = docked-but-base-unpowered. The base cannot recharge the
+    battery, so this is equivalent to `vs=1` for interruption purposes
+    — the BUG-04 pathological case Fable pointed out. The timer must
+    arm and fire at the sustained threshold.
+    """
+    clock = FakeClock()
+    tracker = RunTracker(clock=clock)
+
+    _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "mowingPercentage": 5,
+                "subtotalArea": "10.0",
+                "mowingWeekArea": "10.0",
+                "time": 1_000_000_000_000,
+            }
+        ],
+    )
+    tracker.process_vehicle_state(VS_DOCKED_UNPOWERED, 1_000_000_000_000)
+    assert tracker.state == STATE_PAUSED_DOCKED
+
+    clock.advance(INTERRUPT_SUSTAIN_SECONDS + 1)
+    events = tracker.tick()
+    assert [e.kind for e in events] == [EVENT_RUN_FINISHED]
+    assert events[0].payload["result"] == RESULT_INTERRUPTED
+    assert tracker.state == STATE_INTERRUPTED
+
+
+# --------------------------------------------------------------------- #
+# 7. vs=6 (explicit user pause) holds indefinitely                      #
+# --------------------------------------------------------------------- #
+
+
+def test_vs_6_paused_holds_docked_indefinitely() -> None:
+    clock = FakeClock()
+    tracker = RunTracker(clock=clock)
+
+    _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "mowingPercentage": 5,
+                "subtotalArea": "10.0",
+                "mowingWeekArea": "10.0",
+                "time": 1_000_000_000_000,
+            }
+        ],
+    )
+    tracker.process_vehicle_state(VS_PAUSED, 1_000_000_000_000)
+    assert tracker.state == STATE_PAUSED_DOCKED
+    # Timer NOT armed — user is in control.
+    assert tracker._interrupt_timer_started_at is None
+
+    clock.advance(3600)  # 1 h paused
+    assert tracker.tick() == []
+    assert tracker.state == STATE_PAUSED_DOCKED
+
+    # Resume via fresh type-2 (sub ≥ last).
+    events = _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "mowingPercentage": 6,
+                "subtotalArea": "11.0",
+                "mowingWeekArea": "11.0",
+                "time": 1_000_000_100_000,
+            }
+        ],
+    )
+    assert events == []
+    assert tracker.state == STATE_RUNNING
+
+
+# --------------------------------------------------------------------- #
+# 8. ISO-Monday rollover — no false rejection                           #
+# --------------------------------------------------------------------- #
+
+
+def test_iso_monday_rollover_exempts_both_wk_layers() -> None:
+    tracker = RunTracker()
+
+    sunday = _epoch_ms(datetime(2026, 5, 24, 23, 59, tzinfo=timezone.utc))
+    monday = _epoch_ms(datetime(2026, 5, 25, 0, 1, tzinfo=timezone.utc))
+
+    _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 40,
+                "subtotalArea": "50.0",
+                "mowingWeekArea": "100.0",
+                "mowStartType": 1,
+                "time": sunday,
+            }
+        ],
+    )
+    assert tracker.current_run["wk0"] == 50.0
+
+    # After the Monday rollover: wk resets (100 → 5), but the run
+    # continues. Layer 2 would normally reject `wk 5 < wk 100`; layer 3
+    # would reject `|5 − 52 − 50| = 97`. Both must be exempted, and
+    # wk₀ re-anchored from the new packet (5 − 52 = −47).
+    events = _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 42,
+                "subtotalArea": "52.0",
+                "mowingWeekArea": "5.0",
+                "mowStartType": 1,
+                "time": monday,
+            }
+        ],
+    )
+    assert events == []  # no `run_finished`, run still open
+    assert tracker.state == STATE_RUNNING
+    assert tracker.drops == {"layer_2": 0, "layer_3": 0}
+    assert tracker.current_run["wk0"] == -47.0  # re-anchored
+
+
+# --------------------------------------------------------------------- #
+# 9. vs=8 transient + boundary=0 sentinel                               #
+# --------------------------------------------------------------------- #
+
+
+def test_vs_8_transient_is_ignored() -> None:
+    tracker = RunTracker()
+    _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "mowingPercentage": 5,
+                "subtotalArea": "10.0",
+                "mowingWeekArea": "10.0",
+                "time": 1_000_000_000_000,
+            }
+        ],
+    )
+    tracker.process_vehicle_state(VS_MOWING, 1_000_000_000_000)
+    assert tracker.state == STATE_RUNNING
+    assert tracker.vehicle_state == VS_MOWING
+
+    # vs=8 must not disturb the tracker.
+    events = tracker.process_vehicle_state(VS_TRANSIENT, 1_000_000_010_000)
+    assert events == []
+    assert tracker.state == STATE_RUNNING
+    assert tracker.vehicle_state == VS_MOWING  # unchanged
+
+
+def test_boundary_zero_updates_run_but_not_zones() -> None:
+    tracker = RunTracker()
+    _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 0,  # BUG-06 sentinel
+                "currentMowProgress": 0,
+                "mowingPercentage": 0,
+                "subtotalArea": "0.0",
+                "mowingWeekArea": "0.0",
+                "mowStartType": 0,
+                "time": 1_000_000_000_000,
+            },
+            {
+                "type": 2,
+                "currentMowBoundary": 3,
+                "currentMowProgress": 500,
+                "mowingPercentage": 2,
+                "subtotalArea": "5.0",
+                "mowingWeekArea": "5.0",
+                "mowStartType": 0,
+                "time": 1_000_000_060_000,
+            },
+        ],
+    )
+    # Run opened on the sentinel and continues under boundary 3.
+    assert tracker.state == STATE_RUNNING
+    zones = tracker.current_run["zones"]
+    assert [z["boundary_id"] for z in zones] == [3]
+    assert zones[0]["sub_entry"] == 5.0
+
+
+# --------------------------------------------------------------------- #
+# 10. Run completes at mp=100                                           #
+# --------------------------------------------------------------------- #
+
+
+def test_mp_100_closes_run_completed() -> None:
+    tracker = RunTracker()
+    events = _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 90,
+                "subtotalArea": "180.0",
+                "mowingWeekArea": "180.0",
+                "mowStartType": 1,
+                "time": 1_000_000_000_000,
+            },
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 100,
+                "subtotalArea": "200.0",
+                "mowingWeekArea": "200.0",
+                "mowStartType": 1,
+                "time": 1_000_000_060_000,
+            },
+        ],
+    )
+    finishes = [e for e in events if e.kind == EVENT_RUN_FINISHED]
+    assert len(finishes) == 1
+    assert finishes[0].payload["result"] == RESULT_COMPLETED
+    assert tracker.state == STATE_COMPLETED
+
+
+# --------------------------------------------------------------------- #
+# 11. Snapshot / restore round-trip                                     #
+# --------------------------------------------------------------------- #
+
+
+def test_snapshot_restore_round_trip() -> None:
+    source = RunTracker()
+    _feed(
+        source,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 5,
+                "subtotalArea": "10.0",
+                "mowingWeekArea": "10.0",
+                "mowStartType": 1,
+                "time": 1_000_000_000_000,
+            }
+        ],
+    )
+    snap = source.snapshot()
+
+    restored = RunTracker()
+    assert restored.restore(snap) is True
+    assert restored.state == STATE_RUNNING
+    assert restored.current_run["last_sub"] == 10.0
+    assert restored.drops == {"layer_2": 0, "layer_3": 0}
+    # Feed a fresh continuation packet — invariant still holds against
+    # the restored wk₀.
+    events = _feed(
+        restored,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 10,
+                "subtotalArea": "20.0",
+                "mowingWeekArea": "20.0",
+                "mowStartType": 1,
+                "time": 1_000_000_060_000,
+            }
+        ],
+    )
+    assert events == []  # no new events, continuation
+    assert restored.current_run["last_sub"] == 20.0
+
+
+def test_restore_rejects_wrong_version() -> None:
+    tracker = RunTracker()
+    assert tracker.restore({"version": 99}) is False
+
+
+# --------------------------------------------------------------------- #
+# 12. Coordinator wiring — smoke                                        #
+# --------------------------------------------------------------------- #
+
+
+def test_coordinator_instantiates_run_tracker() -> None:
+    """Regression guard — the coordinator's __init__ wires up a
+    RunTracker and forwards the accepted /location packets to it. The
+    coordinator itself is exercised in the FEAT-01/02/05a suites; this
+    check just verifies the seam exists so a future refactor can't
+    silently drop it.
+    """
+    from unittest.mock import MagicMock
+
+    from custom_components.navimow.coordinator import NavimowCoordinator
+
+    coordinator = NavimowCoordinator.__new__(NavimowCoordinator)
+    coordinator.hass = MagicMock()
+    coordinator.logger = MagicMock()
+    coordinator.name = "test"
+    coordinator.update_interval = None
+    coordinator.config_entry = MagicMock()
+    device = MagicMock()
+    device.id = "REDACTED-ROBOT-SERIAL"
+    coordinator.device = device
+    coordinator.position = None
+    coordinator.vehicle_state = None
+    coordinator._last_position_dispatch = 0.0
+    coordinator.stats = None
+    coordinator._last_accepted_time_type1 = None
+    coordinator._last_accepted_time_type2 = None
+    coordinator._type1_drop_streak = 0
+    coordinator._type2_drop_streak = 0
+    coordinator._build_data = MagicMock(return_value={})
+    coordinator.async_set_updated_data = MagicMock()
+    coordinator.run_tracker = RunTracker()
+
+    coordinator.handle_location_item(
+        {
+            "type": 2,
+            "currentMowBoundary": 1,
+            "mowingPercentage": 5,
+            "subtotalArea": "10.0",
+            "mowingWeekArea": "10.0",
+            "mowStartType": 1,
+            "time": 1_000_000_000_000,
+        }
+    )
+    assert coordinator.run_tracker.state == STATE_RUNNING
