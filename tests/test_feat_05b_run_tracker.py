@@ -22,6 +22,7 @@ from custom_components.navimow.run_tracker import (
     EVENT_RUN_REOPENED,
     EVENT_RUN_STARTED,
     INTERRUPT_SUSTAIN_SECONDS,
+    RESET_SUB_CEILING,
     RESULT_COMPLETED,
     RESULT_INTERRUPTED,
     STATE_COMPLETED,
@@ -144,7 +145,7 @@ def test_full_replay_2026_05_25_yields_two_runs_with_zone_crossing() -> None:
     assert afternoon_zones[1]["sub_entry"] == 229.11
     assert tracker.current_run["last_sub"] == 245.87
     # No layer-2 or layer-3 drops on this well-formed corpus.
-    assert tracker.drops == {"layer_2": 0, "layer_3": 0}
+    assert tracker.drops == {"layer_2": 0, "layer_3": 0, "pending_reset_holds": 0}
 
 
 # --------------------------------------------------------------------- #
@@ -174,7 +175,7 @@ def test_full_replay_2026_07_03_yields_one_running_run() -> None:
     assert [z["boundary_id"] for z in zones] == [1]
     assert zones[0]["sub_entry"] == 2.6
     assert zones[0]["sub_exit"] == 109.78
-    assert tracker.drops == {"layer_2": 0, "layer_3": 0}
+    assert tracker.drops == {"layer_2": 0, "layer_3": 0, "pending_reset_holds": 0}
 
 
 # --------------------------------------------------------------------- #
@@ -254,7 +255,7 @@ def test_synthetic_vs_2_pause_and_resume_bracket() -> None:
     assert tracker.state == STATE_RUNNING
 
     # Enter dock while charging — timer must NOT arm (recharge coming).
-    tracker.process_vehicle_state(VS_DOCKED_CHARGING, 1_000_000_000_000)
+    tracker.process_vehicle_state(VS_DOCKED_CHARGING)
     assert tracker.state == STATE_PAUSED_DOCKED
     assert tracker._interrupt_timer_started_at is None
     # Advance clock past 60 s to prove no timer fires.
@@ -305,7 +306,7 @@ def test_vs_1_sustained_interrupts_then_reopens_on_continuation() -> None:
         ],
     )
     # Dock to vs=1 → arm the timer.
-    tracker.process_vehicle_state(VS_DOCKED_IDLE, 1_000_000_000_000)
+    tracker.process_vehicle_state(VS_DOCKED_IDLE)
     assert tracker.state == STATE_PAUSED_DOCKED
     assert tracker._interrupt_timer_started_at == 0.0
 
@@ -366,7 +367,7 @@ def test_vs_3_base_unpowered_interrupts_after_60s() -> None:
             }
         ],
     )
-    tracker.process_vehicle_state(VS_DOCKED_UNPOWERED, 1_000_000_000_000)
+    tracker.process_vehicle_state(VS_DOCKED_UNPOWERED)
     assert tracker.state == STATE_PAUSED_DOCKED
 
     clock.advance(INTERRUPT_SUSTAIN_SECONDS + 1)
@@ -397,7 +398,7 @@ def test_vs_6_paused_holds_docked_indefinitely() -> None:
             }
         ],
     )
-    tracker.process_vehicle_state(VS_PAUSED, 1_000_000_000_000)
+    tracker.process_vehicle_state(VS_PAUSED)
     assert tracker.state == STATE_PAUSED_DOCKED
     # Timer NOT armed — user is in control.
     assert tracker._interrupt_timer_started_at is None
@@ -470,7 +471,7 @@ def test_iso_monday_rollover_exempts_both_wk_layers() -> None:
     )
     assert events == []  # no `run_finished`, run still open
     assert tracker.state == STATE_RUNNING
-    assert tracker.drops == {"layer_2": 0, "layer_3": 0}
+    assert tracker.drops == {"layer_2": 0, "layer_3": 0, "pending_reset_holds": 0}
     assert tracker.current_run["wk0"] == -47.0  # re-anchored
 
 
@@ -493,12 +494,12 @@ def test_vs_8_transient_is_ignored() -> None:
             }
         ],
     )
-    tracker.process_vehicle_state(VS_MOWING, 1_000_000_000_000)
+    tracker.process_vehicle_state(VS_MOWING)
     assert tracker.state == STATE_RUNNING
     assert tracker.vehicle_state == VS_MOWING
 
     # vs=8 must not disturb the tracker.
-    events = tracker.process_vehicle_state(VS_TRANSIENT, 1_000_000_010_000)
+    events = tracker.process_vehicle_state(VS_TRANSIENT)
     assert events == []
     assert tracker.state == STATE_RUNNING
     assert tracker.vehicle_state == VS_MOWING  # unchanged
@@ -601,7 +602,7 @@ def test_snapshot_restore_round_trip() -> None:
     assert restored.restore(snap) is True
     assert restored.state == STATE_RUNNING
     assert restored.current_run["last_sub"] == 10.0
-    assert restored.drops == {"layer_2": 0, "layer_3": 0}
+    assert restored.drops == {"layer_2": 0, "layer_3": 0, "pending_reset_holds": 0}
     # Feed a fresh continuation packet — invariant still holds against
     # the restored wk₀.
     events = _feed(
@@ -676,3 +677,367 @@ def test_coordinator_instantiates_run_tracker() -> None:
         }
     )
     assert coordinator.run_tracker.state == STATE_RUNNING
+
+
+# --------------------------------------------------------------------- #
+# 13. B1 (#49 review) — trailing echo packets don't loop reopen/close   #
+# --------------------------------------------------------------------- #
+
+
+def test_completed_run_ignores_trailing_echo_packets() -> None:
+    """After a run closes at `mp=100`, further packets with identical
+    content but only `time` advancing (a plausible stream-tail residue)
+    must NOT retrigger the `run_reopened → run_finished(completed)`
+    cycle. Fable's B1 finding: reopen requires strict `sub > last_sub`
+    progress; an echo carries no progress.
+    """
+    tracker = RunTracker()
+
+    # Complete a run at mp=100.
+    _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 100,
+                "subtotalArea": "200.0",
+                "mowingWeekArea": "200.0",
+                "mowStartType": 1,
+                "time": 1_000_000_000_000,
+            }
+        ],
+    )
+    assert tracker.state == STATE_COMPLETED
+
+    # Three echo packets — same sub/mp, only time advancing.
+    echo_events = _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 100,
+                "subtotalArea": "200.0",
+                "mowingWeekArea": "200.0",
+                "mowStartType": 1,
+                "time": 1_000_000_030_000 + i * 30_000,
+            }
+            for i in range(3)
+        ],
+    )
+    assert echo_events == []
+    assert tracker.state == STATE_COMPLETED
+
+
+def test_interrupted_run_reopens_only_on_strict_progress() -> None:
+    """Mirror of the above on the INTERRUPTED path — an echo after a
+    sustained-60 s close must not reopen.
+    """
+    clock = FakeClock()
+    tracker = RunTracker(clock=clock)
+    _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 5,
+                "subtotalArea": "10.0",
+                "mowingWeekArea": "10.0",
+                "mowStartType": 1,
+                "time": 1_000_000_000_000,
+            }
+        ],
+    )
+    tracker.process_vehicle_state(VS_DOCKED_IDLE)
+    clock.advance(INTERRUPT_SUSTAIN_SECONDS + 1)
+    tracker.tick()  # fires INTERRUPTED
+    assert tracker.state == STATE_INTERRUPTED
+
+    # Echo of the closing packet — same sub/mp, later time. Must NOT
+    # reopen.
+    events = _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 5,
+                "subtotalArea": "10.0",
+                "mowingWeekArea": "10.0",
+                "mowStartType": 1,
+                "time": 1_000_000_200_000,
+            }
+        ],
+    )
+    assert events == []
+    assert tracker.state == STATE_INTERRUPTED
+
+
+# --------------------------------------------------------------------- #
+# 14. B2 (#49 review) — mixed-epoch packet is held pending, not immediate#
+# --------------------------------------------------------------------- #
+
+
+def test_mixed_epoch_packet_does_not_destroy_open_run() -> None:
+    """Fable's B2 scenario reproduced: mid-run at `sub=200`, feed one
+    packet with fresh `time`, `wk` equal to the last accepted (layer 2
+    passes) and stale `sub=150`. The old immediate-reset path would
+    close the genuine run and open a phantom; the pending-reset
+    mechanism holds the candidate instead — the anomalous packet
+    itself never surfaces as a run boundary.
+    """
+    tracker = RunTracker()
+
+    # Build a healthy run up to sub=200.
+    _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 40,
+                "subtotalArea": "200.0",
+                "mowingWeekArea": "300.0",  # wk₀ = 100
+                "mowStartType": 1,
+                "time": 2_000_000_000_000,
+            }
+        ],
+    )
+    original_start = tracker.current_run["start_time"]
+
+    # Anomalous packet: fresh time, wk unchanged (layer 2 passes), sub
+    # regresses well above the ceiling.
+    events = _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 40,
+                "subtotalArea": "150.0",
+                "mowingWeekArea": "300.0",
+                "mowStartType": 1,
+                "time": 2_000_000_360_000,
+            }
+        ],
+    )
+    assert events == []
+    assert tracker.state == STATE_RUNNING
+    assert tracker.current_run["start_time"] == original_start
+    assert tracker.current_run["last_sub"] == 200.0  # unchanged
+    assert tracker.drops["pending_reset_holds"] == 1
+
+
+def test_pending_reset_confirmed_by_coherent_successor() -> None:
+    """A pending reset above `RESET_SUB_CEILING` is promoted to a real
+    reset iff the next accepted packet coherently continues the
+    candidate: strictly later `time`, `sub ≥` candidate, and the
+    candidate's implied anchor (`wk - sub`) matches within the layer-3
+    tolerance. Emits `run_finished(interrupted)` + `run_started`
+    retroactively, with the new run anchored at the candidate.
+    """
+    tracker = RunTracker()
+
+    # Healthy run up to sub=200 (wk₀ = 100).
+    _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 40,
+                "subtotalArea": "200.0",
+                "mowingWeekArea": "300.0",
+                "mowStartType": 0,
+                "time": 2_000_000_000_000,
+            }
+        ],
+    )
+
+    # Candidate (pending): sub=50, wk=550 → implied anchor 500.
+    _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 3,
+                "mowingPercentage": 10,
+                "subtotalArea": "50.0",
+                "mowingWeekArea": "550.0",
+                "mowStartType": 1,
+                "time": 2_000_000_120_000,
+            }
+        ],
+    )
+    assert tracker.state == STATE_RUNNING  # held
+
+    # Confirmation: sub=52 (≥ 50), wk=552 → 552-52=500 = candidate anchor.
+    events = _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 3,
+                "mowingPercentage": 11,
+                "subtotalArea": "52.0",
+                "mowingWeekArea": "552.0",
+                "mowStartType": 1,
+                "time": 2_000_000_240_000,
+            }
+        ],
+    )
+    kinds = [e.kind for e in events]
+    assert kinds == [EVENT_RUN_FINISHED, EVENT_RUN_STARTED]
+    assert events[0].payload["result"] == RESULT_INTERRUPTED
+    # New run anchored at the candidate.
+    assert tracker.current_run["start_time"] == 2_000_000_120_000
+    assert tracker.current_run["mow_start_type"] == 1
+    assert tracker.current_run["wk0"] == 500.0
+
+
+def test_pending_reset_discarded_when_successor_incoherent() -> None:
+    """A pending reset that no coherent successor confirms is
+    dropped silently — the open run is preserved. The successor packet
+    is then processed as a continuation of the original run.
+    """
+    tracker = RunTracker()
+    _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 40,
+                "subtotalArea": "200.0",
+                "mowingWeekArea": "300.0",  # wk₀=100
+                "mowStartType": 0,
+                "time": 2_000_000_000_000,
+            }
+        ],
+    )
+    original_start = tracker.current_run["start_time"]
+
+    # Pending candidate: sub=50, wk=550.
+    _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "mowingPercentage": 10,
+                "subtotalArea": "50.0",
+                "mowingWeekArea": "550.0",
+                "time": 2_000_000_120_000,
+            }
+        ],
+    )
+    assert tracker._pending_reset is not None
+
+    # Incoherent successor: implied anchor 100 ≠ candidate's 500.
+    # (Sub advances vs original run, wk advances too — a fresh normal
+    # packet on the OLD run.)
+    events = _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "mowingPercentage": 41,
+                "subtotalArea": "205.0",
+                "mowingWeekArea": "305.0",  # 305-205=100 (old anchor)
+                "time": 2_000_000_240_000,
+            }
+        ],
+    )
+    # Candidate discarded; no events emitted for the pending; old run
+    # continues.
+    assert events == []
+    assert tracker._pending_reset is None
+    assert tracker.state == STATE_RUNNING
+    assert tracker.current_run["start_time"] == original_start
+    assert tracker.current_run["last_sub"] == 205.0
+
+
+def test_small_sub_regression_is_still_immediate_reset() -> None:
+    """A genuine run start with `sub < RESET_SUB_CEILING` (e.g. 0.39 on
+    the 2026-05-25 afternoon run) is *not* stashed — the ceiling only
+    catches unusually large regressions.
+    """
+    tracker = RunTracker()
+    _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "mowingPercentage": 40,
+                "subtotalArea": "200.0",
+                "mowingWeekArea": "300.0",
+                "time": 2_000_000_000_000,
+            }
+        ],
+    )
+    events = _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "mowingPercentage": 0,
+                "subtotalArea": "0.39",  # well below RESET_SUB_CEILING
+                "mowingWeekArea": "300.39",
+                "mowStartType": 1,
+                "time": 2_000_000_120_000,
+            }
+        ],
+    )
+    kinds = [e.kind for e in events]
+    assert kinds == [EVENT_RUN_FINISHED, EVENT_RUN_STARTED]
+    assert tracker.drops["pending_reset_holds"] == 0
+    # Assert we honoured the ceiling explicitly (guards against a future
+    # change accidentally raising the threshold above the observed
+    # values).
+    assert 0.39 < RESET_SUB_CEILING
+
+
+# --------------------------------------------------------------------- #
+# 15. Minor 1 (#49 review) — tick() arms the interrupt timer            #
+# --------------------------------------------------------------------- #
+
+
+def test_tick_arms_interrupt_timer_when_paused_docked() -> None:
+    """A restored tracker (or one whose `_interrupt_timer_started_at`
+    was reset by any means) must re-arm the sustained-docked check
+    from the first `tick()` call — no fresh `process_vehicle_state`
+    required. Otherwise a mid-run HA restart could park an INTERRUPTED
+    run in PAUSED_DOCKED forever.
+    """
+    clock = FakeClock()
+    tracker = RunTracker(clock=clock)
+    _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "mowingPercentage": 5,
+                "subtotalArea": "10.0",
+                "mowingWeekArea": "10.0",
+                "time": 1_000_000_000_000,
+            }
+        ],
+    )
+    tracker.process_vehicle_state(VS_DOCKED_IDLE)
+    assert tracker._interrupt_timer_started_at == 0.0
+    # Simulate a restart: state stays PAUSED_DOCKED but the timer is
+    # gone (as `restore()` sets it to None).
+    tracker._interrupt_timer_started_at = None
+
+    # First tick re-arms.
+    clock.advance(10)
+    events = tracker.tick()
+    assert events == []
+    assert tracker._interrupt_timer_started_at == 10.0
+
+    # 60 s later, tick fires the interruption.
+    clock.advance(INTERRUPT_SUSTAIN_SECONDS + 1)
+    events = tracker.tick()
+    assert [e.kind for e in events] == [EVENT_RUN_FINISHED]
+    assert events[0].payload["result"] == RESULT_INTERRUPTED

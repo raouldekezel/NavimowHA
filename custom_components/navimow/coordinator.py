@@ -245,9 +245,7 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # move an open run into PAUSED_DOCKED / arm the sustained-60 s
             # interruption timer.
             self._forward_run_events(
-                self.run_tracker.process_vehicle_state(
-                    vehicle_state, parsed.get("time") or 0
-                )
+                self.run_tracker.process_vehicle_state(vehicle_state)
             )
             self.async_set_updated_data(self._build_data())
 

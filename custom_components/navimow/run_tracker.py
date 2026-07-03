@@ -8,8 +8,8 @@ coordinator instantiates one tracker per device and forwards:
 
 - `process_type2(parsed)` — for every type-2 item accepted by the
   layer-1 ordering guard (FEAT-05 step (a)).
-- `process_vehicle_state(vs, time_ms)` — for every accepted type-1 item
-  whose `vehicleState` differs from the previously seen value.
+- `process_vehicle_state(vs)` — for every accepted type-1 item whose
+  `vehicleState` differs from the previously seen value.
 - `tick(now=None)` — periodically (coordinator tick cadence, ~30 s) so
   the sustained-60 s docked-idle interruption detector can fire even
   when no MQTT traffic is arriving.
@@ -31,17 +31,24 @@ Guard layers (Fable brief 2026-07-03 16:57 UTC):
 State machine (converged, authoritative per the brief):
 
     IDLE ─fresh type-2─▶ RUNNING [run_started]
-    RUNNING ─vs ∈ {1,2,3,6} while mp < 100─▶ PAUSED_DOCKED
-    PAUSED_DOCKED ─fresh type-2, sub ≥ last─▶ RUNNING   (resume)
+    RUNNING ─vs ∈ {1,2,3,6}─▶ PAUSED_DOCKED
+    PAUSED_DOCKED ─fresh type-2, strict progress─▶ RUNNING   (resume)
     RUNNING ─mp = 100─▶ COMPLETED [run_finished(completed)]
-    RUNNING/PAUSED_DOCKED ─fresh reset (sub < last)─▶
+    RUNNING/PAUSED_DOCKED ─fresh reset (sub < last, sub < ceiling)─▶
         close open run INTERRUPTED [run_finished(interrupted)],
         open new run [run_started]
     PAUSED_DOCKED ─vs ∈ {1,3} sustained 60 s─▶ INTERRUPTED
         [run_finished(interrupted)]
-    COMPLETED/INTERRUPTED ─fresh type-2 continuing accumulator
-        (sub ≥ last)─▶ reopen same run, RUNNING [run_reopened]
-    COMPLETED/INTERRUPTED ─fresh type-2 with reset─▶ open new run
+    COMPLETED/INTERRUPTED ─fresh type-2 with strict progress─▶
+        reopen same run, RUNNING [run_reopened]
+    COMPLETED/INTERRUPTED ─fresh reset (sub < ceiling)─▶ open new run
+
+A `sub` regression *above* `RESET_SUB_CEILING` is not accepted as an
+immediate reset — the packet is stashed as a *pending* reset and only
+promoted retroactively when the next accepted packet confirms it
+coherently (B2 on #49: one anomalous packet must not destroy a live
+run). Reopens require strict `sub > last_sub` progress (B1 on #49: an
+echo packet after a run close must not re-fire the completion cycle).
 
 vs=2 (charging) holds PAUSED_DOCKED indefinitely — a recharge pause
 never times out. vs=8 (firmware-reset transient, MAP-01) is ignored.
@@ -99,6 +106,14 @@ INTERRUPT_SUSTAIN_SECONDS = 60
 
 # Layer-3 tolerance around the wk₀+sub invariant (Fable brief).
 INVARIANT_TOLERANCE_M2 = 0.5
+
+# Sub ceiling below which a `sub` regression is treated as an *immediate*
+# reset (a genuine run just started). Above the ceiling, the packet is
+# treated as a candidate for a *pending* reset that a coherent successor
+# must confirm — otherwise it is discarded as a content anomaly. 10.0 m²
+# gives roughly 4× headroom over every genuine run-start `sub` ever
+# committed (0.39 m² on 2026-05-25, 2.6 m² on 2026-07-03).
+RESET_SUB_CEILING = 10.0
 
 # Event kinds.
 EVENT_RUN_STARTED = "run_started"
@@ -187,10 +202,24 @@ class RunTracker:
         # DOCKED_NOT_CHARGING under an open run.
         self._interrupt_timer_started_at: float | None = None
 
-        # Diagnostic counters for the three guard layers (layer 1 is
-        # tallied by the coordinator; kept here as `0` for shape
-        # symmetry so the restore payload is uniform).
-        self.drops: dict[str, int] = {"layer_2": 0, "layer_3": 0}
+        # Pending-reset candidate: a packet with `sub` below the previous
+        # `last_sub` but *above* RESET_SUB_CEILING (so not obviously a
+        # genuine run start). Held in-memory only — a mid-run HA restart
+        # would forget it, at the cost of one packet of re-observation
+        # latency, which is defensible (the alternative is serialising a
+        # transient decision across restarts). Confirmed retroactively by
+        # the next coherent packet; discarded otherwise.
+        self._pending_reset: dict[str, Any] | None = None
+
+        # Diagnostic counters. `layer_2` / `layer_3` = rejected packets;
+        # `pending_reset_holds` = packets stashed as pending resets (the
+        # `wk` invariant classifier caught them before they could damage
+        # an open run).
+        self.drops: dict[str, int] = {
+            "layer_2": 0,
+            "layer_3": 0,
+            "pending_reset_holds": 0,
+        }
 
     # ------------------------------------------------------------- #
     # Public API                                                    #
@@ -208,20 +237,22 @@ class RunTracker:
         if not self._passes_layer_2(parsed):
             self.drops["layer_2"] += 1
             _LOGGER.debug(
-                "run_tracker: type-2 rejected by layer 2 " "(wk=%s last=%s time=%s)",
+                "run_tracker: type-2 rejected by layer 2 (wk=%s last=%s time=%s)",
                 parsed.get("area_week"),
                 self._last_accepted_wk,
                 parsed.get("time"),
             )
             return events
 
+        # Resolve any previously-stashed pending reset first — the
+        # current packet may confirm or discard it before we look at
+        # its own reset semantics.
+        events.extend(self._resolve_pending_reset(parsed))
+
         prev_sub = self.current_run["last_sub"] if self.current_run else None
         incoming_sub = parsed.get("area_session")
         incoming_mp = parsed.get("mowing_percentage")
 
-        # `is_reset` only meaningful when we have a prior sub AND the
-        # new sub is numeric. Two-of-three-way None short-circuits into
-        # "continuation".
         is_reset = (
             prev_sub is not None
             and incoming_sub is not None
@@ -236,9 +267,17 @@ class RunTracker:
             events.append(self._event_run_started())
         elif self.state in (STATE_RUNNING, STATE_PAUSED_DOCKED):
             if is_reset:
-                events.append(self._close_run(RESULT_INTERRUPTED))
-                self._open_run(parsed)
-                events.append(self._event_run_started())
+                # Split by ceiling: sub << ceiling → obviously a genuine
+                # run-start; sub above → hold as a pending candidate that
+                # a coherent successor must confirm (BUG-08-style
+                # mixed-epoch packets must not destroy a live run).
+                if incoming_sub is not None and incoming_sub < RESET_SUB_CEILING:
+                    events.append(self._close_run(RESULT_INTERRUPTED))
+                    self._open_run(parsed)
+                    events.append(self._event_run_started())
+                else:
+                    self._stash_pending_reset(parsed)
+                    return events
             else:
                 if not self._passes_layer_3(parsed):
                     self.drops["layer_3"] += 1
@@ -257,16 +296,31 @@ class RunTracker:
                     self._interrupt_timer_started_at = None
         elif self.state in (STATE_COMPLETED, STATE_INTERRUPTED):
             if is_reset:
-                self._open_run(parsed)
-                events.append(self._event_run_started())
+                if incoming_sub is not None and incoming_sub < RESET_SUB_CEILING:
+                    self._open_run(parsed)
+                    events.append(self._event_run_started())
+                else:
+                    self._stash_pending_reset(parsed)
+                    return events
             else:
+                # Reopen requires *strict progress* over the closed run's
+                # last accepted values. An echo packet (identical `sub` /
+                # `mp` but fresh `time`) must not re-fire the reopen /
+                # completion cycle — that would emit unbounded
+                # `run_reopened` / `run_finished` pairs to HA (B1 on #49).
+                if not self._has_strict_progress(parsed):
+                    return events
                 if not self._passes_layer_3(parsed):
                     self.drops["layer_3"] += 1
                     return events
                 self._reopen_run()
                 events.append(self._event_run_reopened())
 
-        # Bookkeeping that happens on every accepted packet.
+        # Bookkeeping on acceptance. `_update_wk0_anchor` handles both
+        # the "first packet with data" case and the ISO-Monday rollover;
+        # keeping the mutation out of `_passes_layer_3` keeps the guard
+        # a pure predicate.
+        self._update_wk0_anchor(parsed)
         self._update_accumulators(parsed)
         self._update_zone(parsed)
 
@@ -282,18 +336,17 @@ class RunTracker:
 
         return events
 
-    def process_vehicle_state(self, vs: int, time_ms: int) -> list[Event]:
+    def process_vehicle_state(self, vs: int) -> list[Event]:
         """React to a `vehicleState` change (type-1 packet).
 
-        Only state entries into DOCKED_STATES from RUNNING move the
-        machine (RUNNING → PAUSED_DOCKED). The reverse — resume — is
-        driven by a fresh type-2 in `process_type2`, not by a vs=4/5
-        signal, because type-1 briefly showing vs=4 during a dock-poke
-        must not falsely "resume" the run.
+        Only entries into `DOCKED_STATES` from `RUNNING` move the machine
+        (`RUNNING → PAUSED_DOCKED`). Resume is driven by a fresh type-2
+        in `process_type2`, not by a vs=4/5 signal — type-1 briefly
+        showing `vs=4` during a dock-poke must not falsely "resume" the
+        run.
         """
         events: list[Event] = []
 
-        # Firmware-reset transient — never interpret as a real state.
         if vs == VS_TRANSIENT:
             return events
 
@@ -311,10 +364,17 @@ class RunTracker:
         return events
 
     def tick(self, now: float | None = None) -> list[Event]:
-        """Fire the sustained-docked interruption check.
+        """Advance the sustained-docked interruption timer.
 
-        The caller is expected to invoke `tick` periodically (coordinator
-        cadence ~30 s). Idempotent when there is nothing to close.
+        Called periodically (coordinator cadence ~30 s). Two roles:
+        - Arm the timer if we are `PAUSED_DOCKED` under
+          `DOCKED_NOT_CHARGING` and it is not yet running. This makes
+          the interruption detector survive an HA restart *without*
+          needing a fresh `vehicleState` change to re-arm — a `restore()`
+          followed by a tick suffices.
+        - Fire `run_finished(interrupted)` once the timer has been armed
+          for at least `INTERRUPT_SUSTAIN_SECONDS` and nothing has
+          resumed the run.
         """
         events: list[Event] = []
         now = self._clock() if now is None else now
@@ -322,10 +382,11 @@ class RunTracker:
         if (
             self.state == STATE_PAUSED_DOCKED
             and self.vehicle_state in DOCKED_NOT_CHARGING
-            and self._interrupt_timer_started_at is not None
-            and (now - self._interrupt_timer_started_at) >= INTERRUPT_SUSTAIN_SECONDS
         ):
-            events.append(self._close_run(RESULT_INTERRUPTED))
+            if self._interrupt_timer_started_at is None:
+                self._interrupt_timer_started_at = now
+            elif (now - self._interrupt_timer_started_at) >= INTERRUPT_SUSTAIN_SECONDS:
+                events.append(self._close_run(RESULT_INTERRUPTED))
 
         return events
 
@@ -344,27 +405,152 @@ class RunTracker:
         return _crosses_iso_monday(self._last_accepted_time_ms, parsed.get("time"))
 
     def _passes_layer_3(self, parsed: dict[str, Any]) -> bool:
-        """|wk - sub - wk₀| ≤ 0.5 m² for the currently open run."""
+        """|wk - sub - wk₀| ≤ 0.5 m² for the currently open run.
+
+        Pure predicate — side effects live in `_update_wk0_anchor`,
+        called on the acceptance path.
+        """
         if self.current_run is None:
             return True
         wk = parsed.get("area_week")
         sub = parsed.get("area_session")
         if wk is None or sub is None:
             return True
-        # ISO-Monday exemption: wk itself just reset, so wk₀ has to be
-        # re-anchored from this packet. Accept unconditionally on the
-        # rollover packet and rebuild the anchor.
+        # ISO-Monday exemption — a rollover packet always passes here;
+        # the caller re-anchors `wk₀` from it via `_update_wk0_anchor`.
         if _crosses_iso_monday(self._last_accepted_time_ms, parsed.get("time")):
-            self.current_run["wk0"] = wk - sub
             return True
         wk0 = self.current_run.get("wk0")
         if wk0 is None:
-            # No anchor (opening packet came without wk/sub) — accept
-            # and let a later packet establish the anchor.
-            if wk is not None and sub is not None:
-                self.current_run["wk0"] = wk - sub
+            # No anchor yet — nothing to compare against; the caller
+            # sets it on this same acceptance via `_update_wk0_anchor`.
             return True
         return abs(wk - sub - wk0) <= INVARIANT_TOLERANCE_M2
+
+    def _update_wk0_anchor(self, parsed: dict[str, Any]) -> None:
+        """Set or update `wk₀` on the acceptance path.
+
+        - If the current run has no anchor yet, initialise it from the
+          incoming (`wk`, `sub`) pair.
+        - If the packet crosses an ISO-Monday boundary since the last
+          accepted (`wk` counter reset), re-anchor from the new packet.
+        """
+        if self.current_run is None:
+            return
+        wk = parsed.get("area_week")
+        sub = parsed.get("area_session")
+        if wk is None or sub is None:
+            return
+        wk0 = self.current_run.get("wk0")
+        if wk0 is None or _crosses_iso_monday(
+            self._last_accepted_time_ms, parsed.get("time")
+        ):
+            self.current_run["wk0"] = wk - sub
+
+    # ------------------------------------------------------------- #
+    # Reset semantics (immediate / pending / echo)                  #
+    # ------------------------------------------------------------- #
+
+    def _has_strict_progress(self, parsed: dict[str, Any]) -> bool:
+        """True when the incoming packet shows strict progress over the
+        closed run's last accepted values. Used to gate the reopen
+        transition against echo packets — an identical repeat of the
+        closing packet with only `time` fresher would otherwise trigger
+        an unbounded `run_reopened` / `run_finished` cycle (B1 on #49).
+        """
+        if self.current_run is None:
+            return True
+        last_sub = self.current_run.get("last_sub")
+        incoming_sub = parsed.get("area_session")
+        if incoming_sub is not None and last_sub is not None:
+            return incoming_sub > last_sub
+        last_mp = self.current_run.get("last_mp")
+        incoming_mp = parsed.get("mowing_percentage")
+        if incoming_mp is not None and last_mp is not None:
+            return incoming_mp > last_mp
+        # Neither axis available → conservative default (no reopen).
+        return False
+
+    def _stash_pending_reset(self, parsed: dict[str, Any]) -> None:
+        """Hold a candidate reset packet until a coherent successor
+        confirms it. Discards any prior stash — the newer candidate
+        supersedes.
+        """
+        self._pending_reset = dict(parsed)
+        self.drops["pending_reset_holds"] += 1
+        _LOGGER.debug(
+            "run_tracker: pending reset stashed (sub=%s wk=%s time=%s)",
+            parsed.get("area_session"),
+            parsed.get("area_week"),
+            parsed.get("time"),
+        )
+
+    def _resolve_pending_reset(self, parsed: dict[str, Any]) -> list[Event]:
+        """Decide the fate of a previously stashed pending reset.
+
+        Called at the top of every `process_type2` acceptance. Returns
+        the events emitted if the pending is confirmed (close old run +
+        open new run), or an empty list if it is discarded or if there
+        is nothing pending.
+        """
+        events: list[Event] = []
+        candidate = self._pending_reset
+        if candidate is None:
+            return events
+
+        # Coherence requires: strictly later `time`, no `sub` regression
+        # against the candidate, and a layer-3-tolerated shift on the
+        # candidate's implied anchor.
+        c_time = candidate.get("time")
+        c_sub = candidate.get("area_session")
+        c_wk = candidate.get("area_week")
+        p_time = parsed.get("time")
+        p_sub = parsed.get("area_session")
+        p_wk = parsed.get("area_week")
+
+        coherent = (
+            c_time is not None
+            and c_sub is not None
+            and c_wk is not None
+            and p_time is not None
+            and p_sub is not None
+            and p_wk is not None
+            and p_time > c_time
+            and p_sub >= c_sub
+            and abs((p_wk - p_sub) - (c_wk - c_sub)) <= INVARIANT_TOLERANCE_M2
+        )
+
+        self._pending_reset = None
+
+        if not coherent:
+            _LOGGER.debug(
+                "run_tracker: pending reset discarded (candidate sub=%s wk=%s "
+                "time=%s vs incoming sub=%s wk=%s time=%s)",
+                c_sub,
+                c_wk,
+                c_time,
+                p_sub,
+                p_wk,
+                p_time,
+            )
+            return events
+
+        # Confirmed — close the open run (if any) as INTERRUPTED at its
+        # own accumulator's last `time`, then open a new run at the
+        # candidate. The current packet then flows through the normal
+        # continuation path against the new run.
+        if self.state in (STATE_RUNNING, STATE_PAUSED_DOCKED):
+            events.append(self._close_run(RESULT_INTERRUPTED))
+        self._open_run(candidate)
+        events.append(self._event_run_started())
+        # Stamp cursors from the candidate too, so `_passes_layer_2`
+        # against the current packet sees the candidate's `wk` (which
+        # was smaller) as the anchor.
+        if candidate.get("area_week") is not None:
+            self._last_accepted_wk = candidate["area_week"]
+        if candidate.get("time") is not None:
+            self._last_accepted_time_ms = candidate["time"]
+        return events
 
     # ------------------------------------------------------------- #
     # Run lifecycle                                                 #
@@ -542,10 +728,17 @@ class RunTracker:
         self.drops = {
             "layer_2": drops.get("layer_2", 0),
             "layer_3": drops.get("layer_3", 0),
+            "pending_reset_holds": drops.get("pending_reset_holds", 0),
         }
-        # `_interrupt_timer_started_at` is monotonic and can't be
-        # restored across a process restart. Leaving it at None means
-        # the sustained-docked check re-arms from the first tick after
-        # restart, which is the safe default (no false interruption).
+        # `_interrupt_timer_started_at` is monotonic and cannot be
+        # restored across a process restart. `tick()` re-arms it on the
+        # first call after restart if the machine is `PAUSED_DOCKED`
+        # under `vs ∈ {1, 3}` — so the sustained-docked interruption
+        # detector survives a restart even if `vehicle_state` is
+        # restored from the snapshot rather than re-derived. A pending
+        # reset is intentionally *not* persisted: worst case a mid-flight
+        # candidate re-confirms one packet later after a restart, which
+        # is safer than serialising a transient decision.
         self._interrupt_timer_started_at = None
+        self._pending_reset = None
         return True
