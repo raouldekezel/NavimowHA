@@ -103,6 +103,7 @@ def _make_coordinator(*, is_connected: bool, last_mqtt: float | None):
     coordinator._last_data_source = None
     coordinator.oauth_session = None
     coordinator._mqtt_disconnect_warned = False
+    coordinator._mqtt_disconnect_ticks = 0  # introduced by HARD-04
 
     coordinator._device_status_to_state = MagicMock(return_value=MagicMock(battery=77))
     coordinator._build_data = MagicMock(return_value={"state": "http_fallback_result"})
@@ -154,16 +155,20 @@ async def test_http_fallback_not_called_when_state_is_fresh() -> None:
 
 @pytest.mark.asyncio
 async def test_disconnected_stale_warning_fires_once_on_entry(caplog) -> None:
-    """Two consecutive ticks in the disconnected-stale state must emit
-    the WARNING exactly once. Without the edge trigger, a routine 1 h
-    outage would produce ~120 identical WARNING lines.
+    """Consecutive ticks in the disconnected-stale state must emit the
+    WARNING exactly once. Without the edge trigger, a routine 1 h outage
+    would produce ~120 identical WARNING lines.
+
+    HARD-04 additionally debounces by MQTT_DISCONNECT_TICKS_TO_WARN, so
+    the WARNING lands on the Nth tick, not the first. We drive 5 ticks
+    (well above the threshold) and still assert exactly one WARNING.
     """
     coordinator = _make_coordinator(is_connected=False, last_mqtt=None)
 
     caplog.set_level(logging.WARNING, logger="custom_components.navimow.coordinator")
 
-    await coordinator._async_update_data()
-    await coordinator._async_update_data()
+    for _ in range(5):
+        await coordinator._async_update_data()
 
     disconnect_warnings = [
         r
@@ -171,7 +176,7 @@ async def test_disconnected_stale_warning_fires_once_on_entry(caplog) -> None:
         if r.levelno == logging.WARNING and "MQTT appears disconnected" in r.message
     ]
     assert len(disconnect_warnings) == 1, (
-        f"expected exactly 1 disconnect WARNING across 2 ticks, got "
+        f"expected exactly 1 disconnect WARNING across 5 ticks, got "
         f"{len(disconnect_warnings)}"
     )
     assert coordinator._mqtt_disconnect_warned is True
@@ -184,14 +189,17 @@ async def test_reconnect_logs_once_at_info_and_clears_flag(caplog) -> None:
     the flag — even if the state is still stale (the recovery signal is
     the SDK's own connectivity, not the state freshness).
     """
+    from custom_components.navimow.const import MQTT_DISCONNECT_TICKS_TO_WARN
+
     coordinator = _make_coordinator(is_connected=False, last_mqtt=None)
     caplog.set_level(logging.INFO, logger="custom_components.navimow.coordinator")
 
-    # First tick: enter outage.
-    await coordinator._async_update_data()
+    # Enter outage — drive enough ticks to trip the HARD-04 debounce.
+    for _ in range(MQTT_DISCONNECT_TICKS_TO_WARN):
+        await coordinator._async_update_data()
     assert coordinator._mqtt_disconnect_warned is True
 
-    # Second tick: SDK reconnected but state hasn't refreshed yet — the
+    # Next tick: SDK reconnected but state hasn't refreshed yet — the
     # INFO must still fire (we log the connectivity event, not the state
     # recovery).
     coordinator.sdk.is_connected = True

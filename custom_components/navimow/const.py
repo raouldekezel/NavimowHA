@@ -52,6 +52,14 @@ HTTP_FALLBACK_MIN_INTERVAL: Final = 60
 # 2400 to 120 (BUG-01).
 MQTT_KEEPALIVE_SECONDS: Final = 120
 
+# BUG-01 WARN emits only after this many consecutive ticks with
+# is_connected=False. Debounces the ~40 min token-refresh reconnect cycle
+# (sub-second in practice, per FEAT-03 diag) below the noise floor while
+# preserving the alert on real broker outages (>= 90 s at
+# update_interval=30 s docked; up to ~180 s mowing while `is_state_stale`
+# catches up). HARD-04.
+MQTT_DISCONNECT_TICKS_TO_WARN: Final = 3
+
 # === /location extensions (FEAT-01) ===
 
 # The position sensor throttles dispatcher emissions. The /location type 1
