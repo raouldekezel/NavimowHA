@@ -1,3 +1,23 @@
+## Experimental fork — Segway Navimow i210 LiDAR Pro.
+
+A fork of [`segwaynavimow/NavimowHA`](https://github.com/segwaynavimow/NavimowHA)
+dedicated to the Navimow i210 LiDAR Pro.
+
+## What this fork changes (vs. upstream)
+
+- Targets the Navimow i210 LiDAR Pro specifically.
+- Adds the live mower position, read from the undocumented `/location` MQTT channel.
+- Adds mowing metrics: progression, weekly mowed area and current zone.
+- Adds a cloud-connectivity binary sensor that reflects the MQTT link to the Navimow cloud.
+- Surfaces a silent MQTT outage within ~90 s and falls back to an HTTP poll, instead of showing stale state for up to an hour.
+- Quiets the log: routine ~40-minute token-refresh reconnects no longer spam a WARNING.
+- Persists the weekly mowed area across a Home Assistant restart.
+- Fixes battery flicker and a spurious "#0" current-zone at the start of each mow.
+- Replaces the inherited Chinese user-facing strings and developer comments with English.
+- Redacts sensitive tokens and serials from logs.
+- Adds a documented library of real-device MQTT traces with their interpretation ([`docs/diag/`](https://github.com/raouldekezel/NavimowHA/tree/deploy/docs/diag)), plus a pytest test suite and CI.
+- Miscellaneous issues fixed (see the [Releases](https://github.com/raouldekezel/NavimowHA/releases) page).
+
 # Navimow for Home Assistant
 
 <p align="center">
