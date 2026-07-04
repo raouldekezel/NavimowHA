@@ -3,7 +3,15 @@ name: pytest
 # yamllint disable-line rule:truthy
 on:
   pull_request:
+    paths:
+      - "custom_components/**"
+      - "tests/**"
+      - "requirements-test.txt"
+      - "pyproject.toml"
+      - ".github/workflows/pytest.yaml"
   push:
+    # deploy/main are the merge queue destinations — always run there
+    # as the last-line safety net, even for docs-only merges.
     branches: [deploy, main]
 
 permissions:
