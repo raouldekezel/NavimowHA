@@ -73,6 +73,18 @@ Two consequences worth calling out for the fix design:
 
 Fixing (1) automatically fixes (2) if the fast path (Fix A) picks up the completion at zone finish rather than at charge finish. If only Fix B lands, it needs a result-label branch (`completed` when `mp ≥ ceiling`, `interrupted` otherwise).
 
+## Mid-run install side effect — start time and duration are wrong
+
+Independent of BUG-09 itself, this session surfaces a separate quirk worth calling out. The HACS upgrade to raoul.8 landed at 09:40:26 CEST while the robot was already mowing (the run started at **09:30:12 CEST**, `lawn_mower = mowing` transition in `01_run-day-timeline.sensors.tsv`). The tracker cold-booted to `IDLE`, saw the first accepted type-2 packet at 09:41:58 CEST (with `mp = 59`), and opened the run from there. Consequences:
+
+- `sensor.<slug>_last_run_started = 2026-07-04T07:41:58+00:00` — **11 min 46 s later** than the real start.
+- `sensor.<slug>_last_run_duration = 2880` s (48 min) — the real elapsed mowing time was roughly **60 min** (09:30:12 → 10:29:58 zone-complete), so about **12 min short**.
+- `sensor.<slug>_last_run_result = interrupted` (per §"Post-charge close" above — orthogonal issue).
+
+By design this can only happen on a *first* install (no prior tracker Store payload to restore) or on an integration reload triggered while a `raoul.<N>` build without persistence is in place. The FEAT-05 (c) Store persistence (PR #50) *is* meant to prevent this on subsequent restarts — the snapshot carries `current_run.start_time` across process boundaries. Verified separately in `test_restore_mid_run_continues_same_run` in `test_feat_05c_entities_events_store.py`.
+
+**Not proposing a fix here** — this is the honest floor of the mid-install experience, and Store persistence catches every subsequent restart. The alternative (retroactively backdate the run start using the FEAT-02 `lawn_mower.mowing` transition timestamp on cold boot) would tangle the tracker with recorder history and is out of scope for BUG-09. Worth documenting in the release notes for future raoul.<N> upgrades so operators aren't surprised.
+
 ## Findings
 
 1. **`mp` peaked at 99, never 100** — Fable's SPIKE open question #3 answered negatively. On this run, and consistently over the ~40 min visible in the timeline, the last observed `mp` was 99 at 10:28:06 (line 137 of `01_run-day-timeline`) and it did not budge before the return.
