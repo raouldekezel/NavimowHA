@@ -540,11 +540,15 @@ def test_boundary_zero_updates_run_but_not_zones() -> None:
 
 
 # --------------------------------------------------------------------- #
-# 10. Run completes at mp=100                                           #
+# 10. Run completes when mp ≥ threshold and the robot is docked         #
 # --------------------------------------------------------------------- #
 
 
-def test_mp_100_closes_run_completed() -> None:
+def test_mp_100_plus_dock_closes_run_completed() -> None:
+    """BUG-09 revised the completion criterion: `mp ≥ 99` alone is not
+    enough; the robot must also be docked (`vs ∈ {1, 2, 3}`). A run
+    that reaches `mp = 100` mid-mow stays open until the robot docks.
+    """
     tracker = RunTracker()
     events = _feed(
         tracker,
@@ -569,6 +573,12 @@ def test_mp_100_closes_run_completed() -> None:
             },
         ],
     )
+    # mp=100 with no vs update — the run must still be RUNNING.
+    assert [e for e in events if e.kind == EVENT_RUN_FINISHED] == []
+    assert tracker.state == STATE_RUNNING
+
+    # Dock arrival on charging (vs=2) triggers the completion close.
+    events.extend(tracker.process_vehicle_state(VS_DOCKED_CHARGING))
     finishes = [e for e in events if e.kind == EVENT_RUN_FINISHED]
     assert len(finishes) == 1
     assert finishes[0].payload["result"] == RESULT_COMPLETED
@@ -703,7 +713,7 @@ def test_completed_run_ignores_trailing_echo_packets() -> None:
     """
     tracker = RunTracker()
 
-    # Complete a run at mp=100.
+    # Open a run at mp=100 and dock — BUG-09 close path.
     _feed(
         tracker,
         [
@@ -718,6 +728,7 @@ def test_completed_run_ignores_trailing_echo_packets() -> None:
             }
         ],
     )
+    tracker.process_vehicle_state(VS_DOCKED_CHARGING)
     assert tracker.state == STATE_COMPLETED
 
     # Three echo packets — same sub/mp, only time advancing.

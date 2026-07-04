@@ -28,20 +28,29 @@ Guard layers (Fable brief 2026-07-03 16:57 UTC):
   captured on the first packet of the run. Same ISO-Monday exemption;
   when the exemption fires wk₀ is re-anchored from the new packet.
 
-State machine (converged, authoritative per the brief):
+State machine (converged, authoritative per the brief; BUG-09 revised):
 
     IDLE ─fresh type-2─▶ RUNNING [run_started]
     RUNNING ─vs ∈ {1,2,3,6}─▶ PAUSED_DOCKED
     PAUSED_DOCKED ─fresh type-2, strict progress─▶ RUNNING   (resume)
-    RUNNING ─mp = 100─▶ COMPLETED [run_finished(completed)]
+    RUNNING/PAUSED_DOCKED ─mp ≥ MP_COMPLETION_THRESHOLD (99)
+        ∧ vs ∈ {1,2,3}─▶ COMPLETED [run_finished]
     RUNNING/PAUSED_DOCKED ─fresh reset (sub < last, sub < ceiling)─▶
-        close open run INTERRUPTED [run_finished(interrupted)],
-        open new run [run_started]
+        close open run [run_finished], open new run [run_started]
     PAUSED_DOCKED ─vs ∈ {1,3} sustained 60 s─▶ INTERRUPTED
-        [run_finished(interrupted)]
+        [run_finished]
     COMPLETED/INTERRUPTED ─fresh type-2 with strict progress─▶
         reopen same run, RUNNING [run_reopened]
     COMPLETED/INTERRUPTED ─fresh reset (sub < ceiling)─▶ open new run
+
+BUG-09 (2026-07-04): the observed i210 firmware never emits `mp = 100`
+— tasks terminate at `mp = 99`. The completion criterion is therefore
+`mp ≥ MP_COMPLETION_THRESHOLD` (99) ∧ `vs ∈ {1, 2, 3}` (docked idle /
+charging / unpowered; user pause `vs = 6` excluded so a manual pause
+still holds the run even at `mp = 99`). Immediate close, no debounce.
+The result label is centralised in `_close_run`: `completed` iff the
+last accepted `mp ≥ MP_COMPLETION_THRESHOLD`, else `interrupted` — so
+every close path (fast, reset, sustained-timer) labels consistently.
 
 A `sub` regression *above* `RESET_SUB_CEILING` is not accepted as an
 immediate reset — the packet is stashed as a *pending* reset and only
@@ -50,7 +59,8 @@ coherently (B2 on #49: one anomalous packet must not destroy a live
 run). Reopens require strict `sub > last_sub` progress (B1 on #49: an
 echo packet after a run close must not re-fire the completion cycle).
 
-vs=2 (charging) holds PAUSED_DOCKED indefinitely — a recharge pause
+vs=2 (charging) still holds PAUSED_DOCKED when the run has not reached
+the completion threshold — a mid-run recharge pause below `mp = 99`
 never times out. vs=8 (firmware-reset transient, MAP-01) is ignored.
 `boundary=0` (BUG-06 sentinel) is excluded from zone accounting but
 still updates run accumulators.
@@ -98,6 +108,21 @@ DOCKED_STATES = frozenset(
 # control, no timeout; vs ∈ {1, 3} → terminal for the open run once
 # sustained.
 DOCKED_NOT_CHARGING = frozenset({VS_DOCKED_IDLE, VS_DOCKED_UNPOWERED})
+
+# BUG-09: docked variants that qualify for the mp-completion criterion.
+# vs = 6 (explicit user pause) is excluded so a manual pause at mp = 99
+# still holds the run — the user is in control and may resume.
+DOCKED_NOT_USER_PAUSED = frozenset(
+    {VS_DOCKED_IDLE, VS_DOCKED_CHARGING, VS_DOCKED_UNPOWERED}
+)
+
+# BUG-09: mp threshold that marks a task-scoped run as complete. The
+# observed i210 firmware never emits `mp = 100` — tasks terminate at
+# `mp = 99` (2026-07-04 diag: real run peaked at 99, robot returned to
+# dock, no further mp progression). Set to 99 to catch normal
+# completions while remaining strict enough that a mid-run recharge
+# pause at `mp < 99` still holds PAUSED_DOCKED.
+MP_COMPLETION_THRESHOLD = 99
 
 # Seconds a PAUSED_DOCKED run must remain in DOCKED_NOT_CHARGING before
 # it is declared INTERRUPTED. 60 s ≈ 30 type-1 samples at the 2 s
@@ -273,7 +298,7 @@ class RunTracker:
                 # a coherent successor must confirm (BUG-08-style
                 # mixed-epoch packets must not destroy a live run).
                 if incoming_sub is not None and incoming_sub < RESET_SUB_CEILING:
-                    events.append(self._close_run(RESULT_INTERRUPTED))
+                    events.append(self._close_run())
                     self._open_run(parsed)
                     events.append(self._event_run_started())
                 else:
@@ -331,9 +356,13 @@ class RunTracker:
         if parsed.get("time") is not None:
             self._last_accepted_time_ms = parsed["time"]
 
-        # Terminal transition — mp reaching 100 closes the run.
-        if incoming_mp == 100 and self.state == STATE_RUNNING:
-            events.append(self._close_run(RESULT_COMPLETED))
+        # BUG-09: completion criterion (`mp ≥ 99 ∧ vs ∈ {1,2,3}`). Fires
+        # when a fresh type-2 pushes `last_mp` over the threshold while
+        # the robot is already docked (the mp-then-dock path is handled
+        # by `process_vehicle_state`).
+        completion = self._maybe_complete_run()
+        if completion is not None:
+            events.append(completion)
 
         return events
 
@@ -362,6 +391,15 @@ class RunTracker:
             # -charging arms it.
             self._start_interrupt_timer_if_applicable(vs)
 
+        # BUG-09: the run may already have reached the mp threshold
+        # before the robot arrived at the dock — process_type2 alone
+        # can't fire the close in that ordering because no further
+        # type-2 packet is guaranteed after dock arrival. Firing here
+        # closes the run as soon as `vs` enters {1, 2, 3}.
+        completion = self._maybe_complete_run()
+        if completion is not None:
+            events.append(completion)
+
         return events
 
     def tick(self, now: float | None = None) -> list[Event]:
@@ -373,9 +411,12 @@ class RunTracker:
           the interruption detector survive an HA restart *without*
           needing a fresh `vehicleState` change to re-arm — a `restore()`
           followed by a tick suffices.
-        - Fire `run_finished(interrupted)` once the timer has been armed
-          for at least `INTERRUPT_SUSTAIN_SECONDS` and nothing has
-          resumed the run.
+        - Fire `run_finished` once the timer has been armed for at
+          least `INTERRUPT_SUSTAIN_SECONDS` and nothing has resumed the
+          run. The result label is derived from `last_mp` in
+          `_close_run`, so a sustained-timer close after the robot
+          completed (mp ≥ 99) is labelled `completed`, not
+          `interrupted` (BUG-09 label consistency).
         """
         events: list[Event] = []
         now = self._clock() if now is None else now
@@ -387,7 +428,7 @@ class RunTracker:
             if self._interrupt_timer_started_at is None:
                 self._interrupt_timer_started_at = now
             elif (now - self._interrupt_timer_started_at) >= INTERRUPT_SUSTAIN_SECONDS:
-                events.append(self._close_run(RESULT_INTERRUPTED))
+                events.append(self._close_run())
 
         return events
 
@@ -542,12 +583,13 @@ class RunTracker:
             )
             return events
 
-        # Confirmed — close the open run (if any) as INTERRUPTED at its
-        # own accumulator's last `time`, then open a new run at the
+        # Confirmed — close the open run (if any) at its own
+        # accumulator's last `time` (label derived from that run's
+        # `last_mp` in `_close_run`), then open a new run at the
         # candidate. The current packet then flows through the normal
         # continuation path against the new run.
         if self.state in (STATE_RUNNING, STATE_PAUSED_DOCKED):
-            events.append(self._close_run(RESULT_INTERRUPTED))
+            events.append(self._close_run())
         self._open_run(candidate)
         events.append(self._event_run_started())
         # Stamp cursors from the candidate too, so `_passes_layer_2`
@@ -580,7 +622,19 @@ class RunTracker:
         self.state = STATE_RUNNING
         self._interrupt_timer_started_at = None
 
-    def _close_run(self, result: str) -> Event:
+    def _close_run(self) -> Event:
+        """Close the currently open run. The result label is derived
+        from the last accepted `mowing_percentage`: `completed` iff
+        `last_mp >= MP_COMPLETION_THRESHOLD`, else `interrupted`.
+
+        Centralising the decision here (BUG-09) means every close path
+        — the fast BUG-09 completion criterion, a fresh reset, the
+        sustained-60 s interruption timer, a resolved pending reset —
+        labels the same way. The sustained-timer path on 2026-07-04
+        used to hardcode `interrupted` and thus mis-labeled a genuinely
+        completed run whose close it caught after the battery finished
+        charging.
+        """
         assert self.current_run is not None, "close_run without an open run"
         r = self.current_run
         start = r.get("start_time")
@@ -588,6 +642,12 @@ class RunTracker:
         duration_ms: int | None = None
         if start is not None and end is not None:
             duration_ms = end - start
+        last_mp = r.get("last_mp")
+        result = (
+            RESULT_COMPLETED
+            if last_mp is not None and last_mp >= MP_COMPLETION_THRESHOLD
+            else RESULT_INTERRUPTED
+        )
         self.state = (
             STATE_COMPLETED if result == RESULT_COMPLETED else STATE_INTERRUPTED
         )
@@ -603,6 +663,30 @@ class RunTracker:
                 "zones": [dict(z) for z in r.get("zones", [])],
             },
         )
+
+    def _maybe_complete_run(self) -> Event | None:
+        """BUG-09 completion criterion: `last_mp ≥ MP_COMPLETION_THRESHOLD`
+        (99) ∧ `vehicle_state ∈ DOCKED_NOT_USER_PAUSED` (`{1, 2, 3}`).
+        Immediate close with no debounce. Returns the close event, or
+        `None` when the criterion is not met.
+
+        Called from `process_type2` (after accumulator update, so the
+        just-accepted packet's `mp` is visible) and `process_vehicle_state`
+        (after the vs update, so a dock arrival while `last_mp` was
+        already ≥ threshold fires the close even before the next type-2).
+        Either ordering — mp-crosses-threshold-then-dock, or
+        dock-arrives-then-mp-refresh — is handled.
+        """
+        if self.state not in (STATE_RUNNING, STATE_PAUSED_DOCKED):
+            return None
+        if self.current_run is None:
+            return None
+        last_mp = self.current_run.get("last_mp")
+        if last_mp is None or last_mp < MP_COMPLETION_THRESHOLD:
+            return None
+        if self.vehicle_state not in DOCKED_NOT_USER_PAUSED:
+            return None
+        return self._close_run()
 
     def _reopen_run(self) -> None:
         """Move a closed run back to RUNNING without altering its
