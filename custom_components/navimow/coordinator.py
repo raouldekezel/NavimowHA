@@ -1,5 +1,6 @@
 """DataUpdateCoordinator for Navimow integration."""
 
+import copy
 import logging
 import time
 from dataclasses import replace
@@ -10,6 +11,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import config_entry_oauth2_flow
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from mower_sdk.api import MowerAPI
 from mower_sdk.models import (
@@ -22,18 +24,37 @@ from mower_sdk.sdk import NavimowSDK
 
 from .const import (
     DOMAIN,
+    EVENT_RUN_FINISHED,
+    EVENT_RUN_REOPENED,
+    EVENT_RUN_STARTED,
     FUTURE_TIMESTAMP_TOLERANCE_MS,
+    HISTORY_MAX,
     HTTP_FALLBACK_MIN_INTERVAL,
     MQTT_DISCONNECT_TICKS_TO_WARN,
     MQTT_STALE_SECONDS,
     POSITION_THROTTLE_SECONDS,
     SIGNAL_POSITION_UPDATE,
     STALE_DROP_STREAK_TO_WARN,
+    STORE_VERSION,
+    TRACKER_HEARTBEAT_SECONDS,
     UPDATE_INTERVAL,
 )
 from .location import parse_location_type_1, parse_location_type_2
+from .run_tracker import EVENT_RUN_FINISHED as _TRACKER_EVENT_RUN_FINISHED
+from .run_tracker import EVENT_RUN_REOPENED as _TRACKER_EVENT_RUN_REOPENED
+from .run_tracker import EVENT_RUN_STARTED as _TRACKER_EVENT_RUN_STARTED
+from .run_tracker import STATE_RUNNING as _TRACKER_STATE_RUNNING
 from .run_tracker import Event as RunEvent
 from .run_tracker import RunTracker
+
+# Map internal tracker Event.kind → HA event bus event name. Keeps the
+# HA-facing surface a pure translation, so a future rename on either
+# side lands in exactly one place.
+_TRACKER_KIND_TO_HA_EVENT = {
+    _TRACKER_EVENT_RUN_STARTED: EVENT_RUN_STARTED,
+    _TRACKER_EVENT_RUN_FINISHED: EVENT_RUN_FINISHED,
+    _TRACKER_EVENT_RUN_REOPENED: EVENT_RUN_REOPENED,
+}
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -110,16 +131,89 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._type1_drop_streak: int = 0
         self._type2_drop_streak: int = 0
         # FEAT-05 (b): pure state machine that turns the accepted
-        # /location stream into run/zone events. HA-facing plumbing
-        # (event bus, entities, `Store` persistence) lands in step (c);
-        # here we just log the emitted events at DEBUG so we can trace
-        # the tracker without user-visible side effects yet.
+        # /location stream into run/zone events. Fed by
+        # `_handle_location_stats`, `_handle_location_position` (on vs
+        # change), and `_async_update_data.tick()`.
         self.run_tracker = RunTracker()
+        # FEAT-05 (c): capped history of closed runs (result, duration,
+        # zones, mst) — exposed as an attribute of `last_run_result` for
+        # the future custom card, restored from Store on setup.
+        self.history: list[dict[str, Any]] = []
+        # Most-recently-closed run's `run_finished` payload; drives the
+        # `last_run_*` sensors (started/duration/result).
+        self.last_finished_run: dict[str, Any] | None = None
+        # `homeassistant.helpers.storage.Store` instance, created on
+        # `async_setup` once the device id is known.
+        self._store: Store | None = None
+        self._last_store_save_monotonic: float = 0.0
 
     async def async_setup(self) -> None:
-        """Register callbacks from SDK."""
+        """Restore persistence + register callbacks from SDK.
+
+        Restore happens *before* subscribing to the SDK so the tracker
+        and the layer-1 cursors see live packets against the last
+        known state, not against a cold-boot IDLE.
+        """
+        await self._async_restore_store()
         self.sdk.on_state(self._handle_state)
         self.sdk.on_attributes(self._handle_attributes)
+
+    async def _async_restore_store(self) -> None:
+        """Load the run tracker + cursors + history from Store."""
+        self._store = Store(
+            self.hass,
+            STORE_VERSION,
+            f"{DOMAIN}.{self.device.id}.run_tracker",
+        )
+        try:
+            payload = await self._store.async_load()
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning(
+                "run_tracker store load failed for %s: %s", self.device.id, err
+            )
+            return
+        if not payload:
+            return
+        tracker_snap = payload.get("tracker")
+        if tracker_snap and not self.run_tracker.restore(tracker_snap):
+            _LOGGER.warning(
+                "run_tracker snapshot version mismatch for %s — discarding",
+                self.device.id,
+            )
+        cursors = payload.get("cursors") or {}
+        self._last_accepted_time_type1 = cursors.get("type1")
+        self._last_accepted_time_type2 = cursors.get("type2")
+        history = payload.get("history") or []
+        # Trust the on-disk order but re-cap defensively in case a prior
+        # release stored more than HISTORY_MAX (or the cap has since
+        # dropped).
+        self.history = list(history[-HISTORY_MAX:])
+        self.last_finished_run = payload.get("last_finished_run")
+
+    def _build_store_payload(self) -> dict[str, Any]:
+        # `snapshot()` already deep-copies `current_run` for us; the
+        # history / last_finished_run are cheap to deep-copy at save
+        # time and the copy decouples the fire-and-forget Store save
+        # (which serialises in an executor) from any subsequent mutation
+        # on the HA loop.
+        return {
+            "tracker": self.run_tracker.snapshot(),
+            "cursors": {
+                "type1": self._last_accepted_time_type1,
+                "type2": self._last_accepted_time_type2,
+            },
+            "history": copy.deepcopy(self.history),
+            "last_finished_run": copy.deepcopy(self.last_finished_run),
+        }
+
+    def _schedule_store_save(self) -> None:
+        """Fire-and-forget save. Never awaited from the tracker path so
+        MQTT dispatch is not gated on disk I/O.
+        """
+        if self._store is None:
+            return
+        self.hass.async_create_task(self._store.async_save(self._build_store_payload()))
+        self._last_store_save_monotonic = time.monotonic()
 
     # === /location channel (real-time pose + mowing stats) — FEAT-01 ===
 
@@ -280,14 +374,32 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _forward_run_events(self, events: list[RunEvent]) -> None:
         """Consume events emitted by the tracker.
 
-        Step (b) only logs them at DEBUG — the HA event bus dispatch
-        and the entity state changes land in step (c). Kept as a
-        dedicated seam so (c)'s diff is small and localised.
+        Each event: (1) DEBUG-logged for tracing; (2) fired on the HA
+        event bus so automations can react; (3) if it is a
+        `run_finished`, appended to the capped history + promoted to
+        `last_finished_run`; (4) triggers a Store save so the on-disk
+        state stays consistent with the visible state.
         """
+        if not events:
+            return
         for event in events:
             _LOGGER.debug(
                 "run_tracker event: kind=%s payload=%s", event.kind, event.payload
             )
+            ha_event = _TRACKER_KIND_TO_HA_EVENT.get(event.kind)
+            if ha_event is not None:
+                self.hass.bus.async_fire(
+                    ha_event,
+                    {**event.payload, "device_id": self.device.id},
+                )
+            if event.kind == _TRACKER_EVENT_RUN_FINISHED:
+                entry = dict(event.payload)
+                self.history.append(entry)
+                if len(self.history) > HISTORY_MAX:
+                    # FIFO trim — keep the most recent HISTORY_MAX entries.
+                    self.history = self.history[-HISTORY_MAX:]
+                self.last_finished_run = entry
+        self._schedule_store_save()
 
     def _device_status_to_state(self, status: DeviceStatus) -> DeviceStateMessage:
         error: dict[str, Any] | None = None
@@ -454,6 +566,16 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # arriving (the whole point of the timer is to catch a run that
         # has silently ended).
         self._forward_run_events(self.run_tracker.tick())
+        # FEAT-05 (c): heartbeat Store save while a run is open. Every
+        # tracker transition already saves through `_forward_run_events`;
+        # this is the between-transition backstop for a hard crash mid-
+        # run. `TRACKER_HEARTBEAT_SECONDS` throttles it — never per-tick.
+        if (
+            self.run_tracker.state == _TRACKER_STATE_RUNNING
+            and (time.monotonic() - self._last_store_save_monotonic)
+            >= TRACKER_HEARTBEAT_SECONDS
+        ):
+            self._schedule_store_save()
         self.data = self._build_data()
         return self.data
 

@@ -205,6 +205,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 # Executes on the HA loop (called from _on_message which is
                 # scheduled via create_task). Decodes the /location payload
                 # and dispatches items to the coordinator by device_id.
+                #
+                # FEAT-05 (c) invariant: this early return until
+                # `hass.data[DOMAIN][entry.entry_id]` is populated is what
+                # guarantees the Store restore completes *before* any
+                # /location packet reaches the tracker. `async_setup_entry`
+                # only writes hass.data after every coordinator's
+                # `async_setup()` (which awaits `_async_restore_store`)
+                # returns. A future refactor that populates hass.data
+                # incrementally would break the restore-before-live
+                # property — feed one coordinator at a time only if you
+                # keep this gate closed until each restore completes.
                 from .location import parse_location_payload
 
                 items = parse_location_payload(payload)

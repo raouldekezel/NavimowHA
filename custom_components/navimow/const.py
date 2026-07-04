@@ -91,6 +91,25 @@ FUTURE_TIMESTAMP_TOLERANCE_MS: Final = 300_000
 # reaches this threshold; a truly poisoned cursor will.
 STALE_DROP_STREAK_TO_WARN: Final = 25
 
+# FEAT-05 (c) persistence + history + HA event names.
+# Store payload version — bump when the shape stored on disk changes.
+STORE_VERSION: Final = 1
+# Cap on the persisted list of closed runs. 50 gives ~2 months of history at
+# one run/day (the operator's observed cadence) while keeping the payload
+# small and cheap to serialise every save.
+HISTORY_MAX: Final = 50
+# Heartbeat save cadence while a run is RUNNING. Never per-packet — every
+# tracker transition already triggers an event-driven save. This backstop
+# survives a hard crash between transitions with at most one heartbeat of
+# lost progress.
+TRACKER_HEARTBEAT_SECONDS: Final = 300
+# HA event bus event names surfaced by the tracker. Prefixed with the
+# integration domain per HA convention; step (c) fires them from
+# `_forward_run_events`.
+EVENT_RUN_STARTED: Final = "navimow_run_started"
+EVENT_RUN_FINISHED: Final = "navimow_run_finished"
+EVENT_RUN_REOPENED: Final = "navimow_run_reopened"
+
 
 # Mapping from MowerStatus to LawnMowerActivity
 MOWER_STATUS_TO_ACTIVITY = {

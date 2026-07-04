@@ -52,6 +52,34 @@
       },
       "current_zone": {
         "name": "Zone courante"
+      },
+      "run_progress": {
+        "name": "Progression du passage"
+      },
+      "zone_progress": {
+        "name": "Progression de la zone"
+      },
+      "run_state": {
+        "name": "État du passage",
+        "state": {
+          "idle": "Au repos",
+          "running": "En cours",
+          "paused": "En pause",
+          "returning": "Retour"
+        }
+      },
+      "last_run_started": {
+        "name": "Début du dernier passage"
+      },
+      "last_run_duration": {
+        "name": "Durée du dernier passage"
+      },
+      "last_run_result": {
+        "name": "Résultat du dernier passage",
+        "state": {
+          "completed": "Terminé",
+          "interrupted": "Interrompu"
+        }
       }
     },
     "binary_sensor": {

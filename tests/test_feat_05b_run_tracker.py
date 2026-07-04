@@ -665,6 +665,16 @@ def test_coordinator_instantiates_run_tracker() -> None:
     coordinator.async_set_updated_data = MagicMock()
     coordinator.run_tracker = RunTracker()
 
+    # FEAT-05 (c) persistence + history attributes.
+
+    coordinator.history = []
+
+    coordinator.last_finished_run = None
+
+    coordinator._store = None
+
+    coordinator._last_store_save_monotonic = 0.0
+
     coordinator.handle_location_item(
         {
             "type": 2,
@@ -1229,3 +1239,59 @@ def test_layer_3_within_tolerance_still_accepted() -> None:
     assert events == []
     assert tracker.drops["layer_3"] == 0
     assert tracker.current_run["last_sub"] == 20.0
+
+
+# --------------------------------------------------------------------- #
+# 18. snapshot() is a point-in-time capture (Opus review 3 on #50)      #
+# --------------------------------------------------------------------- #
+
+
+def test_snapshot_is_isolated_from_subsequent_mutation() -> None:
+    """`snapshot()` must return a dict that cannot be mutated by a later
+    packet arriving on the HA loop while `Store.async_save` is still
+    serialising the payload in an executor. Deep-copy on `current_run`
+    guarantees the property; reverting the copy makes this test fail.
+    """
+    tracker = RunTracker()
+    _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "currentMowProgress": 5000,
+                "mowingPercentage": 50,
+                "subtotalArea": "100.0",
+                "mowingWeekArea": "100.0",
+                "mowStartType": 1,
+                "time": 1_000_000_000_000,
+            }
+        ],
+    )
+
+    snap = tracker.snapshot()
+    snap_last_sub = snap["current_run"]["last_sub"]
+    snap_zone_count = len(snap["current_run"]["zones"])
+
+    # A later packet mutates the tracker's live current_run in place.
+    _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 3,  # boundary change → new zone
+                "currentMowProgress": 500,
+                "mowingPercentage": 60,
+                "subtotalArea": "120.0",
+                "mowingWeekArea": "120.0",
+                "mowStartType": 1,
+                "time": 1_000_000_060_000,
+            }
+        ],
+    )
+    assert tracker.current_run["last_sub"] == 120.0
+    assert len(tracker.current_run["zones"]) > snap_zone_count
+
+    # The snapshot must NOT reflect the mutation.
+    assert snap["current_run"]["last_sub"] == snap_last_sub
+    assert len(snap["current_run"]["zones"]) == snap_zone_count

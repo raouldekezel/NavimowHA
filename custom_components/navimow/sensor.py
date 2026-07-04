@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -14,7 +15,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, UnitOfArea, UnitOfLength
+from homeassistant.const import PERCENTAGE, UnitOfArea, UnitOfLength, UnitOfTime
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import DeviceInfo
@@ -23,6 +24,44 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN, SIGNAL_POSITION_UPDATE
 from .coordinator import NavimowCoordinator
+from .run_tracker import STATE_PAUSED_DOCKED, STATE_RUNNING, VS_RETURNING
+
+
+def _current_run_or_none(c: NavimowCoordinator) -> dict[str, Any] | None:
+    """Return the tracker's current open run, or `None` at rest."""
+    if c.run_tracker.state in (STATE_RUNNING, STATE_PAUSED_DOCKED):
+        return c.run_tracker.current_run
+    return None
+
+
+def _run_state_display(c: NavimowCoordinator) -> str:
+    """Map tracker (state, vehicle_state) to the display enum."""
+    ts = c.run_tracker.state
+    if ts == STATE_RUNNING:
+        # `returning` = run open AND vs=5 (docked in MAP-01). vs=4
+        # (mowing) is the ordinary open-run state and stays as
+        # `running`. Fable brief mentions vs ∈ {4, 5} but vs=4 is the
+        # dominant mowing signal — folding it into `returning` would
+        # spuriously flag every mowing tick as returning-to-dock.
+        return "returning" if c.vehicle_state == VS_RETURNING else "running"
+    if ts == STATE_PAUSED_DOCKED:
+        return "paused"
+    return "idle"
+
+
+def _last_run_start_dt(c: NavimowCoordinator) -> datetime | None:
+    """`last_run_started` value — from either the still-open run or
+    the last persisted `last_finished_run`.
+    """
+    open_run = _current_run_or_none(c)
+    epoch_ms = None
+    if open_run is not None:
+        epoch_ms = open_run.get("start_time")
+    elif c.last_finished_run is not None:
+        epoch_ms = c.last_finished_run.get("start_time")
+    if epoch_ms is None:
+        return None
+    return datetime.fromtimestamp(epoch_ms / 1000, tz=UTC)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -101,6 +140,99 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
         ),
         attrs_fn=lambda c: (
             {"boundary_id": c.stats.get("boundary")} if c.stats else None
+        ),
+    ),
+    # === FEAT-05 (c) — tracker-driven run/zone sensors ===
+    # `run_progress` (%): held during `PAUSED_DOCKED`, `None` at rest.
+    # Reads from the tracker's open run, not from `stats`, so a lingering
+    # `stats["mowing_percentage"]` from a closed run does not leak into
+    # the sensor (BUG-07 symptom for this entity).
+    NavimowSensorEntityDescription(
+        key="run_progress",
+        translation_key="run_progress",
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:progress-check",
+        value_fn=lambda c: (
+            r["last_mp"] if (r := _current_run_or_none(c)) is not None else None
+        ),
+    ),
+    # `zone_progress` (%): `currentMowProgress / 100` of the current
+    # zone, held during pause, `None` at rest.
+    NavimowSensorEntityDescription(
+        key="zone_progress",
+        translation_key="zone_progress",
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:progress-helper",
+        value_fn=lambda c: (
+            r["zones"][-1]["cmp_max"] / 100.0
+            if (r := _current_run_or_none(c)) is not None and r.get("zones")
+            else None
+        ),
+    ),
+    # `run_state`: enum idle/running/paused/returning. `returning`
+    # heuristic documented in `_run_state_display`. `options` must
+    # match every value the display fn can return — HA's enum-checks
+    # block short-circuits when `options is None` (no error raised),
+    # so declaring them here enables value-in-options validation and
+    # exposes the OPTIONS capability attribute for the frontend.
+    NavimowSensorEntityDescription(
+        key="run_state",
+        translation_key="run_state",
+        device_class=SensorDeviceClass.ENUM,
+        options=["idle", "running", "paused", "returning"],
+        icon="mdi:state-machine",
+        value_fn=_run_state_display,
+    ),
+    # `last_run_started` — timestamp of the open run's start (while
+    # open) or the last closed run's start (at rest). Persisted via
+    # `last_finished_run` in Store.
+    NavimowSensorEntityDescription(
+        key="last_run_started",
+        translation_key="last_run_started",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        icon="mdi:calendar-clock",
+        value_fn=_last_run_start_dt,
+    ),
+    # `last_run_duration` (seconds) — duration of the *closed* run
+    # (from `last_finished_run.duration_ms`). While a run is open we
+    # deliberately show `None` here so the sensor never reads "live"
+    # duration — the operator has `run_progress` for that.
+    NavimowSensorEntityDescription(
+        key="last_run_duration",
+        translation_key="last_run_duration",
+        native_unit_of_measurement=UnitOfTime.SECONDS,
+        device_class=SensorDeviceClass.DURATION,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:timer-outline",
+        value_fn=lambda c: (
+            round(c.last_finished_run["duration_ms"] / 1000)
+            if c.last_finished_run
+            and c.last_finished_run.get("duration_ms") is not None
+            else None
+        ),
+    ),
+    # `last_run_result` — `completed` / `interrupted`, with `zones`,
+    # `mow_start_type`, and `history` as attributes (feeds the future
+    # green/red run history card).
+    NavimowSensorEntityDescription(
+        key="last_run_result",
+        translation_key="last_run_result",
+        device_class=SensorDeviceClass.ENUM,
+        options=["completed", "interrupted"],
+        icon="mdi:flag-checkered",
+        value_fn=lambda c: (
+            c.last_finished_run.get("result") if c.last_finished_run else None
+        ),
+        attrs_fn=lambda c: (
+            {
+                "zones": c.last_finished_run.get("zones"),
+                "mow_start_type": c.last_finished_run.get("mow_start_type"),
+                "history": c.history,
+            }
+            if c.last_finished_run
+            else None
         ),
     ),
 )

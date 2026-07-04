@@ -72,6 +72,16 @@ def _make_coordinator(*, cached_state):
     from custom_components.navimow.run_tracker import RunTracker
 
     coordinator.run_tracker = RunTracker()
+
+    # FEAT-05 (c) persistence + history attributes.
+
+    coordinator.history = []
+
+    coordinator.last_finished_run = None
+
+    coordinator._store = None
+
+    coordinator._last_store_save_monotonic = 0.0
     return coordinator
 
 
