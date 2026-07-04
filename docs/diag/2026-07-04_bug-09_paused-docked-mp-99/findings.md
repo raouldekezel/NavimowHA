@@ -16,8 +16,9 @@ On a real 2026-07-04 run (`REDACTED-ROBOT-MODEL`, `mowStartType=1`, single-zone)
 
 1. `01_run-day-timeline.sensors.tsv` — full change-only timeline of nine relevant entities from 09:00 to 11:00 CEST, exported from `GET /api/history/period/…` and deduped per entity.
 2. `02_dock-transition.sensors.tsv` — compact 10:20-10:35 window around the mp-peaks-at-99 → dock-arrives-on-`vs=2` transition.
+3. `03_charge-complete-tracker-close.sensors.tsv` — 11:00-11:35 window covering the end of charging, the `vs=2 → vs=1` transition when the battery filled, and the tracker's eventual sustained-`vs ∈ {1, 3}` interruption 89 s later.
 
-Both files use `+02:00` (CEST); the local timezone name is redacted per `docs/diag/README.md`.
+All three files use `+02:00` (CEST); the local timezone name is redacted per `docs/diag/README.md`.
 
 ## Timeline (CEST)
 
@@ -34,7 +35,10 @@ Key transitions extracted from `02_dock-transition.sensors.tsv`. Fable's impleme
 | 10:31:42 | Robot arrives at dock, first `vs=2` push | `lawn_mower = docked`, `en_charge = on`, `etat_du_passage = paused` |
 | 10:31:45 | ~1 s dock-contact flicker: `en_charge = off` (i.e. `vs ≠ 2`) — too brief to arm the sustained timer even if `vs ∈ {1, 3}` | `en_charge = off` |
 | 10:31:46 | `vs = 2` again; back to `PAUSED_DOCKED` under charging | `en_charge = on` |
-| 10:33 → 11:00 | Battery climbs 59 → 82; **`etat_du_passage` stays `paused` throughout** | `batterie` monotonic; no other transitions on tracker sensors |
+| 10:33 → 11:15 | Battery climbs 59 → 100 monotonically | `batterie` monotonic; no other transitions on tracker sensors |
+| **11:15:59** | Battery reaches **100 %** — full-charge threshold | `batterie = 100` |
+| **11:23:44** | `en_charge = off` — first `vs ≠ 2` since dock (**52 min 02 s** after dock arrival). Firmware has transitioned to `vs=1` (docked, full, no charge) as documented in MAP-01. | `en_charge = off` |
+| **11:25:13** | Tracker fires `run_finished(interrupted)` **89 s** after `vs=1` was first observed — matches `INTERRUPT_SUSTAIN_SECONDS = 60` + one coordinator tick (~30 s) exactly. | `etat_du_passage = idle`, `last_run_duration = 2880`, `last_run_result = interrupted` |
 
 At diagnosis time (~50 min after dock, still charging), the live snapshot was:
 
@@ -53,13 +57,29 @@ sensor.<slug>_batterie                   = 78
 
 The operator's custom `sensor.razibus_historique` — reading via HA recorder from the FEAT-02 `sensor.<slug>_zone_courante` state changes, driven by a `docked ← *` transition automation — *did* record the session as `04/07 09:30`. So end-of-run is detectable by an out-of-tracker heuristic; the tracker just doesn't detect it.
 
+## Post-charge close — the state machine works but labels the result wrong
+
+Once the battery reached 100 % at 11:15:59 CEST the firmware transitioned out of `vs=2` (charging complete → `vs=1` docked idle full). This was the *only* moment in the whole 3 h 43 min episode where the sustained-`vs ∈ {1, 3}` path 3 could arm, and it did:
+
+- `11:23:44` — `en_charge = off` (`vs=1`).
+- `11:25:13` — tracker close: `etat_du_passage = idle`, `last_run_duration = 2880` s (= 48 min), `last_run_result = interrupted`.
+
+The 89 s gap (60 s sustained + one coordinator tick) matches the design exactly, so **`INTERRUPT_SUSTAIN_SECONDS = 60` behaves correctly** — the mechanism is not broken, its precondition is just unreachable during charging.
+
+Two consequences worth calling out for the fix design:
+
+1. **Total end-of-run latency, dock arrival to tracker close, was 53 min 31 s** (10:31:42 → 11:25:13). At 1-2 runs per day this is not a UX disaster, but it means every successful run's HA event lands roughly an hour after the fact; automations keyed on `navimow_run_finished` will see the event roughly when the operator has moved on. Fix A (`mp ≥ ceiling + cmp = 10000 + docked → COMPLETED`) would compress this to a few seconds; Fix B (`mowingWeekArea` stagnation N minutes) would compress it to N minutes.
+2. **The result label is `interrupted`, but this was a successful run** — the zone reached 100 %, the robot returned autonomously (not sent back by the app), and the battery recharged in full. Fix design should not just close the run at the right time, it should also close it with `completed` when the shape says so (`mp ≥ ceiling` and `cmp_max = 10000`) and reserve `interrupted` for the genuine "abandoned mid-run" case (`mp < ceiling` at close time). The current close-via-sustained-timer path emits `interrupted` unconditionally.
+
+Fixing (1) automatically fixes (2) if the fast path (Fix A) picks up the completion at zone finish rather than at charge finish. If only Fix B lands, it needs a result-label branch (`completed` when `mp ≥ ceiling`, `interrupted` otherwise).
+
 ## Findings
 
 1. **`mp` peaked at 99, never 100** — Fable's SPIKE open question #3 answered negatively. On this run, and consistently over the ~40 min visible in the timeline, the last observed `mp` was 99 at 10:28:06 (line 137 of `01_run-day-timeline`) and it did not budge before the return.
 2. **Zone complete = `cmp = 10000` — `mp = 99` at that same moment** (both entities update within 2 seconds of each other, 10:29:58 vs. 10:28:06). So `zone_progress` reaching 100.0 *is* a reliable "zone is done" signal on this run; `mp` reaching 100 is not.
 3. **Dock arrival lands directly on `vs=2`**. There is a ~1 s window at 10:31:45 where `en_charge = off` (so `vs ≠ 2`), followed immediately by `en_charge = on` at 10:31:46. The sustained-60 s timer wouldn't have fired even without our design — 1 s is well below the debounce.
 4. **Battery evidence rules out "mid-run recharge pause"** — the battery climbed monotonically from 58 % at 10:31:29 to 82 % at 10:57:59 across the 26 min charge; it kept climbing to 78 % (at diagnosis) and is presumably still climbing. If the robot intended to resume, we would expect it to leave the dock somewhere between ~85 % and full charge; it hasn't. This is a *terminal* dock, not a recharge pause.
-5. **Path 1 (`mp=100 → COMPLETED`) unreachable on this class of run**. Path 2 (fresh reset) needs another run to start. Path 3 (`vs ∈ {1, 3}` sustained 60 s) is design-blocked by `vs=2`. The state machine as written has no exit for a terminal dock during charging.
+5. **Path 1 (`mp=100 → COMPLETED`) unreachable on this class of run**. Path 2 (fresh reset) needs another run to start. Path 3 (`vs ∈ {1, 3}` sustained 60 s) is design-blocked by `vs=2` *during charging*; it fires correctly once charging completes (see post-charge section below), but with a 53-minute latency and the wrong result label (`interrupted` on a completed run).
 6. **The old FEAT-02 sensors are not affected in a way the operator would notice** — `sensor.<slug>_progression` shows `99` (the true last MQTT value) and `sensor.<slug>_zone_courante` shows `#1` (the true last boundary). The old system's end-of-run detection is done by the operator's custom automation on the `lawn_mower.docked` transition, which is fine; it just doesn't populate the new `last_run_*` family.
 
 ## Open questions
