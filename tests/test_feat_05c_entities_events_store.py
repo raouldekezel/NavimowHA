@@ -34,6 +34,7 @@ from custom_components.navimow.run_tracker import (
     STATE_INTERRUPTED,
     STATE_PAUSED_DOCKED,
     STATE_RUNNING,
+    VS_DOCKED_CHARGING,
     VS_DOCKED_IDLE,
     VS_MOWING,
     VS_RETURNING,
@@ -85,6 +86,16 @@ def _make_coordinator():
 def _feed_type2(coord, item):
     parsed = parse_location_type_2(item)
     coord._forward_run_events(coord.run_tracker.process_type2(parsed))
+
+
+def _feed_vs(coord, vs: int) -> None:
+    """Drive a `vehicleState` change into the tracker with the same
+    coord-level fan-out `_feed_type2` uses. Needed since BUG-09 wired
+    the completion-close event onto `process_vehicle_state` too — a
+    fresh dock arrival on a run whose `mp ≥ 99` closes the run.
+    """
+    coord.vehicle_state = vs
+    coord._forward_run_events(coord.run_tracker.process_vehicle_state(vs))
 
 
 # --------------------------------------------------------------------- #
@@ -153,6 +164,8 @@ def test_run_progress_drops_to_none_on_completed() -> None:
             "time": 1_000_000_000_000,
         },
     )
+    # BUG-09: mp=100 alone doesn't close — need a dock arrival too.
+    _feed_vs(coord, VS_DOCKED_CHARGING)
     assert coord.run_tracker.state == STATE_COMPLETED
     assert _desc("run_progress").value_fn(coord) is None
     assert _desc("zone_progress").value_fn(coord) is None
@@ -258,6 +271,8 @@ def test_last_run_duration_and_result_after_close() -> None:
             "time": 1_000_000_060_000,  # +60 s
         },
     )
+    # BUG-09: dock arrival closes the run once mp ≥ 99.
+    _feed_vs(coord, VS_DOCKED_CHARGING)
     assert coord.last_finished_run is not None
     assert _desc("last_run_duration").value_fn(coord) == 60
     assert _desc("last_run_result").value_fn(coord) == "completed"
@@ -313,6 +328,8 @@ def test_run_finished_fires_on_bus_and_appends_history() -> None:
             "time": 1_000_000_060_000,
         },
     )
+    # BUG-09: mp=100 alone doesn't fire the finish event — dock does.
+    _feed_vs(coord, VS_DOCKED_CHARGING)
     kinds = [call.args[0] for call in coord.hass.bus.async_fire.call_args_list]
     assert kinds == [EVENT_RUN_FINISHED]
     assert len(coord.history) == 1
@@ -331,6 +348,8 @@ def test_run_reopened_fires_on_bus() -> None:
             "time": 1_000_000_000_000,
         },
     )
+    # BUG-09: close the run by docking; vs=2 persists into the reopen.
+    _feed_vs(coord, VS_DOCKED_CHARGING)
     assert coord.run_tracker.state == STATE_COMPLETED
     coord.hass.bus.async_fire.reset_mock()
 
@@ -345,8 +364,9 @@ def test_run_reopened_fires_on_bus() -> None:
         },
     )
     kinds = [call.args[0] for call in coord.hass.bus.async_fire.call_args_list]
-    # `mp=100` on the reopen packet immediately closes again → we see
-    # reopened followed by finished.
+    # `mp=100` on the reopen packet re-closes at once because we are
+    # still docked (vs=2 in DOCKED_NOT_USER_PAUSED). We see reopened
+    # followed by finished.
     assert kinds == [EVENT_RUN_REOPENED, EVENT_RUN_FINISHED]
 
 
