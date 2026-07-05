@@ -68,6 +68,9 @@
           "returning": "Retour"
         }
       },
+      "current_run_started": {
+        "name": "Début du passage courant"
+      },
       "last_run_started": {
         "name": "Début du dernier passage"
       },

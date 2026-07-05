@@ -37,11 +37,13 @@ Guard layers (Fable brief 2026-07-03 16:57 UTC, revised BUG-10):
   closes it via vs, and the next session re-anchors cleanly). No
   re-anchoring machinery: revisit on evidence.
 
-State machine (converged, authoritative per the brief; BUG-09 revised):
+State machine (converged, authoritative per the brief; BUG-09 revised;
+FEAT-06 revised — session-scoped runs):
 
     IDLE ─fresh type-2─▶ RUNNING [run_started]
     RUNNING ─vs ∈ {1,2,3,6}─▶ PAUSED_DOCKED
-    PAUSED_DOCKED ─fresh type-2, strict progress─▶ RUNNING   (resume)
+    PAUSED_DOCKED ─fresh type-2, strict progress─▶ RUNNING   (resume,
+        same run — intra-run recharge dock does not split)
     RUNNING/PAUSED_DOCKED ─mp ≥ MP_COMPLETION_THRESHOLD (99)
         ∧ vs ∈ {1,2,3}─▶ COMPLETED [run_finished]
     RUNNING/PAUSED_DOCKED ─fresh reset (sub < last, sub < ceiling)─▶
@@ -49,7 +51,7 @@ State machine (converged, authoritative per the brief; BUG-09 revised):
     PAUSED_DOCKED ─vs ∈ {1,3} sustained 60 s─▶ INTERRUPTED
         [run_finished]
     COMPLETED/INTERRUPTED ─fresh type-2 with strict progress─▶
-        reopen same run, RUNNING [run_reopened]
+        open NEW run [run_started] (FEAT-06 / #54)
     COMPLETED/INTERRUPTED ─fresh reset (sub < ceiling)─▶ open new run
 
 BUG-09 (2026-07-04): the observed i210 firmware never emits `mp = 100`
@@ -61,12 +63,33 @@ The result label is centralised in `_close_run`: `completed` iff the
 last accepted `mp ≥ MP_COMPLETION_THRESHOLD`, else `interrupted` — so
 every close path (fast, reset, sustained-timer) labels consistently.
 
+FEAT-06 (2026-07-05, #54): a run maps to a **user session** — an
+activation → final dock cycle. Intra-run recharge docks (vs=2 while
+`mp < threshold`) do NOT split the session (unchanged). What changes
+is the post-close boundary: a fresh accepted type-2 arriving after a
+`COMPLETED` / `INTERRUPTED` no longer *reopens* the closed run — it
+opens a **new run** at that packet's time, with `sub₀` = that packet's
+`sub`. Per-session area is then `sub − sub₀` (per-zone deltas already
+use absolute `sub` pairs and are unaffected). The `run_reopened` event
+is retired.
+
+Task vs session scoping — the fact this design turns on (recorder TSV
+`docs/diag/2026-07-04_spike-02_run-semantics-task-vs-session/` from
+PR #55, first afternoon packet at `mp=65` while the morning had just
+completed at `mp=99`): the firmware's `mp` re-bases on a fresh task
+definition (freshly-mowed zones are credited — non-zero session starts
+are normal), while `sub` (`subtotalArea`) keeps accumulating across
+tasks. `wk − sub` therefore remains an invariant across a task series;
+layer 3 keeps guarding continuation shape. `run_progress` documented
+as *task* progress on the sensor side; run identity keys on `sub`.
+
 A `sub` regression *above* `RESET_SUB_CEILING` is not accepted as an
 immediate reset — the packet is stashed as a *pending* reset and only
 promoted retroactively when the next accepted packet confirms it
 coherently (B2 on #49: one anomalous packet must not destroy a live
-run). Reopens require strict `sub > last_sub` progress (B1 on #49: an
-echo packet after a run close must not re-fire the completion cycle).
+run). New-session transitions from COMPLETED / INTERRUPTED require
+strict `sub > last_sub` progress (B1 on #49: an echo packet after a
+close must not spawn phantom sessions).
 
 vs=2 (charging) still holds PAUSED_DOCKED when the run has not reached
 the completion threshold — a mid-run recharge pause below `mp = 99`
@@ -149,10 +172,22 @@ INVARIANT_TOLERANCE_M2 = 0.5
 # committed (0.39 m² on 2026-05-25, 2.6 m² on 2026-07-03).
 RESET_SUB_CEILING = 10.0
 
+# BUG-10 observability escalation (Fable suggestion, Raoul-confirmed):
+# after this many consecutive wk regressions the tracker emits one
+# WARNING so an operator sees the residual (mid-run wk reset → layer 3
+# rejects the run's tail) in real time rather than only through the
+# counter attribute. Streak resets on any non-regressing packet, so a
+# routine fresh-session start (wk cursor from yesterday, first Sunday
+# packet regresses once, tracker takes the fresh-reset path, cursor
+# advances) never reaches the threshold. Chosen small enough (~2.5 min
+# at the 30 s type-2 cadence) that the WARN lands while the residual is
+# still actionable; the sustained-timer will close the run within
+# ~1-2 min after dock arrival on `vs=1`.
+WK_REGRESSION_STREAK_TO_WARN = 5
+
 # Event kinds.
 EVENT_RUN_STARTED = "run_started"
 EVENT_RUN_FINISHED = "run_finished"
-EVENT_RUN_REOPENED = "run_reopened"
 
 # Run result values (payload of run_finished events).
 RESULT_COMPLETED = "completed"
@@ -238,6 +273,12 @@ class RunTracker:
         self.counters: dict[str, int] = {
             "wk_regressions_observed": 0,
         }
+        # Consecutive wk-regression streak feeding the throttled WARNING
+        # in `_observe_wk_regression`. In-memory only — not snapshotted,
+        # so a mid-anomaly restart re-arms the WARN from zero (the
+        # persistent counter still tells the operator that regressions
+        # happened; the streak is a real-time signal, not a ledger).
+        self._wk_regression_streak: int = 0
 
     # ------------------------------------------------------------- #
     # Public API                                                    #
@@ -272,9 +313,10 @@ class RunTracker:
             and incoming_sub < prev_sub
         )
 
-        # State transition — determine whether we open, close, reopen,
-        # or continue. Layer 3 only fires on continuations and reopens
-        # (where `wk₀` is defined).
+        # State transition — determine whether we open, close, open a
+        # new session, or continue. Layer 3 only fires on continuations
+        # and post-close new-session opens (where `wk₀` is defined on
+        # the closed run and the continuation is expected to share it).
         if self.state == STATE_IDLE:
             self._open_run(parsed)
             events.append(self._event_run_started())
@@ -316,18 +358,23 @@ class RunTracker:
                     self._stash_pending_reset(parsed)
                     return events
             else:
-                # Reopen requires *strict progress* over the closed run's
-                # last accepted values. An echo packet (identical `sub` /
-                # `mp` but fresh `time`) must not re-fire the reopen /
-                # completion cycle — that would emit unbounded
-                # `run_reopened` / `run_finished` pairs to HA (B1 on #49).
+                # FEAT-06 (#54): a fresh accepted type-2 with strict
+                # progress after a close no longer *reopens* the closed
+                # run — it opens a **new session** anchored at this
+                # packet's time and `sub`. Layer 3 gates the transition
+                # against the closed run's `wk₀` (the continuation
+                # invariant across a firmware task series). Strict
+                # progress rejects echo packets (identical `sub` / `mp`
+                # with only `time` fresher) — otherwise a stream tail
+                # would spawn phantom sessions after every close
+                # (B1 on #49 generalised).
                 if not self._has_strict_progress(parsed):
                     return events
                 if not self._passes_layer_3(parsed):
                     self.drops["layer_3"] += 1
                     return events
-                self._reopen_run()
-                events.append(self._event_run_reopened())
+                self._open_run(parsed)
+                events.append(self._event_run_started())
 
         # Bookkeeping on acceptance. `_update_wk0_anchor` handles both
         # the "first packet with data" case and the ISO-Monday rollover;
@@ -433,18 +480,45 @@ class RunTracker:
         firmware reset (or a genuine content anomaly for that matter)
         goes through the reset / pending-reset / layer-3 machinery
         instead.
+
+        Also drives a streak counter and one-shot WARNING (Fable
+        suggestion post-BUG-10): during the mid-run wk-reset residual,
+        layer 3 rejects every packet after the reset and the counter
+        climbs silently in DEBUG. `WK_REGRESSION_STREAK_TO_WARN`
+        consecutive regressions escalate to a single WARNING so the
+        operator sees the residual in real time; the streak resets on
+        any non-regressing packet, so a routine fresh-session start
+        (one regression, cursor advances via the reset path, next
+        packet already ahead of the cursor) never trips it.
         """
         wk = parsed.get("area_week")
         if wk is None or self._last_accepted_wk is None:
             return
-        if wk < self._last_accepted_wk:
-            self.counters["wk_regressions_observed"] += 1
-            _LOGGER.debug(
-                "run_tracker: wk regression observed (wk=%s last=%s time=%s) "
-                "— accepting, layer 2 is observability only (BUG-10 / #58)",
-                wk,
+        if wk >= self._last_accepted_wk:
+            self._wk_regression_streak = 0
+            return
+        self.counters["wk_regressions_observed"] += 1
+        self._wk_regression_streak += 1
+        _LOGGER.debug(
+            "run_tracker: wk regression observed (wk=%s last=%s time=%s "
+            "streak=%d) — accepting, layer 2 is observability only "
+            "(BUG-10 / #58)",
+            wk,
+            self._last_accepted_wk,
+            parsed.get("time"),
+            self._wk_regression_streak,
+        )
+        if self._wk_regression_streak == WK_REGRESSION_STREAK_TO_WARN:
+            _LOGGER.warning(
+                "run_tracker: %d consecutive wk regressions observed "
+                "against cursor=%.2f (state=%s). Layer 3 will drop this "
+                "run's tail if it stays open; the sustained-timer will "
+                "close it via vs, and the next session re-anchors on "
+                "its first accepted packet (BUG-10 residual). See "
+                "counters['wk_regressions_observed'] for the total.",
+                self._wk_regression_streak,
                 self._last_accepted_wk,
-                parsed.get("time"),
+                self.state,
             )
 
     def _passes_layer_3(self, parsed: dict[str, Any]) -> bool:
@@ -488,10 +562,11 @@ class RunTracker:
 
     def _has_strict_progress(self, parsed: dict[str, Any]) -> bool:
         """True when the incoming packet shows strict progress over the
-        closed run's last accepted values. Used to gate the reopen
-        transition against echo packets — an identical repeat of the
-        closing packet with only `time` fresher would otherwise trigger
-        an unbounded `run_reopened` / `run_finished` cycle (B1 on #49).
+        closed run's last accepted values. Used to gate the FEAT-06
+        new-session transition against echo packets — an identical
+        repeat of the closing packet with only `time` fresher would
+        otherwise spawn a phantom session after every close (B1 on #49
+        generalised).
         """
         if self.current_run is None:
             return True
@@ -602,10 +677,16 @@ class RunTracker:
         wk = parsed.get("area_week")
         sub = parsed.get("area_session")
         wk0 = (wk - sub) if (wk is not None and sub is not None) else None
+        # FEAT-06: `sub₀` is the session-scoped anchor — the incoming
+        # packet's `sub` at the moment the run opens. Per-session area
+        # is later `last_sub − sub₀`. For a genuine fresh mow it is
+        # near 0; for a session opened post-close on a continuing
+        # firmware task it is the accumulator's value at RUN press.
         self.current_run = {
             "start_time": parsed.get("time"),
             "mow_start_type": parsed.get("mow_start_type"),
             "wk0": wk0,
+            "sub0": sub,
             "last_time": parsed.get("time"),
             "last_sub": sub,
             "last_wk": wk,
@@ -641,6 +722,17 @@ class RunTracker:
             if last_mp is not None and last_mp >= MP_COMPLETION_THRESHOLD
             else RESULT_INTERRUPTED
         )
+        # FEAT-06 (#54): per-session area = last_sub − sub₀. Reflects
+        # what the *session* mowed; the firmware's `subtotalArea`
+        # continues across tasks, so raw `last_sub` on its own would
+        # over-count when a session resumes a still-running firmware
+        # task. `None` when either endpoint is missing (e.g. an
+        # old-snapshot run restored without `sub₀` — see `restore`).
+        last_sub = r.get("last_sub")
+        sub0 = r.get("sub0")
+        session_area: float | None = None
+        if last_sub is not None and sub0 is not None:
+            session_area = last_sub - sub0
         self.state = (
             STATE_COMPLETED if result == RESULT_COMPLETED else STATE_INTERRUPTED
         )
@@ -652,6 +744,7 @@ class RunTracker:
                 "start_time": start,
                 "end_time": end,
                 "duration_ms": duration_ms,
+                "session_area": session_area,
                 "mow_start_type": r.get("mow_start_type"),
                 "zones": [dict(z) for z in r.get("zones", [])],
             },
@@ -681,15 +774,6 @@ class RunTracker:
             return None
         return self._close_run()
 
-    def _reopen_run(self) -> None:
-        """Move a closed run back to RUNNING without altering its
-        accumulator. The subsequent `_update_accumulators` call in the
-        surrounding `process_type2` frame extends it.
-        """
-        assert self.current_run is not None, "reopen without a prior run"
-        self.state = STATE_RUNNING
-        self._interrupt_timer_started_at = None
-
     def _event_run_started(self) -> Event:
         assert self.current_run is not None
         r = self.current_run
@@ -699,14 +783,6 @@ class RunTracker:
                 "start_time": r.get("start_time"),
                 "mow_start_type": r.get("mow_start_type"),
             },
-        )
-
-    def _event_run_reopened(self) -> Event:
-        assert self.current_run is not None
-        r = self.current_run
-        return Event(
-            kind=EVENT_RUN_REOPENED,
-            payload={"start_time": r.get("start_time")},
         )
 
     # ------------------------------------------------------------- #
@@ -809,16 +885,26 @@ class RunTracker:
         False when the version doesn't match (caller decides whether to
         drop the payload or upgrade it).
 
-        Tolerant of the pre-BUG-10 shape: a snapshot whose `drops` still
-        carries `layer_2` migrates that count into
-        `counters["wk_regressions_observed"]` so observability continuity
-        survives the deploy.
+        Tolerant of the pre-BUG-10 shape (`drops["layer_2"]` migrated
+        into `counters["wk_regressions_observed"]`) and of the
+        pre-FEAT-06 shape (an open run without `sub₀` degrades to
+        `session_area = None` at close — see below).
         """
         if snap.get("version") != SNAPSHOT_VERSION:
             return False
         self.state = snap.get("state", STATE_IDLE)
         self.vehicle_state = snap.get("vehicle_state")
         self.current_run = snap.get("current_run")
+        # FEAT-06: a pre-FEAT-06 snapshot's open run has no `sub₀`. We
+        # leave it `None` on purpose — the next `_close_run` payload
+        # will report `session_area = None` rather than fabricate a
+        # value (e.g. defaulting to 0 would credit the entire firmware
+        # task-scoped accumulator as this session's area, which is
+        # exactly the bug FEAT-06 fixes). The very next `_open_run`
+        # after that close writes a real `sub₀` and the sensor exits
+        # the degraded window. History rows created before the deploy
+        # are already stored without `session_area`; downstream code
+        # tolerates its absence.
         self._last_accepted_wk = snap.get("last_accepted_wk")
         self._last_accepted_time_ms = snap.get("last_accepted_time_ms")
         drops = snap.get("drops") or {}
@@ -832,6 +918,7 @@ class RunTracker:
                 "wk_regressions_observed", drops.get("layer_2", 0)
             ),
         }
+        self._wk_regression_streak = 0
         # `_interrupt_timer_started_at` is monotonic and cannot be
         # restored across a process restart. `tick()` re-arms it on the
         # first call after restart if the machine is `PAUSED_DOCKED`

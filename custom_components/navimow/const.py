@@ -108,7 +108,6 @@ TRACKER_HEARTBEAT_SECONDS: Final = 300
 # `_forward_run_events`.
 EVENT_RUN_STARTED: Final = "navimow_run_started"
 EVENT_RUN_FINISHED: Final = "navimow_run_finished"
-EVENT_RUN_REOPENED: Final = "navimow_run_reopened"
 
 
 # Mapping from MowerStatus to LawnMowerActivity

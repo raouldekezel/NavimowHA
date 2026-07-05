@@ -8,8 +8,9 @@ Every test exercises one seam:
 - Entity gating: `run_progress` / `zone_progress` `None` at rest, held
   during `PAUSED_DOCKED`; `run_state` enum reflects tracker + vehicle
   state; `last_run_*` read from `last_finished_run`.
-- Event fan-out: each `run_started` / `run_finished` / `run_reopened`
-  emitted by the tracker becomes a `navimow_run_*` event on the bus.
+- Event fan-out: each `run_started` / `run_finished` emitted by the
+  tracker becomes a `navimow_run_*` event on the bus. `run_reopened`
+  was retired by FEAT-06 (#54).
 - History: capped list of closed runs, in-place trim.
 - Store: `snapshot()` → new coordinator → `restore()` → `RUNNING`
   survives with the same accumulator; heartbeat save while `RUNNING`.
@@ -22,7 +23,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from custom_components.navimow.const import (
     EVENT_RUN_FINISHED,
-    EVENT_RUN_REOPENED,
     EVENT_RUN_STARTED,
     HISTORY_MAX,
     TRACKER_HEARTBEAT_SECONDS,
@@ -226,7 +226,12 @@ def test_last_run_started_is_none_at_cold_boot() -> None:
     assert _desc("last_run_started").value_fn(coord) is None
 
 
-def test_last_run_started_reads_open_run_start_time() -> None:
+def test_last_run_started_ignores_open_run_reads_last_finished_only() -> None:
+    """FEAT-06 (#54): `last_run_started` is anchored on the last
+    *closed* session — while a run is open with no prior close on
+    record, the sensor stays `None`. The ongoing session lives on
+    `current_run_started` instead.
+    """
     coord = _make_coordinator()
     _feed_type2(
         coord,
@@ -238,10 +243,38 @@ def test_last_run_started_reads_open_run_start_time() -> None:
             "time": 1_000_000_000_000,
         },
     )
-    dt = _desc("last_run_started").value_fn(coord)
-    assert isinstance(dt, datetime)
+    assert _desc("last_run_started").value_fn(coord) is None
+    # The open session's start time surfaces on `current_run_started`.
+    cur = _desc("current_run_started").value_fn(coord)
+    assert isinstance(cur, datetime)
     # 1_000_000_000_000 ms = 2001-09-09T01:46:40 UTC.
-    assert dt.year == 2001
+    assert cur.year == 2001
+
+
+def test_current_run_started_none_at_rest() -> None:
+    """FEAT-06 (#54): `current_run_started` is `None` when no session
+    is open — including after a close, when `last_run_started` is the
+    populated sensor.
+    """
+    coord = _make_coordinator()
+    assert _desc("current_run_started").value_fn(coord) is None
+
+    # Open a run, then close it via BUG-09 path.
+    _feed_type2(
+        coord,
+        {
+            "type": 2,
+            "mowingPercentage": 100,
+            "subtotalArea": "200.0",
+            "mowingWeekArea": "200.0",
+            "time": 1_000_000_000_000,
+        },
+    )
+    assert _desc("current_run_started").value_fn(coord) is not None
+    _feed_vs(coord, VS_DOCKED_CHARGING)
+    # Post-close: current is None, last is populated.
+    assert _desc("current_run_started").value_fn(coord) is None
+    assert isinstance(_desc("last_run_started").value_fn(coord), datetime)
 
 
 def test_last_run_duration_and_result_after_close() -> None:
@@ -336,7 +369,14 @@ def test_run_finished_fires_on_bus_and_appends_history() -> None:
     assert coord.last_finished_run is coord.history[-1]
 
 
-def test_run_reopened_fires_on_bus() -> None:
+def test_new_session_after_close_fires_run_started_not_reopened() -> None:
+    """FEAT-06 (#54): a fresh accepted type-2 after a close opens a
+    NEW session (`run_started` on the bus). If the incoming packet
+    also satisfies the completion criterion (`mp ≥ 99` while docked),
+    the new session closes on the same tick — the bus sees
+    `run_started` then `run_finished`. `run_reopened` is not emitted
+    (retired).
+    """
     coord = _make_coordinator()
     _feed_type2(
         coord,
@@ -348,7 +388,6 @@ def test_run_reopened_fires_on_bus() -> None:
             "time": 1_000_000_000_000,
         },
     )
-    # BUG-09: close the run by docking; vs=2 persists into the reopen.
     _feed_vs(coord, VS_DOCKED_CHARGING)
     assert coord.run_tracker.state == STATE_COMPLETED
     coord.hass.bus.async_fire.reset_mock()
@@ -358,16 +397,18 @@ def test_run_reopened_fires_on_bus() -> None:
         {
             "type": 2,
             "mowingPercentage": 100,
-            "subtotalArea": "205.0",  # strict progress
+            "subtotalArea": "205.0",  # strict progress → new session
             "mowingWeekArea": "205.0",
             "time": 1_000_000_060_000,
         },
     )
     kinds = [call.args[0] for call in coord.hass.bus.async_fire.call_args_list]
-    # `mp=100` on the reopen packet re-closes at once because we are
-    # still docked (vs=2 in DOCKED_NOT_USER_PAUSED). We see reopened
-    # followed by finished.
-    assert kinds == [EVENT_RUN_REOPENED, EVENT_RUN_FINISHED]
+    assert kinds == [EVENT_RUN_STARTED, EVENT_RUN_FINISHED]
+    # Two distinct history rows (Problem C from #54 dissolved
+    # structurally): one per closed session.
+    assert len(coord.history) == 2
+    assert coord.history[0]["start_time"] == 1_000_000_000_000
+    assert coord.history[1]["start_time"] == 1_000_000_060_000
 
 
 # --------------------------------------------------------------------- #
