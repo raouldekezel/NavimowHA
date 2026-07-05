@@ -31,6 +31,11 @@ to one, and lists the DEBUG capture that would close the design.
   Observation is HA state history plus the BUG-09 findings from earlier
   the same day (`docs/diag/2026-07-04_bug-09_paused-docked-mp-99/`),
   not a fresh packet trace.
+- **Recorder export**: `01_afternoon-recorder.sensors.tsv` — change-only
+  timeline of the 13 relevant entities across 14:00 → 15:30 CEST (345
+  rows). Pulled from `/api/history/period` on 2026-07-05 at Fable's
+  request to ground the snapshot and the `mp` re-basing series. Same
+  pipeline and format as the BUG-09 diag TSVs.
 
 ## Observation
 
@@ -94,10 +99,23 @@ that is one "run". BUG-09 aligned the *closing* on session-shape (dock
 arrival marks a run end). The *opening* is still on task-shape (a task
 starts when the firmware started counting `mp`).
 
-`_run_progress = 97` on the resumed cycle is not a bug per se — the
-firmware really does say `mp = 97` on the first packet of the resume.
-It is honest data leaking a modelling choice the operator did not
-sign up to.
+`_run_progress = 97` at the 15:04 CEST snapshot is not a bug per se —
+the firmware does say `mp = 97` at that moment. But the value in the
+symptom table above is a **live snapshot 47 min into the resumed
+cycle**, not the mp at reopen. The recorder export
+(`01_afternoon-recorder.sensors.tsv`) shows the mp series in full:
+first accepted mp at 14:17:34 was **`65`** (not 97), climbing
+monotonically 65 → 66 → … → 99 → 100 over the following 54 min. The
+draft text "the firmware really does say `mp = 97` on the first packet
+of the resume" is **factually wrong** and is corrected here; the
+resume did not start at 97 — nobody ever saw a start at 97. The
+symptom stands (mp did not restart at 0 on the resumed task, which is
+what Problem A is about), but the number was mis-quoted. Operator
+decision recorded: task-scoped `mp` and non-zero session starts are
+accepted; freshly-mowed zones legitimately credit the counter across
+sessions, so a resume starting somewhere in [30, 68] is normal. Option
+3 (renormalise `mp` to session scope) is therefore **rejected** —
+`run_progress` stays raw firmware `mp`, documented as *task* progress.
 
 ### Problem B — `last_run_*` sensors don't share a subject
 
