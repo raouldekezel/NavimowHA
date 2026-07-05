@@ -18,24 +18,55 @@ Every call returns a list of `Event` records the caller can dispatch to
 Home Assistant. Step (c) turns those into HA events + entity updates;
 step (b) verifies them via `list[Event]` returns in the test suite.
 
-Guard layers (Fable brief 2026-07-03 16:57 UTC, revised BUG-10):
-- Layer 1 lives in the coordinator (`/location` `time` monotonicity per
-  stream) and is not seen here — this module trusts its input.
-- Layer 2 (removed as a blocking guard on 2026-07-05, BUG-10 / #58):
-  `mowingWeekArea` regressions are logged at DEBUG and counted in
-  `counters["wk_regressions_observed"]` but no longer drop the packet.
-  Evidence audit on #58: over ~130 committed /location packets plus two
-  weeks of live operation, layer 2 saw zero true positives (every
-  pathological packet was caught by layer 1 alone) and one catastrophic
-  false positive — a Sunday firmware `wk` reset that made the whole
-  tracker deaf all day. Whatever calendar the firmware follows is not
-  encoded here: no calendar assumption survives contact with evidence.
-- Layer 3: for an open run, `|wk - sub - wk₀| ≤ 0.5` m², where `wk₀` is
-  captured on the first packet of the run. Anchored once per run; a
-  firmware `wk` reset while the run is open will make layer 3 reject
-  the rest of that run (bounded residual — the sustained-timer still
-  closes it via vs, and the next session re-anchors cleanly). No
-  re-anchoring machinery: revisit on evidence.
+Guard layers (post-HARD-06 truth, #62 — the last blocking content guard
+was demoted to observability after a packet-economics audit found zero
+true positives in production and two demonstrated silent-massive-
+rejection failures):
+
+- **Layer 1 — blocking, in the coordinator.** `/location` `time`
+  monotonicity per stream (FEAT-05 step (a) / #48). Evidence-backed:
+  caught the 1 h 38 late-arriving packet on the committed corpus.
+  Not visible from this module — the tracker trusts its input.
+- **Strict-progress echo filter — blocking, here.** On post-close
+  transitions from `COMPLETED` / `INTERRUPTED`, a fresh packet must
+  strictly advance `sub` (or, if unavailable, `mp`) over the closed
+  run's last accepted values. Evidence-backed: caught the event-spam
+  adversarial B1 on #49. Worst case: session start delayed by the
+  transit-length echo tail.
+- **Pending-reset deferral — blocking, here.** A `sub` regression above
+  `RESET_SUB_CEILING` is not accepted immediately: the packet is
+  stashed and only promoted retroactively when the next packet confirms
+  it coherently on `time`, `sub`, and the `wk − sub` shift.
+  Evidence-backed: neutralised the mixed-epoch poison adversarials B2
+  on #49. Worst case: 30–90 s detection latency; the check is
+  packet-vs-packet (never packet-vs-anchor) so a single anomalous
+  packet cannot destroy a live run.
+- **Observability — never blocking.**
+  * `mowingWeekArea` regressions against the last accepted cursor:
+    logged at DEBUG, counted in `counters["wk_regressions_observed"]`,
+    with a one-shot WARN at `WK_REGRESSION_STREAK_TO_WARN` consecutive
+    observations. Layer 2 was demoted on BUG-10 / #58 (evidence audit:
+    zero true positives, one catastrophic all-day false positive on a
+    Sunday firmware `wk` reset).
+  * Invariant deviation `|wk − sub − wk₀|` against the open run's
+    `wk₀`: logged at DEBUG, counted in
+    `counters["invariant_deviations_observed"]`, with a one-shot WARN
+    at `INVARIANT_DEVIATION_STREAK_TO_WARN` consecutive observations.
+    Layer 3 was demoted on HARD-06 / #62 (evidence audit: zero true
+    positives in production, two silent-massive-rejection failures —
+    the BUG-10 mid-run `wk` reset and the FEAT-06 review-fixture 2 m²
+    anchor drift that dropped an entire afternoon without a WARN).
+    `wk₀` stays anchored once per run as the pure reference; no
+    re-anchoring machinery. Runs and per-session areas are
+    `sub`-based and unaffected by a `wk` reset.
+
+The invariant streak WARN fires only against a LIVE run's stable
+`wk₀`; on the post-close new-session path it is measured against the
+closed run's `wk₀` for exactly the first packet before `_open_run`
+re-anchors, so persistent drift there is structurally impossible.
+
+No calendar assumption survives contact with evidence: nothing here
+encodes what week (ISO Monday, Sunday, etc.) the firmware follows.
 
 State machine (converged, authoritative per the brief; BUG-09 revised;
 FEAT-06 revised — session-scoped runs):
@@ -172,18 +203,22 @@ INVARIANT_TOLERANCE_M2 = 0.5
 # committed (0.39 m² on 2026-05-25, 2.6 m² on 2026-07-03).
 RESET_SUB_CEILING = 10.0
 
-# BUG-10 observability escalation (Fable suggestion, Raoul-confirmed):
-# after this many consecutive wk regressions the tracker emits one
-# WARNING so an operator sees the residual (mid-run wk reset → layer 3
-# rejects the run's tail) in real time rather than only through the
-# counter attribute. Streak resets on any non-regressing packet, so a
-# routine fresh-session start (wk cursor from yesterday, first Sunday
-# packet regresses once, tracker takes the fresh-reset path, cursor
-# advances) never reaches the threshold. Chosen small enough (~2.5 min
-# at the 30 s type-2 cadence) that the WARN lands while the residual is
-# still actionable; the sustained-timer will close the run within
-# ~1-2 min after dock arrival on `vs=1`.
+# Observability streak thresholds. After this many consecutive
+# observations the tracker emits one WARNING so an operator sees the
+# anomaly in real time rather than only through the counter attribute.
+# Streak resets on any non-observing packet — routine transitions (fresh
+# session start on a new week, first packet of a new session on the
+# post-close path) never reach the threshold. Chosen small enough
+# (~2.5 min at the 30 s type-2 cadence) that the WARN lands while the
+# anomaly is still actionable.
 WK_REGRESSION_STREAK_TO_WARN = 5
+
+# HARD-06 (#62): the invariant `|wk − sub − wk₀|` is observability, not
+# a blocking guard. A persistent streak against a LIVE run's stable
+# `wk₀` (never re-anchored) means the firmware reset `wk` mid-run; the
+# accepted packets keep the run alive on `sub`, and the sustained-timer
+# closes it via `vs` as usual.
+INVARIANT_DEVIATION_STREAK_TO_WARN = 5
 
 # Event kinds.
 EVENT_RUN_STARTED = "run_started"
@@ -260,25 +295,27 @@ class RunTracker:
         self._pending_reset: dict[str, Any] | None = None
 
         # Diagnostic counters. `drops` = packets the tracker refused
-        # (`layer_3` invariant violation or held as a pending reset);
-        # `counters` = events observed but *not* acted on. The
-        # `wk_regressions_observed` counter replaces the old
-        # `drops["layer_2"]` (BUG-10 / #58): wk regressions are now
-        # logged and counted for observability but no longer drop the
-        # packet.
+        # (held as a pending reset — the only remaining refusal path in
+        # the module); `counters` = events observed but *not* acted on.
+        # `wk_regressions_observed` replaced the old `drops["layer_2"]`
+        # on BUG-10 / #58, `invariant_deviations_observed` replaced
+        # `drops["layer_3"]` on HARD-06 / #62 — both are now
+        # observability signals with streak-WARN escalation.
         self.drops: dict[str, int] = {
-            "layer_3": 0,
             "pending_reset_holds": 0,
         }
         self.counters: dict[str, int] = {
             "wk_regressions_observed": 0,
+            "invariant_deviations_observed": 0,
         }
-        # Consecutive wk-regression streak feeding the throttled WARNING
-        # in `_observe_wk_regression`. In-memory only — not snapshotted,
-        # so a mid-anomaly restart re-arms the WARN from zero (the
-        # persistent counter still tells the operator that regressions
-        # happened; the streak is a real-time signal, not a ledger).
+        # Consecutive observation streaks feeding the throttled WARNINGs
+        # in `_observe_wk_regression` / `_observe_invariant_deviation`.
+        # In-memory only — not snapshotted, so a mid-anomaly restart
+        # re-arms the WARN from zero (the persistent counters still tell
+        # the operator that observations happened; the streaks are
+        # real-time signals, not ledgers).
         self._wk_regression_streak: int = 0
+        self._invariant_deviation_streak: int = 0
 
     # ------------------------------------------------------------- #
     # Public API                                                    #
@@ -314,9 +351,9 @@ class RunTracker:
         )
 
         # State transition — determine whether we open, close, open a
-        # new session, or continue. Layer 3 only fires on continuations
-        # and post-close new-session opens (where `wk₀` is defined on
-        # the closed run and the continuation is expected to share it).
+        # new session, or continue. The invariant `|wk − sub − wk₀|` is
+        # observed (not enforced, HARD-06 / #62) on continuations and
+        # post-close new-session opens; every packet proceeds.
         if self.state == STATE_IDLE:
             self._open_run(parsed)
             events.append(self._event_run_started())
@@ -334,17 +371,10 @@ class RunTracker:
                     self._stash_pending_reset(parsed)
                     return events
             else:
-                if not self._passes_layer_3(parsed):
-                    self.drops["layer_3"] += 1
-                    _LOGGER.debug(
-                        "run_tracker: type-2 rejected by layer 3 "
-                        "(wk=%s sub=%s wk0=%s tol=%s)",
-                        parsed.get("area_week"),
-                        incoming_sub,
-                        self.current_run["wk0"] if self.current_run else None,
-                        INVARIANT_TOLERANCE_M2,
-                    )
-                    return events
+                # Continuation — observe the invariant against the open
+                # run's `wk₀`, then accept. A persistent deviation streak
+                # WARNs at HARD-06 / #62 threshold; it never blocks.
+                self._observe_invariant_deviation(parsed)
                 # Resume from a pause when a fresh type-2 continues.
                 if self.state == STATE_PAUSED_DOCKED:
                     self.state = STATE_RUNNING
@@ -361,30 +391,34 @@ class RunTracker:
                 # FEAT-06 (#54): a fresh accepted type-2 with strict
                 # progress after a close no longer *reopens* the closed
                 # run — it opens a **new session** anchored at this
-                # packet's time and `sub`. Layer 3 gates the transition
-                # against the closed run's `wk₀` (the continuation
-                # invariant across a firmware task series). Strict
-                # progress rejects echo packets (identical `sub` / `mp`
-                # with only `time` fresher) — otherwise a stream tail
-                # would spawn phantom sessions after every close
-                # (B1 on #49 generalised).
+                # packet's time and `sub`. Strict progress rejects echo
+                # packets (identical `sub` / `mp` with only `time`
+                # fresher) — otherwise a stream tail would spawn phantom
+                # sessions after every close (B1 on #49 generalised).
                 if not self._has_strict_progress(parsed):
                     return events
-                if not self._passes_layer_3(parsed):
-                    self.drops["layer_3"] += 1
-                    return events
+                # HARD-06 (#62): observe the invariant against the
+                # CLOSED run's `wk₀` BEFORE `_open_run` re-anchors,
+                # so the observability reference is the anchor the
+                # packet was expected to share — the one whose 2 m²
+                # drift silently killed an afternoon in the review
+                # fixture. Post `_open_run`, subsequent packets sit
+                # under the fresh anchor and are within tolerance;
+                # persistent drift here is structurally impossible.
+                self._observe_invariant_deviation(parsed)
                 self._open_run(parsed)
                 events.append(self._event_run_started())
 
-        # Bookkeeping on acceptance. `_update_wk0_anchor` handles both
-        # the "first packet with data" case and the ISO-Monday rollover;
-        # keeping the mutation out of `_passes_layer_3` keeps the guard
-        # a pure predicate.
+        # Bookkeeping on acceptance. `_update_wk0_anchor` handles the
+        # "first packet with data" case; keeping the mutation out of
+        # `_observe_invariant_deviation` keeps that observer a pure
+        # read.
         self._update_wk0_anchor(parsed)
         self._update_accumulators(parsed)
         self._update_zone(parsed)
 
-        # Layer-2 acceptance stamps the wk/time cursors.
+        # Acceptance stamps the wk/time cursors used by the
+        # wk-regression observer.
         if parsed.get("area_week") is not None:
             self._last_accepted_wk = parsed["area_week"]
         if parsed.get("time") is not None:
@@ -481,15 +515,14 @@ class RunTracker:
         goes through the reset / pending-reset / layer-3 machinery
         instead.
 
-        Also drives a streak counter and one-shot WARNING (Fable
-        suggestion post-BUG-10): during the mid-run wk-reset residual,
-        layer 3 rejects every packet after the reset and the counter
-        climbs silently in DEBUG. `WK_REGRESSION_STREAK_TO_WARN`
-        consecutive regressions escalate to a single WARNING so the
-        operator sees the residual in real time; the streak resets on
-        any non-regressing packet, so a routine fresh-session start
-        (one regression, cursor advances via the reset path, next
-        packet already ahead of the cursor) never trips it.
+        Also drives a streak counter and one-shot WARNING: after
+        `WK_REGRESSION_STREAK_TO_WARN` consecutive regressions the
+        tracker emits a single WARNING so the operator sees the anomaly
+        in real time rather than only through the counter attribute.
+        Streak resets on any non-regressing packet, so a routine
+        fresh-session start (one regression, cursor advances via the
+        reset path, next packet already ahead of the cursor) never
+        trips it.
         """
         wk = parsed.get("area_week")
         if wk is None or self._last_accepted_wk is None:
@@ -511,41 +544,101 @@ class RunTracker:
         if self._wk_regression_streak == WK_REGRESSION_STREAK_TO_WARN:
             _LOGGER.warning(
                 "run_tracker: %d consecutive wk regressions observed "
-                "against cursor=%.2f (state=%s). Layer 3 will drop this "
-                "run's tail if it stays open; the sustained-timer will "
-                "close it via vs, and the next session re-anchors on "
-                "its first accepted packet (BUG-10 residual). See "
-                "counters['wk_regressions_observed'] for the total.",
+                "against cursor=%.2f (state=%s). Packets are accepted "
+                "— wk checks are observability only (BUG-10 #58, "
+                "HARD-06 #62). A persistent streak means the firmware "
+                "reset its weekly counter mid-run; run identity and "
+                "session_area are sub-based and unaffected. Total in "
+                "counters['wk_regressions_observed'].",
                 self._wk_regression_streak,
                 self._last_accepted_wk,
                 self.state,
             )
 
-    def _passes_layer_3(self, parsed: dict[str, Any]) -> bool:
-        """|wk - sub - wk₀| ≤ 0.5 m² for the currently open run.
+    def _observe_invariant_deviation(self, parsed: dict[str, Any]) -> None:
+        """Observe `|wk − sub − wk₀|` without blocking the packet
+        (HARD-06 / #62).
 
-        Pure predicate — side effects live in `_update_wk0_anchor`,
-        called on the acceptance path.
+        Was `_passes_layer_3`, a blocking predicate whose audit on #62
+        showed zero true positives in production and two silent-massive-
+        rejection failures (BUG-10 mid-run wk reset; FEAT-06 review-
+        fixture 2 m² anchor drift). Every packet the tracker now drops
+        is dropped by an evidence-backed guard (layer 1, strict
+        progress, pending-reset) — this one only observes.
+
+        Semantics mirror `_observe_wk_regression`:
+        - Short-circuit on missing `wk` / `sub` / `wk₀` without touching
+          the streak (nothing to compare, nothing to reset).
+        - When the deviation exceeds `INVARIANT_TOLERANCE_M2`, increment
+          `counters["invariant_deviations_observed"]`, DEBUG-log the
+          values, bump the streak, WARN exactly once when the streak
+          reaches `INVARIANT_DEVIATION_STREAK_TO_WARN` (streak-equality
+          gate — the same throttle as the wk-regression WARN).
+        - When the deviation is within tolerance, reset the streak.
+
+        The WARN's semantic is "persistent deviation against a LIVE
+        anchor". On the post-close new-session path the observation
+        fires exactly once against the closed run's `wk₀` before
+        `_open_run` re-anchors — a streak there is structurally
+        impossible. On a mid-run `wk` reset the streak climbs against
+        the open run's never-re-anchored anchor and the WARN lands
+        while the sustained-timer still closes the run cleanly via
+        `vs`; `session_area` is `sub`-only and unaffected.
         """
         if self.current_run is None:
-            return True
+            return
         wk = parsed.get("area_week")
         sub = parsed.get("area_session")
         if wk is None or sub is None:
-            return True
+            return
         wk0 = self.current_run.get("wk0")
         if wk0 is None:
-            # No anchor yet — nothing to compare against; the caller
-            # sets it on this same acceptance via `_update_wk0_anchor`.
-            return True
-        return abs(wk - sub - wk0) <= INVARIANT_TOLERANCE_M2
+            # No anchor yet — nothing to compare against; the acceptance
+            # path will set it via `_update_wk0_anchor`.
+            return
+        deviation = abs(wk - sub - wk0)
+        if deviation <= INVARIANT_TOLERANCE_M2:
+            self._invariant_deviation_streak = 0
+            return
+        self.counters["invariant_deviations_observed"] += 1
+        self._invariant_deviation_streak += 1
+        _LOGGER.debug(
+            "run_tracker: invariant deviation observed "
+            "(wk=%s sub=%s wk0=%s deviation=%.3f tol=%s time=%s state=%s "
+            "streak=%d) — accepting, layer 3 is observability only "
+            "(HARD-06 / #62)",
+            wk,
+            sub,
+            wk0,
+            deviation,
+            INVARIANT_TOLERANCE_M2,
+            parsed.get("time"),
+            self.state,
+            self._invariant_deviation_streak,
+        )
+        if self._invariant_deviation_streak == INVARIANT_DEVIATION_STREAK_TO_WARN:
+            _LOGGER.warning(
+                "run_tracker: %d consecutive invariant deviations "
+                "observed against wk0=%.2f (state=%s). Packets are "
+                "accepted — the invariant is observability only "
+                "(HARD-06 #62). A persistent streak against a live "
+                "anchor means the firmware reset wk mid-run or the "
+                "map was edited during a task; run identity and "
+                "session_area are sub-based and unaffected. Total in "
+                "counters['invariant_deviations_observed'].",
+                self._invariant_deviation_streak,
+                wk0,
+                self.state,
+            )
 
     def _update_wk0_anchor(self, parsed: dict[str, Any]) -> None:
         """Initialise `wk₀` on the first packet with (`wk`, `sub`) after
         `_open_run` — for the case where `_open_run` was fed a packet
         without both fields. Once set, `wk₀` is stable for the life of
-        the run; a firmware `wk` reset mid-run is not re-anchored (see
-        module docstring on the bounded-tail residual).
+        the run; a firmware `wk` reset mid-run is never re-anchored so
+        the deviation observer can see it. `wk₀` is purely the
+        observability reference now (HARD-06 / #62); nothing blocks on
+        it.
         """
         if self.current_run is None:
             return
@@ -602,6 +695,17 @@ class RunTracker:
         the events emitted if the pending is confirmed (close old run +
         open new run), or an empty list if it is discarded or if there
         is nothing pending.
+
+        HARD-06 (#62) explicitly leaves this internal coherence check
+        untouched. It compares the candidate packet to its successor
+        (packet-vs-packet), NOT a packet to a stored run anchor
+        (packet-vs-anchor, which was layer 3's shape). Its failure
+        mode is bounded to discarding the candidate — the next packet
+        becomes one — and it is the evidence-backed mechanism that
+        neutralised the #49 mixed-epoch poison adversarials. The
+        `abs((p_wk - p_sub) - (c_wk - c_sub)) <= INVARIANT_TOLERANCE_M2`
+        term below is that packet-vs-packet check; do not conflate
+        with the demoted layer 3.
         """
         events: list[Event] = []
         candidate = self._pending_reset
@@ -886,9 +990,12 @@ class RunTracker:
         drop the payload or upgrade it).
 
         Tolerant of the pre-BUG-10 shape (`drops["layer_2"]` migrated
-        into `counters["wk_regressions_observed"]`) and of the
-        pre-FEAT-06 shape (an open run without `sub₀` degrades to
-        `session_area = None` at close — see below).
+        into `counters["wk_regressions_observed"]`), the pre-HARD-06
+        shape (`drops["layer_3"]` migrated into
+        `counters["invariant_deviations_observed"]` — same pattern as
+        the #60 layer-2 migration), and the pre-FEAT-06 shape (an open
+        run without `sub₀` degrades to `session_area = None` at
+        close — see below).
         """
         if snap.get("version") != SNAPSHOT_VERSION:
             return False
@@ -908,17 +1015,20 @@ class RunTracker:
         self._last_accepted_wk = snap.get("last_accepted_wk")
         self._last_accepted_time_ms = snap.get("last_accepted_time_ms")
         drops = snap.get("drops") or {}
-        self.drops = {
-            "layer_3": drops.get("layer_3", 0),
-            "pending_reset_holds": drops.get("pending_reset_holds", 0),
-        }
         counters = snap.get("counters") or {}
         self.counters = {
             "wk_regressions_observed": counters.get(
                 "wk_regressions_observed", drops.get("layer_2", 0)
             ),
+            "invariant_deviations_observed": counters.get(
+                "invariant_deviations_observed", drops.get("layer_3", 0)
+            ),
+        }
+        self.drops = {
+            "pending_reset_holds": drops.get("pending_reset_holds", 0),
         }
         self._wk_regression_streak = 0
+        self._invariant_deviation_streak = 0
         # `_interrupt_timer_started_at` is monotonic and cannot be
         # restored across a process restart. `tick()` re-arms it on the
         # first call after restart if the machine is `PAUSED_DOCKED`
