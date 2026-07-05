@@ -25,7 +25,6 @@ from mower_sdk.sdk import NavimowSDK
 from .const import (
     DOMAIN,
     EVENT_RUN_FINISHED,
-    EVENT_RUN_REOPENED,
     EVENT_RUN_STARTED,
     FUTURE_TIMESTAMP_TOLERANCE_MS,
     HISTORY_MAX,
@@ -41,7 +40,6 @@ from .const import (
 )
 from .location import parse_location_type_1, parse_location_type_2
 from .run_tracker import EVENT_RUN_FINISHED as _TRACKER_EVENT_RUN_FINISHED
-from .run_tracker import EVENT_RUN_REOPENED as _TRACKER_EVENT_RUN_REOPENED
 from .run_tracker import EVENT_RUN_STARTED as _TRACKER_EVENT_RUN_STARTED
 from .run_tracker import STATE_RUNNING as _TRACKER_STATE_RUNNING
 from .run_tracker import Event as RunEvent
@@ -49,11 +47,12 @@ from .run_tracker import RunTracker
 
 # Map internal tracker Event.kind → HA event bus event name. Keeps the
 # HA-facing surface a pure translation, so a future rename on either
-# side lands in exactly one place.
+# side lands in exactly one place. The `run_reopened` kind was retired
+# by FEAT-06 (#54) — the tracker now emits `run_started` for a new
+# session and never resurrects a closed run.
 _TRACKER_KIND_TO_HA_EVENT = {
     _TRACKER_EVENT_RUN_STARTED: EVENT_RUN_STARTED,
     _TRACKER_EVENT_RUN_FINISHED: EVENT_RUN_FINISHED,
-    _TRACKER_EVENT_RUN_REOPENED: EVENT_RUN_REOPENED,
 }
 
 _LOGGER = logging.getLogger(__name__)

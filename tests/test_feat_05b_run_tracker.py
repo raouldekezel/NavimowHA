@@ -18,7 +18,6 @@ from pathlib import Path
 from custom_components.navimow.location import parse_location_type_2
 from custom_components.navimow.run_tracker import (
     EVENT_RUN_FINISHED,
-    EVENT_RUN_REOPENED,
     EVENT_RUN_STARTED,
     INTERRUPT_SUSTAIN_SECONDS,
     RESET_SUB_CEILING,
@@ -35,6 +34,7 @@ from custom_components.navimow.run_tracker import (
     VS_MOWING,
     VS_PAUSED,
     VS_TRANSIENT,
+    WK_REGRESSION_STREAK_TO_WARN,
     RunTracker,
 )
 
@@ -374,7 +374,7 @@ def test_synthetic_vs_2_pause_and_resume_bracket() -> None:
 # --------------------------------------------------------------------- #
 
 
-def test_vs_1_sustained_interrupts_then_reopens_on_continuation() -> None:
+def test_vs_1_sustained_interrupts_then_new_session_on_continuation() -> None:
     clock = FakeClock()
     tracker = RunTracker(clock=clock)
 
@@ -406,7 +406,9 @@ def test_vs_1_sustained_interrupts_then_reopens_on_continuation() -> None:
     assert events[0].payload["result"] == RESULT_INTERRUPTED
     assert tracker.state == STATE_INTERRUPTED
 
-    # Fresh type-2 that continues the accumulator (sub ≥ last) → reopen.
+    # FEAT-06 (#54): a fresh accepted type-2 after a close opens a
+    # NEW session (not a reopen). start_time = this packet's time,
+    # sub₀ = this packet's sub. Layer 3 still gates continuity.
     events = _feed(
         tracker,
         [
@@ -420,10 +422,10 @@ def test_vs_1_sustained_interrupts_then_reopens_on_continuation() -> None:
             }
         ],
     )
-    assert [e.kind for e in events] == [EVENT_RUN_REOPENED]
+    assert [e.kind for e in events] == [EVENT_RUN_STARTED]
     assert tracker.state == STATE_RUNNING
-    # Accumulator carries forward: sub advanced 10 → 12, no new run
-    # started.
+    assert tracker.current_run["start_time"] == 1_000_000_200_000
+    assert tracker.current_run["sub0"] == 12.0
     assert tracker.current_run["last_sub"] == 12.0
 
 
@@ -853,9 +855,10 @@ def test_coordinator_instantiates_run_tracker() -> None:
 def test_completed_run_ignores_trailing_echo_packets() -> None:
     """After a run closes at `mp=100`, further packets with identical
     content but only `time` advancing (a plausible stream-tail residue)
-    must NOT retrigger the `run_reopened → run_finished(completed)`
-    cycle. Fable's B1 finding: reopen requires strict `sub > last_sub`
-    progress; an echo carries no progress.
+    must NOT spawn a phantom new session (FEAT-06 / #54) — the same
+    `_has_strict_progress` gate that used to guard the reopen path now
+    guards new-session opens: an echo carries no progress on `sub`, so
+    it stays inert.
     """
     tracker = RunTracker()
 

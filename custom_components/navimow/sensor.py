@@ -50,15 +50,30 @@ def _run_state_display(c: NavimowCoordinator) -> str:
 
 
 def _last_run_start_dt(c: NavimowCoordinator) -> datetime | None:
-    """`last_run_started` value — from either the still-open run or
-    the last persisted `last_finished_run`.
+    """`last_run_started` value — start time of the last *closed*
+    session, `None` before the first close. FEAT-06 (#54): the three
+    `last_run_*` sensors share one subject ("the last closed
+    session"); the open run is exposed via `current_run_started` +
+    `run_state` + `run_progress` + `zone_progress`.
+    """
+    if c.last_finished_run is None:
+        return None
+    epoch_ms = c.last_finished_run.get("start_time")
+    if epoch_ms is None:
+        return None
+    return datetime.fromtimestamp(epoch_ms / 1000, tz=UTC)
+
+
+def _current_run_start_dt(c: NavimowCoordinator) -> datetime | None:
+    """`current_run_started` value — start time of the ongoing session
+    (`None` when no session is open). FEAT-06 sibling of
+    `_last_run_start_dt`; the pair distinguishes "current" from "last
+    closed" for the dashboard row.
     """
     open_run = _current_run_or_none(c)
-    epoch_ms = None
-    if open_run is not None:
-        epoch_ms = open_run.get("start_time")
-    elif c.last_finished_run is not None:
-        epoch_ms = c.last_finished_run.get("start_time")
+    if open_run is None:
+        return None
+    epoch_ms = open_run.get("start_time")
     if epoch_ms is None:
         return None
     return datetime.fromtimestamp(epoch_ms / 1000, tz=UTC)
@@ -147,6 +162,16 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
     # Reads from the tracker's open run, not from `stats`, so a lingering
     # `stats["mowing_percentage"]` from a closed run does not leak into
     # the sensor (BUG-07 symptom for this entity).
+    #
+    # FEAT-06 (#54): this is **task** progress, not session progress —
+    # the firmware's `mowingPercentage` re-bases on a fresh task
+    # definition (freshly-mowed zones are credited), so a session that
+    # continues an already-partly-mowed task starts at a non-zero value
+    # (e.g. 65 % on the 2026-07-04 afternoon zone #3 cycle, per
+    # `docs/diag/2026-07-04_spike-02_run-semantics-task-vs-session/`).
+    # Operator-decided: keep the raw firmware `mp`, do not renormalise
+    # to session scope — the number honestly reflects the task the
+    # firmware is executing.
     NavimowSensorEntityDescription(
         key="run_progress",
         translation_key="run_progress",
@@ -185,9 +210,21 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
         icon="mdi:state-machine",
         value_fn=_run_state_display,
     ),
-    # `last_run_started` — timestamp of the open run's start (while
-    # open) or the last closed run's start (at rest). Persisted via
-    # `last_finished_run` in Store.
+    # `current_run_started` — start time of the ongoing session, `None`
+    # at rest. FEAT-06 (#54): pairs with `last_run_started` (last closed
+    # session) so the dashboard can show a coherent "current" row and a
+    # coherent "last" row without either sensor lying about the subject.
+    NavimowSensorEntityDescription(
+        key="current_run_started",
+        translation_key="current_run_started",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        icon="mdi:play-circle-outline",
+        value_fn=_current_run_start_dt,
+    ),
+    # `last_run_started` — start time of the last **closed** session.
+    # FEAT-06 (#54): reads `last_finished_run` exclusively; there is no
+    # open-run fallback (the ongoing session lives on
+    # `current_run_started`). Persisted via `last_finished_run` in Store.
     NavimowSensorEntityDescription(
         key="last_run_started",
         translation_key="last_run_started",
@@ -195,10 +232,9 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
         icon="mdi:calendar-clock",
         value_fn=_last_run_start_dt,
     ),
-    # `last_run_duration` (seconds) — duration of the *closed* run
-    # (from `last_finished_run.duration_ms`). While a run is open we
-    # deliberately show `None` here so the sensor never reads "live"
-    # duration — the operator has `run_progress` for that.
+    # `last_run_duration` (seconds) — duration of the last **closed**
+    # session (from `last_finished_run.duration_ms`). Same subject as
+    # `last_run_started`: the last closed session. Not a live counter.
     NavimowSensorEntityDescription(
         key="last_run_duration",
         translation_key="last_run_duration",
@@ -213,9 +249,11 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
             else None
         ),
     ),
-    # `last_run_result` — `completed` / `interrupted`, with `zones`,
+    # `last_run_result` — `completed` / `interrupted` for the last
+    # **closed** session, with `zones`, `session_area`,
     # `mow_start_type`, and `history` as attributes (feeds the future
-    # green/red run history card).
+    # green/red run history card). Same subject as the other two
+    # `last_run_*` sensors (FEAT-06).
     NavimowSensorEntityDescription(
         key="last_run_result",
         translation_key="last_run_result",
@@ -228,6 +266,7 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
         attrs_fn=lambda c: (
             {
                 "zones": c.last_finished_run.get("zones"),
+                "session_area": c.last_finished_run.get("session_area"),
                 "mow_start_type": c.last_finished_run.get("mow_start_type"),
                 "history": c.history,
             }
