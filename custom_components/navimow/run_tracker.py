@@ -18,15 +18,24 @@ Every call returns a list of `Event` records the caller can dispatch to
 Home Assistant. Step (c) turns those into HA events + entity updates;
 step (b) verifies them via `list[Event]` returns in the test suite.
 
-Guard layers (Fable brief 2026-07-03 16:57 UTC):
+Guard layers (Fable brief 2026-07-03 16:57 UTC, revised BUG-10):
 - Layer 1 lives in the coordinator (`/location` `time` monotonicity per
   stream) and is not seen here — this module trusts its input.
-- Layer 2: `mowingWeekArea` is monotonically non-decreasing across the
-  ISO week. Rejection is exempted when the payload crosses an ISO
-  Monday 00:00 UTC boundary (the counter resets there).
+- Layer 2 (removed as a blocking guard on 2026-07-05, BUG-10 / #58):
+  `mowingWeekArea` regressions are logged at DEBUG and counted in
+  `counters["wk_regressions_observed"]` but no longer drop the packet.
+  Evidence audit on #58: over ~130 committed /location packets plus two
+  weeks of live operation, layer 2 saw zero true positives (every
+  pathological packet was caught by layer 1 alone) and one catastrophic
+  false positive — a Sunday firmware `wk` reset that made the whole
+  tracker deaf all day. Whatever calendar the firmware follows is not
+  encoded here: no calendar assumption survives contact with evidence.
 - Layer 3: for an open run, `|wk - sub - wk₀| ≤ 0.5` m², where `wk₀` is
-  captured on the first packet of the run. Same ISO-Monday exemption;
-  when the exemption fires wk₀ is re-anchored from the new packet.
+  captured on the first packet of the run. Anchored once per run; a
+  firmware `wk` reset while the run is open will make layer 3 reject
+  the rest of that run (bounded residual — the sustained-timer still
+  closes it via vs, and the next session re-anchors cleanly). No
+  re-anchoring machinery: revisit on evidence.
 
 State machine (converged, authoritative per the brief; BUG-09 revised):
 
@@ -73,7 +82,6 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
@@ -174,27 +182,6 @@ class Event:
 
 
 # --------------------------------------------------------------------- #
-# Helpers                                                               #
-# --------------------------------------------------------------------- #
-
-
-def _iso_week(time_ms: int) -> tuple[int, int]:
-    """Return (ISO year, ISO week) of a firmware epoch-ms timestamp."""
-    dt = datetime.fromtimestamp(time_ms / 1000, tz=timezone.utc)
-    iso = dt.isocalendar()
-    return (iso[0], iso[1])
-
-
-def _crosses_iso_monday(prev_time_ms: int | None, curr_time_ms: int | None) -> bool:
-    """True when `curr` and `prev` belong to different ISO weeks (i.e.
-    something between them crossed a Monday 00:00 UTC boundary).
-    """
-    if prev_time_ms is None or curr_time_ms is None:
-        return False
-    return _iso_week(prev_time_ms) != _iso_week(curr_time_ms)
-
-
-# --------------------------------------------------------------------- #
 # Tracker                                                               #
 # --------------------------------------------------------------------- #
 
@@ -237,14 +224,19 @@ class RunTracker:
         # the next coherent packet; discarded otherwise.
         self._pending_reset: dict[str, Any] | None = None
 
-        # Diagnostic counters. `layer_2` / `layer_3` = rejected packets;
-        # `pending_reset_holds` = packets stashed as pending resets (the
-        # `wk` invariant classifier caught them before they could damage
-        # an open run).
+        # Diagnostic counters. `drops` = packets the tracker refused
+        # (`layer_3` invariant violation or held as a pending reset);
+        # `counters` = events observed but *not* acted on. The
+        # `wk_regressions_observed` counter replaces the old
+        # `drops["layer_2"]` (BUG-10 / #58): wk regressions are now
+        # logged and counted for observability but no longer drop the
+        # packet.
         self.drops: dict[str, int] = {
-            "layer_2": 0,
             "layer_3": 0,
             "pending_reset_holds": 0,
+        }
+        self.counters: dict[str, int] = {
+            "wk_regressions_observed": 0,
         }
 
     # ------------------------------------------------------------- #
@@ -259,16 +251,11 @@ class RunTracker:
         """
         events: list[Event] = []
 
-        # Layer 2 — wk monotonicity (ISO-Monday exempt).
-        if not self._passes_layer_2(parsed):
-            self.drops["layer_2"] += 1
-            _LOGGER.debug(
-                "run_tracker: type-2 rejected by layer 2 (wk=%s last=%s time=%s)",
-                parsed.get("area_week"),
-                self._last_accepted_wk,
-                parsed.get("time"),
-            )
-            return events
+        # BUG-10 (2026-07-05, #58): layer 2 is now observability. A `wk`
+        # regression is logged at DEBUG and counted, but the packet
+        # proceeds through the rest of the machine. Rationale in the
+        # module docstring; the evidence audit is on issue #58.
+        self._observe_wk_regression(parsed)
 
         # Resolve any previously-stashed pending reset first — the
         # current packet may confirm or discard it before we look at
@@ -433,18 +420,32 @@ class RunTracker:
         return events
 
     # ------------------------------------------------------------- #
-    # Guards                                                        #
+    # Guards + observability                                        #
     # ------------------------------------------------------------- #
 
-    def _passes_layer_2(self, parsed: dict[str, Any]) -> bool:
-        """`mowingWeekArea` never decreases within an ISO week."""
+    def _observe_wk_regression(self, parsed: dict[str, Any]) -> None:
+        """Count and log wk regressions without dropping the packet.
+
+        Replaces the old blocking `_passes_layer_2` (BUG-10 / #58): a
+        Sunday firmware `wk` reset made every incoming packet regress
+        against the cursor and the guard rejected the whole day. No
+        calendar assumption survives here — anything that looks like a
+        firmware reset (or a genuine content anomaly for that matter)
+        goes through the reset / pending-reset / layer-3 machinery
+        instead.
+        """
         wk = parsed.get("area_week")
         if wk is None or self._last_accepted_wk is None:
-            return True
-        if wk >= self._last_accepted_wk:
-            return True
-        # `wk` regressed — allowed only if we crossed a Monday.
-        return _crosses_iso_monday(self._last_accepted_time_ms, parsed.get("time"))
+            return
+        if wk < self._last_accepted_wk:
+            self.counters["wk_regressions_observed"] += 1
+            _LOGGER.debug(
+                "run_tracker: wk regression observed (wk=%s last=%s time=%s) "
+                "— accepting, layer 2 is observability only (BUG-10 / #58)",
+                wk,
+                self._last_accepted_wk,
+                parsed.get("time"),
+            )
 
     def _passes_layer_3(self, parsed: dict[str, Any]) -> bool:
         """|wk - sub - wk₀| ≤ 0.5 m² for the currently open run.
@@ -458,10 +459,6 @@ class RunTracker:
         sub = parsed.get("area_session")
         if wk is None or sub is None:
             return True
-        # ISO-Monday exemption — a rollover packet always passes here;
-        # the caller re-anchors `wk₀` from it via `_update_wk0_anchor`.
-        if _crosses_iso_monday(self._last_accepted_time_ms, parsed.get("time")):
-            return True
         wk0 = self.current_run.get("wk0")
         if wk0 is None:
             # No anchor yet — nothing to compare against; the caller
@@ -470,12 +467,11 @@ class RunTracker:
         return abs(wk - sub - wk0) <= INVARIANT_TOLERANCE_M2
 
     def _update_wk0_anchor(self, parsed: dict[str, Any]) -> None:
-        """Set or update `wk₀` on the acceptance path.
-
-        - If the current run has no anchor yet, initialise it from the
-          incoming (`wk`, `sub`) pair.
-        - If the packet crosses an ISO-Monday boundary since the last
-          accepted (`wk` counter reset), re-anchor from the new packet.
+        """Initialise `wk₀` on the first packet with (`wk`, `sub`) after
+        `_open_run` — for the case where `_open_run` was fed a packet
+        without both fields. Once set, `wk₀` is stable for the life of
+        the run; a firmware `wk` reset mid-run is not re-anchored (see
+        module docstring on the bounded-tail residual).
         """
         if self.current_run is None:
             return
@@ -483,10 +479,7 @@ class RunTracker:
         sub = parsed.get("area_session")
         if wk is None or sub is None:
             return
-        wk0 = self.current_run.get("wk0")
-        if wk0 is None or _crosses_iso_monday(
-            self._last_accepted_time_ms, parsed.get("time")
-        ):
+        if self.current_run.get("wk0") is None:
             self.current_run["wk0"] = wk - sub
 
     # ------------------------------------------------------------- #
@@ -592,7 +585,7 @@ class RunTracker:
             events.append(self._close_run())
         self._open_run(candidate)
         events.append(self._event_run_started())
-        # Stamp cursors from the candidate too, so `_passes_layer_2`
+        # Stamp cursors from the candidate too, so `_observe_wk_regression`
         # against the current packet sees the candidate's `wk` (which
         # was smaller) as the anchor.
         if candidate.get("area_week") is not None:
@@ -808,12 +801,18 @@ class RunTracker:
             "last_accepted_wk": self._last_accepted_wk,
             "last_accepted_time_ms": self._last_accepted_time_ms,
             "drops": dict(self.drops),
+            "counters": dict(self.counters),
         }
 
     def restore(self, snap: dict[str, Any]) -> bool:
         """Load a previously-taken snapshot. Returns True on acceptance,
         False when the version doesn't match (caller decides whether to
         drop the payload or upgrade it).
+
+        Tolerant of the pre-BUG-10 shape: a snapshot whose `drops` still
+        carries `layer_2` migrates that count into
+        `counters["wk_regressions_observed"]` so observability continuity
+        survives the deploy.
         """
         if snap.get("version") != SNAPSHOT_VERSION:
             return False
@@ -824,9 +823,14 @@ class RunTracker:
         self._last_accepted_time_ms = snap.get("last_accepted_time_ms")
         drops = snap.get("drops") or {}
         self.drops = {
-            "layer_2": drops.get("layer_2", 0),
             "layer_3": drops.get("layer_3", 0),
             "pending_reset_holds": drops.get("pending_reset_holds", 0),
+        }
+        counters = snap.get("counters") or {}
+        self.counters = {
+            "wk_regressions_observed": counters.get(
+                "wk_regressions_observed", drops.get("layer_2", 0)
+            ),
         }
         # `_interrupt_timer_started_at` is monotonic and cannot be
         # restored across a process restart. `tick()` re-arms it on the
