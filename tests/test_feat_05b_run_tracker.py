@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from custom_components.navimow.location import parse_location_type_2
@@ -86,10 +85,6 @@ class FakeClock:
         self.now += seconds
 
 
-def _epoch_ms(dt: datetime) -> int:
-    return int(dt.timestamp() * 1000)
-
-
 def _feed(tracker: RunTracker, items: list[dict]) -> list:
     events = []
     for item in items:
@@ -145,7 +140,7 @@ def test_full_replay_2026_05_25_yields_two_runs_with_zone_crossing() -> None:
     assert afternoon_zones[1]["sub_entry"] == 229.11
     assert tracker.current_run["last_sub"] == 245.87
     # No layer-2 or layer-3 drops on this well-formed corpus.
-    assert tracker.drops == {"layer_2": 0, "layer_3": 0, "pending_reset_holds": 0}
+    assert tracker.drops == {"layer_3": 0, "pending_reset_holds": 0}
 
 
 # --------------------------------------------------------------------- #
@@ -175,52 +170,143 @@ def test_full_replay_2026_07_03_yields_one_running_run() -> None:
     assert [z["boundary_id"] for z in zones] == [1]
     assert zones[0]["sub_entry"] == 2.6
     assert zones[0]["sub_exit"] == 109.78
-    assert tracker.drops == {"layer_2": 0, "layer_3": 0, "pending_reset_holds": 0}
+    assert tracker.drops == {"layer_3": 0, "pending_reset_holds": 0}
 
 
 # --------------------------------------------------------------------- #
-# 3. Layer-2 rejects late packet after synthetic live predecessor       #
+# 3. BUG-10 (2026-07-05 / #58) — layer 2 is observability, not blocking #
 # --------------------------------------------------------------------- #
 
 
-def test_synthetic_predecessor_plus_real_late_packet_layer_2_rejects() -> None:
-    """The Fable brief's fixture reconstruction: after the tracker has
-    accepted a packet stamped at the live findings-timeline (~13:37:25
-    UTC, wk ≈ 338), feeding it the *real* 2026-05-25 late packet (fw
-    time 12:01:15 UTC, wk 124.15) must be rejected by layer 2 — `wk`
-    regresses, and both packets are inside the same ISO week (2026-W22)
-    so the Monday exemption does not fire.
+def test_wk_regression_counts_and_logs_but_does_not_drop() -> None:
+    """After BUG-10, a `wk` regression against the cursor is logged at
+    DEBUG and counted in `counters["wk_regressions_observed"]` but the
+    packet flows through the rest of the state machine.
     """
     tracker = RunTracker()
-    predecessor = {
-        "type": 2,
-        "currentMowBoundary": 1,
-        "currentMowProgress": 4700,
-        "mowingPercentage": 42,
-        "subtotalArea": "200.0",  # wk₀ = 138 (any consistent value works)
-        "mowingWeekArea": "338.0",
-        "mowStartType": 1,
-        "time": 1779716245448,  # 2026-05-25T13:37:25 UTC
-    }
-    _feed(tracker, [predecessor])
+    # Predecessor: sub=200, wk=338, wk₀=138.
+    _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 42,
+                "subtotalArea": "200.0",
+                "mowingWeekArea": "338.0",
+                "mowStartType": 1,
+                "time": 1_000_000_000_000,
+            }
+        ],
+    )
+    baseline_wk0 = tracker.current_run["wk0"]
+    assert baseline_wk0 == 138.0
+
+    # A continuation packet with a wk regression but sub still advancing:
+    # `sub=201` (progress), `wk=337.5` (regression of 0.5). Not a reset;
+    # layer 3 still passes (|337.5 - 201 - 138| = 1.5 > 0.5 — actually
+    # fails), so wire the anchor to make layer 3 pass.
+    events = _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 43,
+                "subtotalArea": "200.0",  # equal — not is_reset
+                "mowingWeekArea": "337.9",  # regression by 0.1, layer 3 offset 0.1
+                "mowStartType": 1,
+                "time": 1_000_000_060_000,
+            }
+        ],
+    )
+    assert events == []
     assert tracker.state == STATE_RUNNING
+    # Counter increments; no packet dropped.
+    assert tracker.counters["wk_regressions_observed"] == 1
+    assert tracker.drops == {"layer_3": 0, "pending_reset_holds": 0}
 
-    late = {
-        "type": 2,
-        "currentMowBoundary": 1,
-        "currentMowProgress": 16,
-        "mowingPercentage": 0,
-        "subtotalArea": "0.39",
-        "mowingWeekArea": "124.15",
-        "mowStartType": 1,
-        "time": 1779710475448,  # 2026-05-25T12:01:15 UTC
+
+def test_bug_10_sunday_wk_reset_run_opens_via_fresh_reset_path() -> None:
+    """The 2026-07-05 scenario (issue #58) with the layer-2 guard gone.
+
+    Close-state cursors at `wk = 1189.34` from yesterday's completed
+    run; today's Sunday session starts with `sub ≈ 0` climbing from a
+    small value. Layer 2 no longer drops those packets — the first
+    fresh-reset packet (`sub < RESET_SUB_CEILING`) opens a new run via
+    the normal reset path, subsequent packets continue it, the
+    regression counter increments exactly once (on the first Sunday
+    packet), and no packet is dropped.
+    """
+    tracker = RunTracker()
+
+    # Simulate yesterday's completed run leaving the cursor at 1189.34.
+    tracker.state = STATE_COMPLETED
+    tracker._last_accepted_wk = 1189.34
+    tracker._last_accepted_time_ms = 1_000_000_000_000
+    tracker.current_run = {
+        "start_time": 1_000_000_000_000 - 10_000_000,
+        "mow_start_type": 0,
+        "wk0": 1000.0,
+        "last_time": 1_000_000_000_000,
+        "last_sub": 180.0,
+        "last_wk": 1189.34,
+        "last_mp": 99,
+        "zones": [],
     }
-    events = _feed(tracker, [late])
 
-    assert events == []  # nothing surfaced from a rejected packet
-    assert tracker.drops["layer_2"] == 1
-    # Cursor untouched by the drop.
-    assert tracker.current_run["last_sub"] == 200.0
+    # Today (Sunday morning): first three packets climbing from ~0 —
+    # the shape the tracker would have seen if DEBUG had been on before
+    # the run started.
+    events = _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 1,
+                "subtotalArea": "0.4",
+                "mowingWeekArea": "0.4",
+                "mowStartType": 0,
+                "time": 1_000_100_000_000,
+            },
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 2,
+                "subtotalArea": "2.0",
+                "mowingWeekArea": "2.0",
+                "mowStartType": 0,
+                "time": 1_000_100_060_000,
+            },
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 38,
+                "subtotalArea": "91.3",
+                "mowingWeekArea": "91.3",
+                "mowStartType": 0,
+                "time": 1_000_100_120_000,
+            },
+        ],
+    )
+
+    # Exactly one `run_started` (fresh reset path from STATE_COMPLETED);
+    # no `run_finished` (nothing was open to close on the state side).
+    kinds = [e.kind for e in events]
+    assert kinds == [EVENT_RUN_STARTED], kinds
+    assert tracker.state == STATE_RUNNING
+    # Counter fired once — the first Sunday packet's wk (0.4) regressed
+    # against the cursor (1189.34). Subsequent packets advance the new
+    # cursor so no further regressions.
+    assert tracker.counters["wk_regressions_observed"] == 1
+    # Zero packets dropped.
+    assert tracker.drops == {"layer_3": 0, "pending_reset_holds": 0}
+    # New run properly anchored on the fresh Sunday morning.
+    assert tracker.current_run["last_sub"] == 91.3
+    assert tracker.current_run["last_mp"] == 38
+    # wk₀ anchored on the first accepted Sunday packet: 0.4 − 0.4 = 0.
+    assert tracker.current_run["wk0"] == 0.0
 
 
 # --------------------------------------------------------------------- #
@@ -425,16 +511,24 @@ def test_vs_6_paused_holds_docked_indefinitely() -> None:
 
 
 # --------------------------------------------------------------------- #
-# 8. ISO-Monday rollover — no false rejection                           #
+# 8. BUG-10 bounded residual — wk reset mid-run + next-session recovery #
 # --------------------------------------------------------------------- #
 
 
-def test_iso_monday_rollover_exempts_both_wk_layers() -> None:
-    tracker = RunTracker()
+def test_mid_run_wk_reset_rejected_by_layer_3_then_sustained_close_and_reanchor() -> (
+    None
+):
+    """Bounded residual accepted with the BUG-10 hotfix: a hypothetical
+    firmware `wk` reset while a run is open trips layer 3 (the anchor
+    `wk₀` is not re-anchored anywhere — no calendar assumption survives
+    the BUG-10 evidence audit). The run's tail is dropped by layer 3;
+    the sustained-timer on vs closes it; the next fresh-reset session
+    opens cleanly with its own anchor.
+    """
+    clock = FakeClock()
+    tracker = RunTracker(clock=clock)
 
-    sunday = _epoch_ms(datetime(2026, 5, 24, 23, 59, tzinfo=timezone.utc))
-    monday = _epoch_ms(datetime(2026, 5, 25, 0, 1, tzinfo=timezone.utc))
-
+    # Open a healthy run: sub=50, wk=100, wk₀=50.
     _feed(
         tracker,
         [
@@ -445,16 +539,15 @@ def test_iso_monday_rollover_exempts_both_wk_layers() -> None:
                 "subtotalArea": "50.0",
                 "mowingWeekArea": "100.0",
                 "mowStartType": 1,
-                "time": sunday,
+                "time": 1_000_000_000_000,
             }
         ],
     )
     assert tracker.current_run["wk0"] == 50.0
 
-    # After the Monday rollover: wk resets (100 → 5), but the run
-    # continues. Layer 2 would normally reject `wk 5 < wk 100`; layer 3
-    # would reject `|5 − 52 − 50| = 97`. Both must be exempted, and
-    # wk₀ re-anchored from the new packet (5 − 52 = −47).
+    # Hypothetical firmware wk reset mid-run: sub keeps climbing (52),
+    # wk collapses (5). Layer 2 no longer drops → counter increments.
+    # Layer 3 rejects (|5 - 52 - 50| = 97 > 0.5).
     events = _feed(
         tracker,
         [
@@ -465,14 +558,66 @@ def test_iso_monday_rollover_exempts_both_wk_layers() -> None:
                 "subtotalArea": "52.0",
                 "mowingWeekArea": "5.0",
                 "mowStartType": 1,
-                "time": monday,
+                "time": 1_000_000_060_000,
             }
         ],
     )
-    assert events == []  # no `run_finished`, run still open
+    assert events == []
     assert tracker.state == STATE_RUNNING
-    assert tracker.drops == {"layer_2": 0, "layer_3": 0, "pending_reset_holds": 0}
-    assert tracker.current_run["wk0"] == -47.0  # re-anchored
+    assert tracker.counters["wk_regressions_observed"] == 1
+    assert tracker.drops["layer_3"] == 1
+    # Accumulator untouched by the rejection.
+    assert tracker.current_run["last_sub"] == 50.0
+    assert tracker.current_run["wk0"] == 50.0
+
+    # A follow-up packet on the same reset axis is also rejected by
+    # layer 3 — the residual "tail" the design accepts.
+    events = _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 43,
+                "subtotalArea": "55.0",
+                "mowingWeekArea": "8.0",
+                "mowStartType": 1,
+                "time": 1_000_000_120_000,
+            }
+        ],
+    )
+    assert events == []
+    assert tracker.drops["layer_3"] == 2
+    assert tracker.current_run["last_sub"] == 50.0  # still untouched
+
+    # Dock arrival on vs=1 → sustained-60 s timer closes the run
+    # INTERRUPTED — the tail is bounded to what the operator dropped
+    # here, and the timer path still works.
+    tracker.process_vehicle_state(VS_DOCKED_IDLE)
+    clock.advance(INTERRUPT_SUSTAIN_SECONDS + 1)
+    close_events = tracker.tick()
+    assert [e.kind for e in close_events] == [EVENT_RUN_FINISHED]
+    assert tracker.state == STATE_INTERRUPTED
+
+    # Next session (fresh reset) opens cleanly with its own anchor —
+    # no calendar-machinery drift.
+    new_events = _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 1,
+                "subtotalArea": "0.5",
+                "mowingWeekArea": "0.5",
+                "mowStartType": 1,
+                "time": 1_000_000_300_000,
+            }
+        ],
+    )
+    assert [e.kind for e in new_events] == [EVENT_RUN_STARTED]
+    assert tracker.state == STATE_RUNNING
+    assert tracker.current_run["wk0"] == 0.0
 
 
 # --------------------------------------------------------------------- #
@@ -612,7 +757,8 @@ def test_snapshot_restore_round_trip() -> None:
     assert restored.restore(snap) is True
     assert restored.state == STATE_RUNNING
     assert restored.current_run["last_sub"] == 10.0
-    assert restored.drops == {"layer_2": 0, "layer_3": 0, "pending_reset_holds": 0}
+    assert restored.drops == {"layer_3": 0, "pending_reset_holds": 0}
+    assert restored.counters == {"wk_regressions_observed": 0}
     # Feed a fresh continuation packet — invariant still holds against
     # the restored wk₀.
     events = _feed(
