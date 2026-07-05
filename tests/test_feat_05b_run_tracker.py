@@ -12,6 +12,7 @@ Fable brief on #43.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from custom_components.navimow.run_tracker import (
     EVENT_RUN_FINISHED,
     EVENT_RUN_STARTED,
     INTERRUPT_SUSTAIN_SECONDS,
+    INVARIANT_DEVIATION_STREAK_TO_WARN,
     RESET_SUB_CEILING,
     RESULT_COMPLETED,
     RESULT_INTERRUPTED,
@@ -140,7 +142,7 @@ def test_full_replay_2026_05_25_yields_two_runs_with_zone_crossing() -> None:
     assert afternoon_zones[1]["sub_entry"] == 229.11
     assert tracker.current_run["last_sub"] == 245.87
     # No layer-2 or layer-3 drops on this well-formed corpus.
-    assert tracker.drops == {"layer_3": 0, "pending_reset_holds": 0}
+    assert tracker.drops == {"pending_reset_holds": 0}
 
 
 # --------------------------------------------------------------------- #
@@ -170,7 +172,7 @@ def test_full_replay_2026_07_03_yields_one_running_run() -> None:
     assert [z["boundary_id"] for z in zones] == [1]
     assert zones[0]["sub_entry"] == 2.6
     assert zones[0]["sub_exit"] == 109.78
-    assert tracker.drops == {"layer_3": 0, "pending_reset_holds": 0}
+    assert tracker.drops == {"pending_reset_holds": 0}
 
 
 # --------------------------------------------------------------------- #
@@ -224,7 +226,7 @@ def test_wk_regression_counts_and_logs_but_does_not_drop() -> None:
     assert tracker.state == STATE_RUNNING
     # Counter increments; no packet dropped.
     assert tracker.counters["wk_regressions_observed"] == 1
-    assert tracker.drops == {"layer_3": 0, "pending_reset_holds": 0}
+    assert tracker.drops == {"pending_reset_holds": 0}
 
 
 def test_bug_10_sunday_wk_reset_run_opens_via_fresh_reset_path() -> None:
@@ -301,7 +303,7 @@ def test_bug_10_sunday_wk_reset_run_opens_via_fresh_reset_path() -> None:
     # cursor so no further regressions.
     assert tracker.counters["wk_regressions_observed"] == 1
     # Zero packets dropped.
-    assert tracker.drops == {"layer_3": 0, "pending_reset_holds": 0}
+    assert tracker.drops == {"pending_reset_holds": 0}
     # New run properly anchored on the fresh Sunday morning.
     assert tracker.current_run["last_sub"] == 91.3
     assert tracker.current_run["last_mp"] == 38
@@ -513,19 +515,24 @@ def test_vs_6_paused_holds_docked_indefinitely() -> None:
 
 
 # --------------------------------------------------------------------- #
-# 8. BUG-10 bounded residual — wk reset mid-run + next-session recovery #
+# 8. HARD-06 (#62) — mid-run wk reset stays alive, deviation WARN at 5  #
 # --------------------------------------------------------------------- #
 
 
-def test_mid_run_wk_reset_rejected_by_layer_3_then_sustained_close_and_reanchor() -> (
-    None
-):
-    """Bounded residual accepted with the BUG-10 hotfix: a hypothetical
-    firmware `wk` reset while a run is open trips layer 3 (the anchor
-    `wk₀` is not re-anchored anywhere — no calendar assumption survives
-    the BUG-10 evidence audit). The run's tail is dropped by layer 3;
-    the sustained-timer on vs closes it; the next fresh-reset session
-    opens cleanly with its own anchor.
+def test_mid_run_wk_reset_run_stays_open_deviation_warns_at_five(caplog) -> None:
+    """Post-HARD-06 (#62): a firmware `wk` reset while a run is open is
+    now OBSERVED, not blocked. The invariant deviation counter climbs,
+    the streak WARN fires exactly once at
+    `INVARIANT_DEVIATION_STREAK_TO_WARN` consecutive observations
+    against the LIVE anchor, the accumulator keeps advancing on `sub`,
+    the sustained-timer closes the run normally via `vs`, and
+    `session_area` (`last_sub − sub₀`) is correct because it is
+    `sub`-only — unaffected by the `wk` collapse.
+
+    Pre-HARD-06 this scenario was the bounded-tail residual (layer 3
+    rejected every post-reset packet, `session_area` was still correct
+    at close but the counter was silent). #62 turned the counter into
+    the visible signal and removed the residual entirely.
     """
     clock = FakeClock()
     tracker = RunTracker(clock=clock)
@@ -546,63 +553,79 @@ def test_mid_run_wk_reset_rejected_by_layer_3_then_sustained_close_and_reanchor(
         ],
     )
     assert tracker.current_run["wk0"] == 50.0
+    assert tracker.current_run["sub0"] == 50.0
+    caplog.clear()
 
-    # Hypothetical firmware wk reset mid-run: sub keeps climbing (52),
-    # wk collapses (5). Layer 2 no longer drops → counter increments.
-    # Layer 3 rejects (|5 - 52 - 50| = 97 > 0.5).
-    events = _feed(
-        tracker,
-        [
-            {
-                "type": 2,
-                "currentMowBoundary": 1,
-                "mowingPercentage": 42,
-                "subtotalArea": "52.0",
-                "mowingWeekArea": "5.0",
-                "mowStartType": 1,
-                "time": 1_000_000_060_000,
-            }
-        ],
-    )
-    assert events == []
+    # Feed exactly INVARIANT_DEVIATION_STREAK_TO_WARN consecutive
+    # post-reset packets: `sub` advances by 3 each 60 s (normal run
+    # cadence), `wk` climbs from a small value after the firmware reset
+    # (so each deviation |wk_i − sub_i − 50| stays roughly at 97, well
+    # above tolerance). Each packet is observed, counter climbs, streak
+    # climbs, and the WARN fires exactly at the fifth.
+    with caplog.at_level(
+        logging.WARNING, logger="custom_components.navimow.run_tracker"
+    ):
+        for i in range(INVARIANT_DEVIATION_STREAK_TO_WARN):
+            _feed(
+                tracker,
+                [
+                    {
+                        "type": 2,
+                        "currentMowBoundary": 1,
+                        "mowingPercentage": 42 + i,
+                        "subtotalArea": str(52.0 + i * 3.0),
+                        "mowingWeekArea": str(5.0 + i * 3.0),
+                        "mowStartType": 1,
+                        "time": 1_000_000_060_000 + i * 60_000,
+                    }
+                ],
+            )
+
+    # Counter and streak reached the threshold; accumulator advanced;
+    # `wk₀` still anchored at the run's original value.
     assert tracker.state == STATE_RUNNING
-    assert tracker.counters["wk_regressions_observed"] == 1
-    assert tracker.drops["layer_3"] == 1
-    # Accumulator untouched by the rejection.
-    assert tracker.current_run["last_sub"] == 50.0
-    assert tracker.current_run["wk0"] == 50.0
-
-    # A follow-up packet on the same reset axis is also rejected by
-    # layer 3 — the residual "tail" the design accepts.
-    events = _feed(
-        tracker,
-        [
-            {
-                "type": 2,
-                "currentMowBoundary": 1,
-                "mowingPercentage": 43,
-                "subtotalArea": "55.0",
-                "mowingWeekArea": "8.0",
-                "mowStartType": 1,
-                "time": 1_000_000_120_000,
-            }
-        ],
+    assert (
+        tracker.counters["invariant_deviations_observed"]
+        == INVARIANT_DEVIATION_STREAK_TO_WARN
     )
-    assert events == []
-    assert tracker.drops["layer_3"] == 2
-    assert tracker.current_run["last_sub"] == 50.0  # still untouched
+    assert tracker._invariant_deviation_streak == INVARIANT_DEVIATION_STREAK_TO_WARN
+    assert (
+        tracker.current_run["last_sub"]
+        == 52.0 + (INVARIANT_DEVIATION_STREAK_TO_WARN - 1) * 3.0
+    )
+    assert tracker.current_run["wk0"] == 50.0
+    # `wk` regressed once on the first collapsed packet (100 → 5), then
+    # subsequent packets advanced against a cursor that already sits at
+    # the collapsed value — no further wk regressions, and one
+    # observation short of any WARN there.
+    assert tracker.counters["wk_regressions_observed"] == 1
 
-    # Dock arrival on vs=1 → sustained-60 s timer closes the run
-    # INTERRUPTED — the tail is bounded to what the operator dropped
-    # here, and the timer path still works.
+    # Exactly one WARNING emitted — the deviation streak WARN. The
+    # wk-regression path is well below its own threshold (streak = 1).
+    warns = [rec for rec in caplog.records if rec.levelno >= logging.WARNING]
+    assert len(warns) == 1, [r.getMessage() for r in warns]
+    assert "invariant deviations" in warns[0].getMessage()
+
+    # No layer_3 key in drops after HARD-06.
+    assert "layer_3" not in tracker.drops
+    assert tracker.drops == {"pending_reset_holds": 0}
+
+    # Dock on vs=1 → sustained-60 s timer closes the run cleanly.
+    # The last accepted `mp` climbed to 42 + 4 = 46 (< threshold), so
+    # the close is labelled INTERRUPTED.
     tracker.process_vehicle_state(VS_DOCKED_IDLE)
     clock.advance(INTERRUPT_SUSTAIN_SECONDS + 1)
     close_events = tracker.tick()
     assert [e.kind for e in close_events] == [EVENT_RUN_FINISHED]
+    payload = close_events[0].payload
+    assert payload["result"] == RESULT_INTERRUPTED
+    # `session_area` is `sub`-only (last_sub − sub₀) — the `wk` reset
+    # never touched it. sub₀ = 50, last_sub = 52 + (5 − 1) × 3 = 64.
+    assert payload["session_area"] == 14.0
     assert tracker.state == STATE_INTERRUPTED
 
-    # Next session (fresh reset) opens cleanly with its own anchor —
-    # no calendar-machinery drift.
+    # Next session (fresh reset below the ceiling) opens cleanly with
+    # its own anchor.
     new_events = _feed(
         tracker,
         [
@@ -613,7 +636,9 @@ def test_mid_run_wk_reset_rejected_by_layer_3_then_sustained_close_and_reanchor(
                 "subtotalArea": "0.5",
                 "mowingWeekArea": "0.5",
                 "mowStartType": 1,
-                "time": 1_000_000_300_000,
+                "time": 1_000_000_060_000
+                + INVARIANT_DEVIATION_STREAK_TO_WARN * 60_000
+                + 120_000,
             }
         ],
     )
@@ -759,8 +784,11 @@ def test_snapshot_restore_round_trip() -> None:
     assert restored.restore(snap) is True
     assert restored.state == STATE_RUNNING
     assert restored.current_run["last_sub"] == 10.0
-    assert restored.drops == {"layer_3": 0, "pending_reset_holds": 0}
-    assert restored.counters == {"wk_regressions_observed": 0}
+    assert restored.drops == {"pending_reset_holds": 0}
+    assert restored.counters == {
+        "wk_regressions_observed": 0,
+        "invariant_deviations_observed": 0,
+    }
     # Feed a fresh continuation packet — invariant still holds against
     # the restored wk₀.
     events = _feed(
@@ -1292,27 +1320,28 @@ def test_identical_repeat_pending_packets_never_confirm() -> None:
     assert tracker.state == STATE_RUNNING
     assert tracker.current_run["start_time"] == original_start
     assert tracker.current_run["last_sub"] == 205.0
-    # Layer 3 must NOT have rejected the genuine packet — the phantom
-    # anchor is gone, the original wk₀ is intact.
-    assert tracker.drops["layer_3"] == 0
+    # The genuine packet aligns with the original wk₀ (505 − 205 = 300):
+    # no invariant deviation is observed. HARD-06 (#62) removed layer 3
+    # blocking but the check would have been within tolerance anyway.
+    assert tracker.counters["invariant_deviations_observed"] == 0
 
 
 # --------------------------------------------------------------------- #
-# 17. Layer 3 rejection path (mutation-testing gap flagged on #49)      #
+# 17. Invariant observation path (HARD-06 / #62 — was layer 3 blocking) #
 # --------------------------------------------------------------------- #
 
 
-def test_layer_3_rejects_invariant_violating_continuation() -> None:
-    """The replays only *confirm* the invariant, so an accidental
-    neutering of `_passes_layer_3` (e.g. `return True` unconditionally)
-    would ship green. Feed a mid-run continuation whose `|wk - sub -
-    wk₀| = 5 m² > INVARIANT_TOLERANCE_M2` and assert the drop counter,
-    the untouched accumulator, and the untouched cursor.
+def test_invariant_violating_continuation_observed_but_accepted() -> None:
+    """HARD-06 (#62) demoted `|wk - sub - wk₀| ≤ INVARIANT_TOLERANCE_M2`
+    from blocking guard to observability. A continuation whose deviation
+    exceeds the tolerance is now ACCEPTED — the accumulator updates and
+    the cursor advances — while the counter increments as the only
+    trace.
 
-    Concrete values: open at `sub=10, wk=110 → wk₀=100`. Poison packet
+    Concrete values: open at `sub=10, wk=110 → wk₀=100`. Continuation
     at `sub=20, wk=125` gives `125 - 20 = 105`, off the anchor by 5 m².
-    `sub` grows (no reset path), `wk` grows (layer 2 passes), only the
-    anchor invariant fails.
+    `sub` grows (no reset path), `wk` grows (no wk regression), only the
+    anchor invariant deviates.
     """
     tracker = RunTracker()
 
@@ -1331,8 +1360,6 @@ def test_layer_3_rejects_invariant_violating_continuation() -> None:
         ],
     )
     assert tracker.current_run["wk0"] == 100.0
-    baseline_last_sub = tracker.current_run["last_sub"]
-    baseline_last_wk = tracker._last_accepted_wk
 
     events = _feed(
         tracker,
@@ -1351,17 +1378,23 @@ def test_layer_3_rejects_invariant_violating_continuation() -> None:
 
     assert events == []
     assert tracker.state == STATE_RUNNING
-    assert tracker.drops["layer_3"] == 1
-    # Rejected packet touches no state.
-    assert tracker.current_run["last_sub"] == baseline_last_sub
-    assert tracker._last_accepted_wk == baseline_last_wk
+    # Deviation observed, packet accepted: accumulator advances and the
+    # cursor follows the wk value.
+    assert tracker.counters["invariant_deviations_observed"] == 1
+    assert tracker.current_run["last_sub"] == 20.0
+    assert tracker._last_accepted_wk == 125.0
+    # wk₀ stays anchored once per run (HARD-06 §5): the observability
+    # reference is untouched even when the deviation is large.
+    assert tracker.current_run["wk0"] == 100.0
+    # No layer_3 key in drops after HARD-06.
+    assert "layer_3" not in tracker.drops
 
 
-def test_layer_3_within_tolerance_still_accepted() -> None:
-    """Regression guard on the tolerance itself: a packet exactly on
-    the `wk - sub` anchor line (offset 0) is accepted, and one within
-    `INVARIANT_TOLERANCE_M2` (say offset 0.3) is also accepted. Makes
-    sure the guard does not overshoot into the healthy-data range.
+def test_within_tolerance_continuation_resets_deviation_streak() -> None:
+    """After a deviation observation the streak is armed at 1. A
+    within-tolerance continuation resets it to 0, ready for the next
+    live-anchor drift. Guards the streak-reset semantics of the WARN
+    throttle.
     """
     tracker = RunTracker()
 
@@ -1380,7 +1413,25 @@ def test_layer_3_within_tolerance_still_accepted() -> None:
         ],
     )
 
-    # Offset 0.3 — within tolerance.
+    # Deviating packet — streak climbs to 1, counter to 1.
+    _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 6,
+                "subtotalArea": "15.0",
+                "mowingWeekArea": "120.0",  # 120 - 15 = 105, offset 5
+                "mowStartType": 1,
+                "time": 2_000_000_060_000,
+            }
+        ],
+    )
+    assert tracker.counters["invariant_deviations_observed"] == 1
+    assert tracker._invariant_deviation_streak == 1
+
+    # Within-tolerance packet — offset 0.3.
     events = _feed(
         tracker,
         [
@@ -1391,13 +1442,16 @@ def test_layer_3_within_tolerance_still_accepted() -> None:
                 "subtotalArea": "20.0",
                 "mowingWeekArea": "120.3",  # 120.3 - 20 = 100.3, offset 0.3
                 "mowStartType": 1,
-                "time": 2_000_000_060_000,
+                "time": 2_000_000_120_000,
             }
         ],
     )
 
     assert events == []
-    assert tracker.drops["layer_3"] == 0
+    assert tracker._invariant_deviation_streak == 0
+    # Counter is a persistent ledger — the reset touches the streak,
+    # not the total.
+    assert tracker.counters["invariant_deviations_observed"] == 1
     assert tracker.current_run["last_sub"] == 20.0
 
 
@@ -1455,3 +1509,178 @@ def test_snapshot_is_isolated_from_subsequent_mutation() -> None:
     # The snapshot must NOT reflect the mutation.
     assert snap["current_run"]["last_sub"] == snap_last_sub
     assert len(snap["current_run"]["zones"]) == snap_zone_count
+
+
+# --------------------------------------------------------------------- #
+# 18. HARD-06 (#62) — benign paths never consult a deviation            #
+# --------------------------------------------------------------------- #
+
+
+def test_benign_paths_do_not_consult_invariant_deviation() -> None:
+    """The invariant observer only fires on continuations
+    (`STATE_RUNNING` / `STATE_PAUSED_DOCKED`, `is_reset=False`) and on
+    post-close new-session opens (`STATE_COMPLETED` / `STATE_INTERRUPTED`,
+    strict progress). Every other path — fresh IDLE open, fresh reset
+    below the ceiling, pending-reset stash — must not touch the counter,
+    so the operator's signal stays specific to actual anchor-drift
+    events.
+    """
+    tracker = RunTracker()
+
+    # IDLE → open. First packet: no prior wk₀; the observer is not
+    # consulted at all on this path.
+    _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 5,
+                "subtotalArea": "10.0",
+                "mowingWeekArea": "10.0",
+                "mowStartType": 1,
+                "time": 1_000_000_000_000,
+            }
+        ],
+    )
+    assert tracker.state == STATE_RUNNING
+    assert tracker.counters["invariant_deviations_observed"] == 0
+
+    # Fresh reset from RUNNING (sub crashes below `RESET_SUB_CEILING`).
+    # The observer is not consulted — the packet takes the reset path.
+    events = _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 1,
+                "subtotalArea": "0.4",
+                "mowingWeekArea": "0.4",
+                "mowStartType": 1,
+                "time": 1_000_000_060_000,
+            }
+        ],
+    )
+    kinds = [e.kind for e in events]
+    assert kinds == [EVENT_RUN_FINISHED, EVENT_RUN_STARTED]
+    assert tracker.counters["invariant_deviations_observed"] == 0
+
+    # Close via BUG-09 (mp ≥ 99, vs docked), then a fresh reset from
+    # COMPLETED (sub below ceiling) — again the observer stays silent.
+    _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 99,
+                "subtotalArea": "50.0",
+                "mowingWeekArea": "50.0",
+                "mowStartType": 1,
+                "time": 1_000_000_120_000,
+            }
+        ],
+    )
+    tracker.process_vehicle_state(VS_DOCKED_CHARGING)
+    assert tracker.state == STATE_COMPLETED
+    assert tracker.counters["invariant_deviations_observed"] == 0
+
+    # Robot leaves the dock so a new run can open on a fresh reset.
+    tracker.process_vehicle_state(VS_MOWING)
+    events = _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "mowingPercentage": 1,
+                "subtotalArea": "0.5",
+                "mowingWeekArea": "0.5",
+                "mowStartType": 1,
+                "time": 1_000_000_180_000,
+            }
+        ],
+    )
+    assert [e.kind for e in events] == [EVENT_RUN_STARTED]
+    assert tracker.counters["invariant_deviations_observed"] == 0
+
+
+# --------------------------------------------------------------------- #
+# 19. HARD-06 (#62) — restore() migrates pre-HARD-06 drops["layer_3"]   #
+# --------------------------------------------------------------------- #
+
+
+def test_restore_migrates_pre_hard_06_layer_3_drops_into_counter() -> None:
+    """A snapshot taken before HARD-06 carries `drops["layer_3"] = N`;
+    after HARD-06 that count lives under
+    `counters["invariant_deviations_observed"]`. Mirrors the layer-2
+    migration shipped on PR #60. Shape-tolerant both ways.
+    """
+    tracker = RunTracker()
+    legacy_snap = {
+        "version": 1,
+        "state": STATE_RUNNING,
+        "vehicle_state": None,
+        "current_run": {
+            "start_time": 1_000_000_000_000,
+            "mow_start_type": 1,
+            "wk0": 100.0,
+            "sub0": 10.0,
+            "last_time": 1_000_000_060_000,
+            "last_sub": 42.5,
+            "last_wk": 142.5,
+            "last_mp": 40,
+            "zones": [],
+        },
+        "last_accepted_wk": 142.5,
+        "last_accepted_time_ms": 1_000_000_060_000,
+        # Pre-HARD-06 shape — `drops["layer_3"]` present, no
+        # `invariant_deviations_observed` key under `counters`.
+        "drops": {"layer_3": 7, "pending_reset_holds": 3},
+        "counters": {"wk_regressions_observed": 2},
+    }
+    assert tracker.restore(legacy_snap) is True
+    # `drops["layer_3"]` migrates into the new counter; `drops` sheds
+    # the retired key.
+    assert tracker.counters["invariant_deviations_observed"] == 7
+    assert tracker.counters["wk_regressions_observed"] == 2
+    assert tracker.drops == {"pending_reset_holds": 3}
+    # Streak is in-memory only, always re-armed at zero on restore.
+    assert tracker._invariant_deviation_streak == 0
+
+
+def test_restore_of_post_hard_06_snapshot_is_shape_tolerant() -> None:
+    """A snapshot taken AFTER HARD-06 has no `drops["layer_3"]` and
+    carries `counters["invariant_deviations_observed"]` directly. The
+    restore path must accept it as-is, without treating the missing
+    `layer_3` key as a zero-count migration overriding the counter.
+    """
+    tracker = RunTracker()
+    modern_snap = {
+        "version": 1,
+        "state": STATE_RUNNING,
+        "vehicle_state": None,
+        "current_run": {
+            "start_time": 1_000_000_000_000,
+            "mow_start_type": 1,
+            "wk0": 100.0,
+            "sub0": 10.0,
+            "last_time": 1_000_000_060_000,
+            "last_sub": 42.5,
+            "last_wk": 142.5,
+            "last_mp": 40,
+            "zones": [],
+        },
+        "last_accepted_wk": 142.5,
+        "last_accepted_time_ms": 1_000_000_060_000,
+        "drops": {"pending_reset_holds": 4},
+        "counters": {
+            "wk_regressions_observed": 1,
+            "invariant_deviations_observed": 5,
+        },
+    }
+    assert tracker.restore(modern_snap) is True
+    assert tracker.counters["invariant_deviations_observed"] == 5
+    assert tracker.counters["wk_regressions_observed"] == 1
+    assert tracker.drops == {"pending_reset_holds": 4}
