@@ -459,9 +459,19 @@ def test_wk_regression_warn_fires_once_at_threshold(caplog) -> None:
                 ],
             )
 
-    warns = [rec for rec in caplog.records if rec.levelno >= logging.WARNING]
-    assert len(warns) == 1, [r.getMessage() for r in warns]
-    assert "consecutive wk regressions" in warns[0].getMessage()
+    # HARD-06 (#62): the fixture (advancing `sub` with a regressing
+    # `wk`) exercises BOTH observability signals in this state — layer
+    # 2 sees the `wk` regressions, and layer 3 sees `|wk − sub − wk₀|`
+    # blow up on the same packets. Both WARN fire; this test filters
+    # for the wk-regression WARN specifically. The invariant WARN is
+    # covered by the mid-run wk-reset test in test_feat_05b_.
+    wk_warns = [
+        rec
+        for rec in caplog.records
+        if rec.levelno >= logging.WARNING
+        and "consecutive wk regressions" in rec.getMessage()
+    ]
+    assert len(wk_warns) == 1, [r.getMessage() for r in wk_warns]
     # Counter matches streak (all packets regressed against the cursor).
     assert tracker.counters["wk_regressions_observed"] == WK_REGRESSION_STREAK_TO_WARN
 
@@ -520,8 +530,16 @@ def test_wk_regression_streak_resets_on_non_regressing_packet(caplog) -> None:
                 ],
             )
 
-    warns = [rec for rec in caplog.records if rec.levelno >= logging.WARNING]
-    assert warns == [], [r.getMessage() for r in warns]
+    # HARD-06 (#62): as in the sibling test, the wk-regressing fixture
+    # also drives layer 3's observation. Filter to the wk-regression
+    # WARN — that is the one whose streak reset is under test here.
+    wk_warns = [
+        rec
+        for rec in caplog.records
+        if rec.levelno >= logging.WARNING
+        and "consecutive wk regressions" in rec.getMessage()
+    ]
+    assert wk_warns == [], [r.getMessage() for r in wk_warns]
 
 
 def test_wk_regression_warn_not_emitted_on_fresh_session_start(caplog) -> None:
@@ -629,3 +647,138 @@ def test_idle_open_close_still_works_no_regression() -> None:
         events[0].payload["session_area"] == 0.0
     )  # 50 − 50 (open packet is also close)
     assert tracker.state == STATE_COMPLETED
+
+
+# --------------------------------------------------------------------- #
+# 6. HARD-06 (#62) — FEAT-06 review-fixture 2 m² anchor drift           #
+# --------------------------------------------------------------------- #
+
+
+def test_feat_06_fixture_drift_yields_complete_second_session_no_warn(
+    caplog,
+) -> None:
+    """The FEAT-06 review fixture accident, reproduced.
+
+    A 2 m² anchor drift between the morning close and the afternoon
+    open used to make the pre-HARD-06 layer-3 gate silently reject the
+    entire afternoon (three `drops["layer_3"]`, no session opened, no
+    history row, no WARN — the wk-regression streak does not fire in
+    the drift shape). Post-HARD-06 (#62): the afternoon session opens
+    cleanly, closes with the correct `session_area`, the deviation
+    counter carries a single observation, and no WARN fires.
+
+    Rationale on the WARN silence (Raoul, 2026-07-05, incorporated
+    into the HARD-06 requirements): on the post-close new-session
+    path AT MOST ONE consultation ever happens against the closed
+    run's anchor — the first strict-progress packet is observed
+    (deviation counted, streak = 1) and immediately opens the new
+    session via `_open_run`, which re-anchors `wk₀` from that same
+    packet; the next packet is within tolerance → streak resets to
+    zero. Five consecutive checks against a dead anchor are
+    structurally impossible on this path. The WARN's semantic is
+    "persistent deviation against a LIVE anchor" — that is the mid-run
+    wk-reset test's job (see
+    `test_mid_run_wk_reset_run_stays_open_deviation_warns_at_five` in
+    `test_feat_05b_run_tracker.py`), and that test keeps its
+    single-WARN assertion.
+    """
+    import logging
+
+    from custom_components.navimow.run_tracker import (
+        INVARIANT_DEVIATION_STREAK_TO_WARN,
+        VS_MOWING,
+    )
+
+    tracker = RunTracker()
+
+    # Morning session — establishes wk₀ = 945 on the closed run.
+    _feed(
+        tracker,
+        [
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "currentMowProgress": 100,
+                "mowingPercentage": 48,
+                "subtotalArea": "1.0",
+                "mowingWeekArea": "946.0",
+                "mowStartType": 0,
+                "time": _MORNING_START_MS,
+            },
+            {
+                "type": 2,
+                "currentMowBoundary": 1,
+                "currentMowProgress": 9906,
+                "mowingPercentage": 99,
+                "subtotalArea": "118.0",
+                "mowingWeekArea": "1063.0",
+                "mowStartType": 0,
+                "time": _MORNING_END_MS,
+            },
+        ],
+    )
+    morning_close = tracker.process_vehicle_state(VS_DOCKED_CHARGING)
+    assert [e.kind for e in morning_close] == [EVENT_RUN_FINISHED]
+    assert tracker.state == STATE_COMPLETED
+    assert tracker.current_run["wk0"] == 945.0
+
+    tracker.process_vehicle_state(VS_MOWING)
+    caplog.clear()
+
+    # Afternoon packets — `wk` shifted +2 m² so the closed-run anchor
+    # sees a drift of exactly 2 m² on the first strict-progress packet.
+    with caplog.at_level(
+        logging.WARNING, logger="custom_components.navimow.run_tracker"
+    ):
+        afternoon_events = _feed(
+            tracker,
+            [
+                {
+                    "type": 2,
+                    "currentMowBoundary": 3,
+                    "currentMowProgress": 107,
+                    "mowingPercentage": 65,
+                    "subtotalArea": "121.17",
+                    "mowingWeekArea": "1068.17",  # drift: wk₀ implied = 947
+                    "mowStartType": 1,
+                    "time": _AFTERNOON_START_MS,
+                },
+                {
+                    "type": 2,
+                    "currentMowBoundary": 3,
+                    "currentMowProgress": 10000,
+                    "mowingPercentage": 100,
+                    "subtotalArea": "244.34",
+                    "mowingWeekArea": "1191.34",  # 1191.34 − 244.34 = 947
+                    "mowStartType": 1,
+                    "time": _AFTERNOON_END_MS,
+                },
+            ],
+        )
+        afternoon_close = tracker.process_vehicle_state(VS_DOCKED_CHARGING)
+
+    # Session opens (pre-HARD-06 the first packet would have been
+    # silently dropped by layer 3 and no session would ever have
+    # started).
+    assert [e.kind for e in afternoon_events] == [EVENT_RUN_STARTED]
+    # Session closes with the correct `session_area` = 244.34 − 121.17.
+    assert [e.kind for e in afternoon_close] == [EVENT_RUN_FINISHED]
+    assert abs(afternoon_close[0].payload["session_area"] - 123.17) < 1e-9
+
+    # Exactly one deviation observation — the first strict-progress
+    # afternoon packet, measured against the closed-run wk₀ = 945.
+    # The second afternoon packet sits under the freshly re-anchored
+    # session wk₀ = 947 and is within tolerance, so the streak resets.
+    assert tracker.counters["invariant_deviations_observed"] == 1
+    # Streak stayed well below the WARN threshold — 5 consecutive
+    # deviations against a dead anchor are structurally impossible on
+    # the post-close path.
+    assert 1 < INVARIANT_DEVIATION_STREAK_TO_WARN
+    assert tracker._invariant_deviation_streak == 0
+
+    # No WARN emitted.
+    warns = [rec for rec in caplog.records if rec.levelno >= logging.WARNING]
+    assert warns == [], [r.getMessage() for r in warns]
+
+    # No layer_3 key in drops after HARD-06.
+    assert "layer_3" not in tracker.drops
