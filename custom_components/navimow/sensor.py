@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -22,9 +23,10 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, SIGNAL_POSITION_UPDATE
+from .const import DOMAIN, SIGNAL_POSITION_UPDATE, SIGNAL_ZONE_DISCOVERED
 from .coordinator import NavimowCoordinator
 from .run_tracker import STATE_PAUSED_DOCKED, STATE_RUNNING, VS_RETURNING
+from .zone_registry import ZoneRecord
 
 
 def _current_run_or_none(c: NavimowCoordinator) -> dict[str, Any] | None:
@@ -301,7 +303,60 @@ async def async_setup_entry(
         # rather than coordinator-driven, so it does not share the tick
         # cadence of the other sensors.
         entities.append(NavimowPositionSensor(coordinator))
+        # FEAT-04 PR 3 — zone family: one static aggregate + a lazy trio
+        # per boundary. The aggregate is always added; the per-zone
+        # trios are added eagerly for the boundaries already known
+        # (registry rebuilt from history in PR 2's restore path) and
+        # lazily on `SIGNAL_ZONE_DISCOVERED` for boundaries that appear
+        # at runtime.
+        entities.append(NavimowZonesAggregateSensor(coordinator))
+        for boundary_id in coordinator.zone_registry.zones:
+            entities.extend(_build_zone_trio(coordinator, boundary_id))
+        _wire_zone_discovery(hass, config_entry, coordinator, async_add_entities)
     async_add_entities(entities)
+
+
+def _build_zone_trio(
+    coordinator: NavimowCoordinator, boundary_id: int
+) -> list[SensorEntity]:
+    """Return the three per-zone sensors for a boundary."""
+    return [
+        NavimowZoneSurfaceSensor(coordinator, boundary_id),
+        NavimowZoneDurationSensor(coordinator, boundary_id),
+        NavimowZoneLastMowedSensor(coordinator, boundary_id),
+    ]
+
+
+def _wire_zone_discovery(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    coordinator: NavimowCoordinator,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Connect the ``SIGNAL_ZONE_DISCOVERED_<device_id>`` listener.
+
+    Runtime-discovered boundaries land here. A guard against
+    double-add is essential because PR 4 will let the operator forget
+    a zone: if the same ``boundary_id`` reappears the following mow,
+    ``ingest_run`` will re-fire the signal, and HA's own unique-id
+    dedup does the rest — but we still avoid an unnecessary call by
+    tracking the set locally.
+    """
+    known: set[int] = set(coordinator.zone_registry.zones.keys())
+
+    @callback
+    def _on_discovery(boundary_id: int) -> None:
+        if boundary_id in known:
+            return
+        known.add(boundary_id)
+        async_add_entities(_build_zone_trio(coordinator, boundary_id))
+
+    unsub = async_dispatcher_connect(
+        hass,
+        f"{SIGNAL_ZONE_DISCOVERED}_{coordinator.device.id}",
+        _on_discovery,
+    )
+    config_entry.async_on_unload(unsub)
 
 
 class NavimowSensor(CoordinatorEntity[NavimowCoordinator], RestoreSensor):
@@ -374,6 +429,212 @@ class NavimowSensor(CoordinatorEntity[NavimowCoordinator], RestoreSensor):
         if self.entity_description.attrs_fn is None:
             return None
         return self.entity_description.attrs_fn(self.coordinator)
+
+
+# === FEAT-04 PR 3 — per-zone family + aggregate ==========================
+
+
+def _zone_device_info(coordinator: NavimowCoordinator) -> DeviceInfo:
+    """Repeat the same ``DeviceInfo`` shape as ``NavimowSensor``.
+
+    Zones sit on the mower's device — the design was explicit that we do
+    not create a per-zone device (§6): dynamic naming, the ability to
+    survive a firmware id renumbering, and options-flow-driven renames
+    are all data the integration owns, not the device registry.
+    """
+    device = coordinator.device
+    return DeviceInfo(
+        identifiers={(DOMAIN, device.id)},
+        name=device.name,
+        manufacturer="Navimow",
+        model=device.model or "Unknown",
+        sw_version=device.firmware_version or None,
+        serial_number=device.serial_number or device.id,
+    )
+
+
+class _NavimowZoneEntity(CoordinatorEntity[NavimowCoordinator], SensorEntity):
+    """Base for the three per-zone sensors.
+
+    Anchored on the firmware ``boundary_id`` in the ``unique_id`` so the
+    entities survive an app-side rename (which does not touch the id),
+    and are cleanable via the future options-flow ``forget`` (PR 4).
+    """
+
+    _attr_has_entity_name = True
+
+    def __init__(self, coordinator: NavimowCoordinator, boundary_id: int) -> None:
+        super().__init__(coordinator)
+        self._boundary_id = boundary_id
+        self._attr_device_info = _zone_device_info(coordinator)
+        # Fallback name until PR 4's options flow provides a friendly one.
+        # ``_attr_name`` is set (not ``translation_key``) because per-zone
+        # names are dynamic and translation keys resolve statically at
+        # load — see design §6, aggregate below carries the key.
+        self._attr_name = f"Zone #{boundary_id}"
+
+    @property
+    def _record(self) -> ZoneRecord | None:
+        return self.coordinator.zone_registry.zones.get(self._boundary_id)
+
+    @property
+    def available(self) -> bool:
+        # Present as long as the registry still knows this boundary. The
+        # ``forget`` service (PR 4) removes the entity outright rather
+        # than flipping `available` to False.
+        return self._record is not None
+
+
+class NavimowZoneSurfaceSensor(_NavimowZoneEntity):
+    """Last-mow surface for one boundary, presented ``ceil``'d to the next m².
+
+    Attributes carry the precise float (``last_surface_precise``) and the
+    zone-size estimate derived from the last complete pass. Design §6.
+    """
+
+    _attr_native_unit_of_measurement = UnitOfArea.SQUARE_METERS
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:texture-box"
+
+    def __init__(self, coordinator: NavimowCoordinator, boundary_id: int) -> None:
+        super().__init__(coordinator, boundary_id)
+        self._attr_unique_id = f"{DOMAIN}_{coordinator.device.id}_zone_{boundary_id}"
+
+    @property
+    def native_value(self) -> int | None:
+        rec = self._record
+        if rec is None or rec.last_surface_m2 is None:
+            return None
+        return math.ceil(rec.last_surface_m2)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        rec = self._record
+        if rec is None:
+            return None
+        return {
+            "boundary_id": self._boundary_id,
+            "size_estimate": (
+                math.ceil(rec.size_estimate_m2)
+                if rec.size_estimate_m2 is not None
+                else None
+            ),
+            "last_surface_precise": rec.last_surface_m2,
+            "last_cmp_max": rec.last_cmp_max,
+            "last_result": rec.last_result,
+        }
+
+
+class NavimowZoneDurationSensor(_NavimowZoneEntity):
+    """Last-mow in-zone wall-clock duration (recharge inside a segment
+    included). Design §5 D1."""
+
+    _attr_native_unit_of_measurement = UnitOfTime.SECONDS
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:timer-outline"
+
+    def __init__(self, coordinator: NavimowCoordinator, boundary_id: int) -> None:
+        super().__init__(coordinator, boundary_id)
+        self._attr_unique_id = (
+            f"{DOMAIN}_{coordinator.device.id}_zone_{boundary_id}_duration"
+        )
+        # HA display fallback: FR shows "5 min", EN shows "5 minutes",
+        # etc. The native unit stays seconds so history-graph charts do
+        # not shatter on a unit change if PR 4 or later widens the range.
+        self._attr_name = f"Zone #{boundary_id} durée"
+
+    @property
+    def native_value(self) -> int | None:
+        rec = self._record
+        return rec.last_duration_s if rec is not None else None
+
+
+class NavimowZoneLastMowedSensor(_NavimowZoneEntity):
+    """Timestamp of this boundary's own last mow exit — NOT the run
+    end (Fable correction, design §5). On an interleaved run
+    ``[1, 3, 1]`` zone 1's last-mowed sits *after* zone 3's."""
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_icon = "mdi:calendar-clock"
+
+    def __init__(self, coordinator: NavimowCoordinator, boundary_id: int) -> None:
+        super().__init__(coordinator, boundary_id)
+        self._attr_unique_id = (
+            f"{DOMAIN}_{coordinator.device.id}_zone_{boundary_id}_last_mowed"
+        )
+        self._attr_name = f"Zone #{boundary_id} dernière tonte"
+
+    @property
+    def native_value(self) -> datetime | None:
+        rec = self._record
+        if rec is None or rec.last_mowed_ms is None:
+            return None
+        return datetime.fromtimestamp(rec.last_mowed_ms / 1000, tz=UTC)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        rec = self._record
+        if rec is None:
+            return None
+        return {"last_result": rec.last_result}
+
+
+class NavimowZonesAggregateSensor(CoordinatorEntity[NavimowCoordinator], SensorEntity):
+    """Static aggregate over all zones.
+
+    State = zone **count** (decision D-agg, design §12): a small badge
+    number that rarely changes. Interesting numbers (surface totals,
+    ids, per-zone summary) live in attributes so recorder churn stays
+    minimal.
+
+    Static (single instance per device) → carries ``translation_key`` in
+    ``strings.json``/``en.json``/``fr.json`` (§6 lesson from PR #50 —
+    a keyless static entity ships nameless).
+    """
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "zones"
+    _attr_icon = "mdi:map-outline"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: NavimowCoordinator) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{DOMAIN}_{coordinator.device.id}_zones"
+        self._attr_device_info = _zone_device_info(coordinator)
+
+    @property
+    def native_value(self) -> int:
+        return len(self.coordinator.zone_registry.zones)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        zones = self.coordinator.zone_registry.zones
+        zone_ids = sorted(zones.keys())
+        # `total_area` = spatial sum of size estimates, ceil'd. Zones
+        # without an estimate yet (no complete pass) contribute 0 — the
+        # aggregate stays honest until the first complete pass.
+        total = sum(
+            math.ceil(rec.size_estimate_m2)
+            for rec in zones.values()
+            if rec.size_estimate_m2 is not None
+        )
+        per_zone = {
+            bid: {
+                "size_estimate": (
+                    math.ceil(rec.size_estimate_m2)
+                    if rec.size_estimate_m2 is not None
+                    else None
+                ),
+                "last_result": rec.last_result,
+            }
+            for bid, rec in zones.items()
+        }
+        return {
+            "zone_ids": zone_ids,
+            "total_area": total,
+            "per_zone": per_zone,
+        }
 
 
 class NavimowPositionSensor(SensorEntity):
