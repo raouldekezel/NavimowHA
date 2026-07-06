@@ -83,6 +83,9 @@
           "completed": "Terminé",
           "interrupted": "Interrompu"
         }
+      },
+      "zones": {
+        "name": "Zones"
       }
     },
     "binary_sensor": {
