@@ -129,6 +129,58 @@ async def test_restore_on_empty_store_leaves_registry_empty() -> None:
     assert coord.zone_registry.zones == {}
 
 
+async def test_restore_does_not_dispatch_zone_discovered() -> None:
+    """Contract for PR 3: restore is eager (entities created by iterating
+    ``registry.zones`` after the rebuild), the discovery signal is
+    reserved for runtime ``run_finished`` events. A dispatch during
+    restore would cause double entity adds — pinning this here stops a
+    future change to ``_async_restore_store`` from silently regressing
+    PR 3."""
+    coord = _make_coordinator()
+    history = [
+        {
+            "result": "completed",
+            "start_time": 0,
+            "end_time": 100_000,
+            "zones": [_seg(1, 0, 90_000, 10_000, 0.0, 228.0)],
+        }
+    ]
+    with (
+        patch("custom_components.navimow.coordinator.Store") as store_cls,
+        patch("custom_components.navimow.coordinator.async_dispatcher_send") as disp,
+    ):
+        store_instance = MagicMock()
+        store_instance.async_load = AsyncMock(return_value={"history": history})
+        store_cls.return_value = store_instance
+        await coord._async_restore_store()
+    assert 1 in coord.zone_registry.zones  # rebuild happened
+    assert disp.call_count == 0  # but no dispatch
+
+
+async def test_restore_survives_corrupt_history() -> None:
+    """A malformed on-disk entry (here: ``zones`` is a string, not a
+    list) must not crash restore. The registry stays empty; future
+    ``run_finished`` events will re-populate it as sessions close."""
+    coord = _make_coordinator()
+    bad_history = [
+        {
+            "result": "completed",
+            "start_time": 0,
+            "end_time": 100_000,
+            "zones": "not-a-list",  # AttributeError in the rebuild loop
+        }
+    ]
+    with patch("custom_components.navimow.coordinator.Store") as store_cls:
+        store_instance = MagicMock()
+        store_instance.async_load = AsyncMock(return_value={"history": bad_history})
+        store_cls.return_value = store_instance
+        await coord._async_restore_store()  # must not raise
+    assert coord.zone_registry.zones == {}
+    # History field itself is untouched — the corrupt bytes reach the
+    # coordinator; only the registry projection is skipped.
+    assert coord.history == bad_history
+
+
 # --------------------------------------------------------------------- #
 # 3. Ingest + dispatch on run_finished                                   #
 # --------------------------------------------------------------------- #

@@ -197,8 +197,21 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # FEAT-04 PR 2: project the restored history onto the zone registry.
         # The last complete pass per zone wins `size_estimate`, so every
         # value the sensor platform (PR 3) will read is already correct
-        # before the first live packet arrives.
-        self.zone_registry.rebuild(self.history)
+        # before the first live packet arrives. Guarded against a corrupt
+        # on-disk shape: if a run entry is malformed (e.g. `zones` is not a
+        # list) the projection cannot proceed, but restore must not crash —
+        # the registry stays empty and future `run_finished` events will
+        # re-populate it as sessions close.
+        try:
+            self.zone_registry.rebuild(self.history)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning(
+                "zone_registry rebuild failed for %s (corrupt history?); "
+                "registry starts empty and will re-populate on next run_finished: %s",
+                self.device.id,
+                err,
+            )
+            self.zone_registry = ZoneRegistry()
 
     def _build_store_payload(self) -> dict[str, Any]:
         # `snapshot()` already deep-copies `current_run` for us; the
