@@ -99,7 +99,71 @@ def test_empty_string_name_falls_back_to_hash_id() -> None:
 
 
 # --------------------------------------------------------------------- #
-# 2. Options flow — rename                                              #
+# 2. Options flow — render paths (menu + forms)                         #
+# --------------------------------------------------------------------- #
+
+
+async def test_init_step_shows_menu_with_rename_and_forget() -> None:
+    """The top-level step must render a menu, not a form. Pins the
+    contract that PR 4's UI keeps rename + forget as the two entry
+    points (any future extension adds an option; the two present
+    here must not disappear)."""
+    entry = _make_entry()
+    hass = MagicMock()
+    handler = NavimowOptionsFlowHandler(entry)
+    handler.hass = hass
+    handler.async_show_menu = MagicMock(return_value={"type": "menu"})
+
+    await handler.async_step_init()
+
+    handler.async_show_menu.assert_called_once()
+    kwargs = handler.async_show_menu.call_args.kwargs
+    assert kwargs["step_id"] == "init"
+    assert set(kwargs["menu_options"]) == {"rename_zone", "forget_zone"}
+
+
+async def test_rename_step_with_no_input_renders_form_with_choices() -> None:
+    """Calling ``async_step_rename_zone(None)`` on a populated entry
+    shows the form with the boundary selector and name text field.
+    Pins the render path — the submit branches are covered below."""
+    coord = _make_coordinator(
+        {
+            1: _rec(1, surface=227.82),
+            3: _rec(3, surface=123.54),
+        }
+    )
+    entry = _make_entry({OPTIONS_KEY_ZONES: {"1": {"name": "Prunier"}}})
+    hass = MagicMock()
+    hass.data = {DOMAIN: {entry.entry_id: {"coordinators": {"dev": coord}}}}
+
+    handler = NavimowOptionsFlowHandler(entry)
+    handler.hass = hass
+    handler.async_show_form = MagicMock(return_value={"type": "form"})
+
+    result = await handler.async_step_rename_zone()
+
+    handler.async_show_form.assert_called_once()
+    kwargs = handler.async_show_form.call_args.kwargs
+    assert kwargs["step_id"] == "rename_zone"
+    # Schema must accept `boundary_id` (the selector) and `name` (the
+    # text field). Feeding the schema a real dict is enough — voluptuous
+    # will raise on an unknown key or a missing required one.
+    schema = kwargs["data_schema"]
+    assert schema({"boundary_id": "1", "name": "Prunier"}) == {
+        "boundary_id": "1",
+        "name": "Prunier",
+    }
+    # The known boundaries appear in the selector's `In` accept list —
+    # `_In` on unknown values raises `MultipleInvalid`.
+    import voluptuous as vol
+
+    with __import__("pytest").raises(vol.Invalid):
+        schema({"boundary_id": "99", "name": "Nope"})
+    assert result == {"type": "form"}
+
+
+# --------------------------------------------------------------------- #
+# 3. Options flow — rename (submit)                                      #
 # --------------------------------------------------------------------- #
 
 
@@ -154,7 +218,7 @@ async def test_rename_step_aborts_when_no_zones() -> None:
 
 
 # --------------------------------------------------------------------- #
-# 3. Options flow — forget                                              #
+# 4. Options flow — forget                                              #
 # --------------------------------------------------------------------- #
 
 
@@ -206,7 +270,7 @@ async def test_forget_step_without_confirmation_aborts() -> None:
 
 
 # --------------------------------------------------------------------- #
-# 4. Sensor wiring — forget                                             #
+# 5. Sensor wiring — forget                                             #
 # --------------------------------------------------------------------- #
 
 
@@ -280,7 +344,7 @@ def test_wire_zone_forget_is_idempotent_on_unknown_boundary() -> None:
 
 
 # --------------------------------------------------------------------- #
-# 5. Sensor wiring — options-update listener                            #
+# 6. Sensor wiring — options-update listener                            #
 # --------------------------------------------------------------------- #
 
 

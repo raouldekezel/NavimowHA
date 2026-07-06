@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 from typing import Any
 
 import voluptuous as vol
@@ -199,7 +200,13 @@ class NavimowOptionsFlowHandler(config_entries.OptionsFlow):
 
     def _zone_label(self, boundary_id: int) -> str:
         """User-facing label in the selector: current name (if any) +
-        boundary id + last-mowed surface for recognition."""
+        boundary id + last-mowed surface for recognition.
+
+        Surface is presented ``math.ceil``'d for parity with the
+        per-zone sensor state (D-size). Round-and-ceil disagree by
+        1 m² on non-integers — the picker would read ``227`` while
+        the entity shows ``228`` on the same zone otherwise.
+        """
         zones_opt = self._config_entry.options.get(OPTIONS_KEY_ZONES, {})
         name = zones_opt.get(str(boundary_id), {}).get("name")
         try:
@@ -207,7 +214,7 @@ class NavimowOptionsFlowHandler(config_entries.OptionsFlow):
             for coord in data["coordinators"].values():
                 rec = coord.zone_registry.zones.get(boundary_id)
                 if rec is not None and rec.last_surface_m2 is not None:
-                    surface_int = int(round(rec.last_surface_m2))
+                    surface_int = math.ceil(rec.last_surface_m2)
                     if name:
                         return f"{name} — #{boundary_id} ({surface_int} m²)"
                     return f"#{boundary_id} ({surface_int} m²)"
