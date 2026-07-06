@@ -160,3 +160,65 @@ def test_forget():
     assert reg.forget(1) is True
     assert 1 not in reg.zones
     assert reg.forget(99) is False
+
+
+def test_newly_seen_only_reports_first_time_boundaries():
+    # Contract for PR 3's lazy entity creation: newly_seen must fire once and
+    # only once per boundary, even across many ingestions.
+    reg = ZoneRegistry()
+    first = reg.ingest_run(_run([_seg(1, 0, 10_000, 10_000, 0.0, 200.0)]))
+    assert first == [1]
+    second = reg.ingest_run(_run([_seg(1, 0, 10_000, 10_000, 0.0, 210.0)]))
+    assert second == []  # already known
+    third = reg.ingest_run(
+        _run(
+            [
+                _seg(1, 0, 5_000, 10_000, 0.0, 200.0),
+                _seg(3, 5_000, 10_000, 10_000, 200.0, 320.0),
+            ]
+        )
+    )
+    assert third == [3]  # only the truly new one
+
+
+def test_empty_and_all_sentinel_run_are_noops():
+    reg = ZoneRegistry()
+    assert reg.ingest_run(_run([])) == []
+    assert reg.zones == {}
+    # All-sentinel: only boundary=0 present → registry stays empty, no raise.
+    assert reg.ingest_run(_run([_seg(0, 0, 1_000, 0, 0.0, 0.0)])) == []
+    assert reg.zones == {}
+
+
+def test_defensive_none_fields_skip_per_field():
+    # Contract for partial segments: each field is guarded independently.
+    # A segment with sub but no time contributes to surface only; a segment
+    # with time but no sub contributes to duration only. No raise, no silent
+    # mix. In practice tracker-emitted segments always carry all fields —
+    # this locks the guard behaviour rather than leaving it incidental.
+    bad_no_sub = {
+        "boundary_id": 1,
+        "first_time": 5_000,
+        "last_time": 8_000,
+        "cmp_max": 3_000,
+        # sub_entry / sub_exit intentionally missing → skipped for surface
+    }
+    bad_no_time = {
+        "boundary_id": 1,
+        "cmp_max": 4_000,
+        "sub_entry": 100.0,
+        "sub_exit": 110.0,
+        # first_time / last_time intentionally missing → skipped for duration
+    }
+    good = _seg(1, 0, 5_000, 10_000, 0.0, 200.0)
+    reg = ZoneRegistry()
+    reg.ingest_run(_run([good, bad_no_sub, bad_no_time], end_time=20_000))
+    z1 = reg.zones[1]
+    # surface = good (200 − 0) + bad_no_time (110 − 100) = 210; bad_no_sub skipped
+    assert z1.last_surface_m2 == pytest.approx(210.0)
+    # duration = good (5 s) + bad_no_sub (3 s) = 8; bad_no_time skipped
+    assert z1.last_duration_s == 8
+    # last_mowed = max of times present — bad_no_time skipped
+    assert z1.last_mowed_ms == 8_000  # max(5000, 8000)
+    # cmp_max reflects the highest across all segments (they all have it)
+    assert z1.last_cmp_max == 10_000

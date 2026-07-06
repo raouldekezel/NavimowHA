@@ -29,7 +29,7 @@ class ZoneRecord:
     last_cmp_max: int = 0
     size_estimate_m2: float | None = None
     last_result: str | None = None
-    bbox: dict[str, float] | None = None  # FEAT-04b, unused here
+    bbox: dict[str, float] | None = None  # deferred posture-bbox phase, unused here
 
 
 class ZoneRegistry:
@@ -60,6 +60,11 @@ class ZoneRegistry:
                 newly_seen.append(bid)
             rec = self.zones[bid]
 
+            # Segments missing sub_entry/sub_exit are skipped defensively; in
+            # practice every tracker-emitted segment carries them. When every
+            # segment lacks sub the surface collapses to 0.0 rather than None
+            # (harmless: real payloads never trigger it, and downstream steps
+            # treat 0.0 and None the same for "nothing mowed").
             surface = sum(
                 s["sub_exit"] - s["sub_entry"]
                 for s in segs
