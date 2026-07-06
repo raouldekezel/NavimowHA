@@ -45,6 +45,15 @@ def _make_coordinator(zone_records: dict[int, ZoneRecord] | None = None):
     return coord
 
 
+def _make_entry(options: dict | None = None):
+    """Minimal ConfigEntry mock — carries just the options dict the
+    per-zone entities read to derive their display name (PR 4)."""
+    entry = MagicMock()
+    entry.entry_id = "test-entry"
+    entry.options = options or {}
+    return entry
+
+
 def _rec(
     boundary_id: int,
     *,
@@ -73,7 +82,7 @@ def _rec(
 
 def test_surface_state_ceils_precise_value_and_exposes_precise_attr() -> None:
     coord = _make_coordinator({1: _rec(1, surface=227.82, size_estimate=227.82)})
-    ent = NavimowZoneSurfaceSensor(coord, 1)
+    ent = NavimowZoneSurfaceSensor(coord, _make_entry(), 1)
     # ceil(227.82) = 228 m², precise float retained in attr.
     assert ent.native_value == 228
     assert ent.native_unit_of_measurement == UnitOfArea.SQUARE_METERS
@@ -87,7 +96,7 @@ def test_surface_state_ceils_precise_value_and_exposes_precise_attr() -> None:
 
 def test_surface_returns_none_when_registry_lacks_boundary() -> None:
     coord = _make_coordinator({})
-    ent = NavimowZoneSurfaceSensor(coord, 1)
+    ent = NavimowZoneSurfaceSensor(coord, _make_entry(), 1)
     assert ent.native_value is None
     assert ent.extra_state_attributes is None
     assert ent.available is False
@@ -97,7 +106,7 @@ def test_surface_returns_none_when_record_has_no_surface_yet() -> None:
     # A newly-created ZoneRecord (first sighting, no run closed) has None
     # for last_surface_m2; the entity must render `unknown`, not crash.
     coord = _make_coordinator({3: ZoneRecord(boundary_id=3)})
-    ent = NavimowZoneSurfaceSensor(coord, 3)
+    ent = NavimowZoneSurfaceSensor(coord, _make_entry(), 3)
     assert ent.native_value is None
     # But the record IS there, so `available` is True and attrs render.
     assert ent.available is True
@@ -107,7 +116,7 @@ def test_surface_returns_none_when_record_has_no_surface_yet() -> None:
 
 def test_duration_entity_native_value_and_class() -> None:
     coord = _make_coordinator({1: _rec(1, duration=2400)})
-    ent = NavimowZoneDurationSensor(coord, 1)
+    ent = NavimowZoneDurationSensor(coord, _make_entry(), 1)
     assert ent.native_value == 2400
     assert ent.native_unit_of_measurement == UnitOfTime.SECONDS
     assert ent.device_class == SensorDeviceClass.DURATION
@@ -116,7 +125,7 @@ def test_duration_entity_native_value_and_class() -> None:
 def test_last_mowed_entity_returns_utc_datetime() -> None:
     # 1_779_694_000_000 ms = 2026-05-25 07:26:40 UTC
     coord = _make_coordinator({1: _rec(1, mowed_ms=1_779_694_000_000)})
-    ent = NavimowZoneLastMowedSensor(coord, 1)
+    ent = NavimowZoneLastMowedSensor(coord, _make_entry(), 1)
     got = ent.native_value
     assert isinstance(got, datetime)
     assert got.tzinfo == UTC
@@ -127,9 +136,9 @@ def test_zone_entities_carry_fallback_name_until_pr4() -> None:
     """PR 3 → PR 4 handoff: names are ``#<id>``. PR 4 will override
     ``_attr_name`` from the options flow map."""
     coord = _make_coordinator({3: _rec(3, surface=123.5)})
-    surf = NavimowZoneSurfaceSensor(coord, 3)
-    dur = NavimowZoneDurationSensor(coord, 3)
-    lm = NavimowZoneLastMowedSensor(coord, 3)
+    surf = NavimowZoneSurfaceSensor(coord, _make_entry(), 3)
+    dur = NavimowZoneDurationSensor(coord, _make_entry(), 3)
+    lm = NavimowZoneLastMowedSensor(coord, _make_entry(), 3)
     assert surf.name == "Zone #3"
     assert dur.name == "Zone #3 durée"
     assert lm.name == "Zone #3 dernière tonte"
@@ -137,7 +146,7 @@ def test_zone_entities_carry_fallback_name_until_pr4() -> None:
 
 def test_zone_entities_unique_ids_anchored_on_boundary_id() -> None:
     coord = _make_coordinator({7: _rec(7)})
-    trio = _build_zone_trio(coord, 7)
+    trio = _build_zone_trio(coord, _make_entry(), 7)
     ids = {e.unique_id for e in trio}
     assert ids == {
         f"{DOMAIN}_REDACTED-ROBOT-SERIAL_zone_7",
@@ -229,7 +238,8 @@ def test_wire_zone_discovery_dispatches_on_new_boundary() -> None:
     # Signal to fire uses the standard suffix.
     assert async_add_entities.call_count == 0  # nothing added yet
 
-    # Simulate the dispatcher firing with a brand-new boundary.
+    # PR 4 also connects a forgotten-listener for the internal `known`
+    # bookkeeping — first captured callback is discovery, second is forget.
     on_discovery = captured_callback[0]
     on_discovery(3)
     async_add_entities.assert_called_once()
@@ -282,7 +292,12 @@ def test_wire_zone_discovery_registers_unload_on_config_entry() -> None:
     ):
         _wire_zone_discovery(hass, config_entry, coord, async_add_entities)
 
-    config_entry.async_on_unload.assert_called_once_with(sentinel_unsub)
+    # Two unsubs registered: SIGNAL_ZONE_DISCOVERED + SIGNAL_ZONE_FORGOTTEN
+    # (the latter keeps the local `known` set in sync so a re-discovery
+    # after forget re-adds the trio). Both wrapped in async_on_unload.
+    assert config_entry.async_on_unload.call_count == 2
+    for call in config_entry.async_on_unload.call_args_list:
+        assert call.args[0] is sentinel_unsub
 
 
 def test_wire_zone_discovery_signal_name_uses_device_id() -> None:
@@ -295,7 +310,8 @@ def test_wire_zone_discovery_signal_name_uses_device_id() -> None:
         connect.return_value = lambda: None
         _wire_zone_discovery(hass, config_entry, coord, async_add_entities)
 
-    signal = connect.call_args.args[1]
+    # First connect is discovery; the second (PR 4) is forgotten-listener.
+    signal = connect.call_args_list[0].args[1]
     assert signal == f"{SIGNAL_ZONE_DISCOVERED}_{coord.device.id}"
 
 
@@ -366,13 +382,18 @@ async def test_async_setup_entry_eager_creates_aggregate_and_trio_per_zone() -> 
     ):
         assert {e._boundary_id for e in added if isinstance(e, cls)} == {1, 3}
 
-    # No dispatcher signal fires during setup — structurally impossible here:
-    # `sensor.py` only imports `async_dispatcher_connect`, not `_send`, so
-    # PR 2's "restore-does-not-dispatch" contract is respected end-to-end.
-    # The runtime listener is registered exactly once, unsub piped through
-    # config_entry.async_on_unload.
-    assert connect.call_count == 1
-    config_entry.async_on_unload.assert_called_once()
+    # No dispatcher signal fires during setup — PR 2's
+    # "restore-does-not-dispatch" contract is respected end-to-end (and
+    # `sensor.py`'s import surface only carries `async_dispatcher_connect`
+    # and `async_dispatcher_send`; the latter is only fired by the
+    # options-flow update listener, not during initial setup).
+    # PR 4 registers three connect calls at setup: discovery, forgotten
+    # (bookkeeping), forgotten (registry cleanup). All three unsubs
+    # piped through async_on_unload alongside the update-listener unsub.
+    assert connect.call_count == 3
+    assert config_entry.async_on_unload.call_count >= 3
+    # Update listener also wired.
+    config_entry.add_update_listener.assert_called_once()
 
 
 async def test_async_setup_entry_with_no_restored_zones_still_adds_aggregate() -> None:
@@ -416,4 +437,5 @@ async def test_async_setup_entry_with_no_restored_zones_still_adds_aggregate() -
     ]
     assert len(aggregates) == 1
     assert zone_entities == []
-    assert connect.call_count == 1  # ready to receive first runtime discovery
+    # PR 4: three connects at setup (discovery + 2× forgotten wiring).
+    assert connect.call_count == 3

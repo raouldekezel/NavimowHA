@@ -18,12 +18,22 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import PERCENTAGE, UnitOfArea, UnitOfLength, UnitOfTime
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers.dispatcher import (
+    async_dispatcher_connect,
+    async_dispatcher_send,
+)
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, SIGNAL_POSITION_UPDATE, SIGNAL_ZONE_DISCOVERED
+from .const import (
+    DOMAIN,
+    OPTIONS_KEY_ZONES,
+    SIGNAL_POSITION_UPDATE,
+    SIGNAL_ZONE_DISCOVERED,
+    SIGNAL_ZONE_FORGOTTEN,
+    SIGNAL_ZONE_NAMES_UPDATED,
+)
 from .coordinator import NavimowCoordinator
 from .run_tracker import STATE_PAUSED_DOCKED, STATE_RUNNING, VS_RETURNING
 from .zone_registry import ZoneRecord
@@ -311,19 +321,23 @@ async def async_setup_entry(
         # at runtime.
         entities.append(NavimowZonesAggregateSensor(coordinator))
         for boundary_id in coordinator.zone_registry.zones:
-            entities.extend(_build_zone_trio(coordinator, boundary_id))
+            entities.extend(_build_zone_trio(coordinator, config_entry, boundary_id))
         _wire_zone_discovery(hass, config_entry, coordinator, async_add_entities)
+        _wire_zone_forget(hass, config_entry, coordinator)
+        _wire_options_update_listener(hass, config_entry)
     async_add_entities(entities)
 
 
 def _build_zone_trio(
-    coordinator: NavimowCoordinator, boundary_id: int
+    coordinator: NavimowCoordinator,
+    config_entry: ConfigEntry,
+    boundary_id: int,
 ) -> list[SensorEntity]:
     """Return the three per-zone sensors for a boundary."""
     return [
-        NavimowZoneSurfaceSensor(coordinator, boundary_id),
-        NavimowZoneDurationSensor(coordinator, boundary_id),
-        NavimowZoneLastMowedSensor(coordinator, boundary_id),
+        NavimowZoneSurfaceSensor(coordinator, config_entry, boundary_id),
+        NavimowZoneDurationSensor(coordinator, config_entry, boundary_id),
+        NavimowZoneLastMowedSensor(coordinator, config_entry, boundary_id),
     ]
 
 
@@ -336,11 +350,12 @@ def _wire_zone_discovery(
     """Connect the ``SIGNAL_ZONE_DISCOVERED_<device_id>`` listener.
 
     Runtime-discovered boundaries land here. A guard against
-    double-add is essential because PR 4 will let the operator forget
-    a zone: if the same ``boundary_id`` reappears the following mow,
-    ``ingest_run`` will re-fire the signal, and HA's own unique-id
-    dedup does the rest — but we still avoid an unnecessary call by
-    tracking the set locally.
+    double-add is essential because PR 4 lets the operator forget a
+    zone: if the same ``boundary_id`` reappears the following mow,
+    ``ingest_run`` re-fires the signal, and HA's own unique-id dedup
+    does the rest — but we still avoid an unnecessary call by
+    tracking the set locally. The set is mutated on ``forget`` so a
+    re-discovery does add the trio back.
     """
     known: set[int] = set(coordinator.zone_registry.zones.keys())
 
@@ -349,13 +364,82 @@ def _wire_zone_discovery(
         if boundary_id in known:
             return
         known.add(boundary_id)
-        async_add_entities(_build_zone_trio(coordinator, boundary_id))
+        async_add_entities(_build_zone_trio(coordinator, config_entry, boundary_id))
+
+    @callback
+    def _on_forget(boundary_id: int) -> None:
+        # Keep the known set in sync so a future re-discovery re-adds.
+        known.discard(boundary_id)
 
     unsub = async_dispatcher_connect(
         hass,
         f"{SIGNAL_ZONE_DISCOVERED}_{coordinator.device.id}",
         _on_discovery,
     )
+    config_entry.async_on_unload(unsub)
+    unsub_forget = async_dispatcher_connect(
+        hass,
+        f"{SIGNAL_ZONE_FORGOTTEN}_{coordinator.device.id}",
+        _on_forget,
+    )
+    config_entry.async_on_unload(unsub_forget)
+
+
+def _wire_zone_forget(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    coordinator: NavimowCoordinator,
+) -> None:
+    """Handle ``SIGNAL_ZONE_FORGOTTEN_<device_id>``.
+
+    Drops the boundary from the registry AND removes the three
+    per-zone entities from the entity registry. Deferred import of
+    ``entity_registry`` keeps the module top-level thin. The removal
+    is idempotent — a signal echoing after the fact is safe.
+    """
+
+    @callback
+    def _on_forget(boundary_id: int) -> None:
+        coordinator.zone_registry.forget(boundary_id)
+        # Remove the three entity registry entries so they don't linger
+        # as `unavailable`. If a run later re-discovers the same id,
+        # PR 3's dispatcher re-adds a fresh trio.
+        from homeassistant.helpers import entity_registry as er
+
+        ent_reg = er.async_get(hass)
+        device_id = coordinator.device.id
+        for suffix in ("", "_duration", "_last_mowed"):
+            uid = f"{DOMAIN}_{device_id}_zone_{boundary_id}{suffix}"
+            entity_id = ent_reg.async_get_entity_id("sensor", DOMAIN, uid)
+            if entity_id:
+                ent_reg.async_remove(entity_id)
+
+    unsub = async_dispatcher_connect(
+        hass,
+        f"{SIGNAL_ZONE_FORGOTTEN}_{coordinator.device.id}",
+        _on_forget,
+    )
+    config_entry.async_on_unload(unsub)
+
+
+def _wire_options_update_listener(
+    hass: HomeAssistant, config_entry: ConfigEntry
+) -> None:
+    """Fire ``SIGNAL_ZONE_NAMES_UPDATED`` after any options-flow save.
+
+    Per-zone entities listen on the signal and re-derive their
+    ``_attr_name`` from ``config_entry.options[OPTIONS_KEY_ZONES]``,
+    then call ``async_write_ha_state`` — no integration reload, no
+    entity re-registration.
+    """
+
+    async def _on_options_updated(hass_: HomeAssistant, entry: ConfigEntry) -> None:
+        async_dispatcher_send(
+            hass_,
+            f"{SIGNAL_ZONE_NAMES_UPDATED}_{entry.entry_id}",
+        )
+
+    unsub = config_entry.add_update_listener(_on_options_updated)
     config_entry.async_on_unload(unsub)
 
 
@@ -453,25 +537,78 @@ def _zone_device_info(coordinator: NavimowCoordinator) -> DeviceInfo:
     )
 
 
+def _zone_display_name(
+    config_entry: ConfigEntry, boundary_id: int, suffix: str = ""
+) -> str:
+    """Compose the entity display name.
+
+    Reads the operator's chosen name from
+    ``config_entry.options[OPTIONS_KEY_ZONES][str(boundary_id)]["name"]``
+    and falls back to ``Zone #<id>`` when unmapped. Optional ``suffix``
+    (`` durée`` / `` dernière tonte``) is appended verbatim. This is
+    the one place per-zone naming lives; PR 4's options-update signal
+    re-derives it and calls ``async_write_ha_state``.
+    """
+    zones_opt = config_entry.options.get(OPTIONS_KEY_ZONES, {}) or {}
+    entry = zones_opt.get(str(boundary_id))
+    name = (entry or {}).get("name")
+    base = name if name else f"Zone #{boundary_id}"
+    return f"{base}{suffix}"
+
+
 class _NavimowZoneEntity(CoordinatorEntity[NavimowCoordinator], SensorEntity):
     """Base for the three per-zone sensors.
 
     Anchored on the firmware ``boundary_id`` in the ``unique_id`` so the
     entities survive an app-side rename (which does not touch the id),
-    and are cleanable via the future options-flow ``forget`` (PR 4).
+    and are cleanable via the options-flow ``forget`` (PR 4).
+
+    The display name is read from ``config_entry.options`` — the
+    operator's rename (PR 4) refreshes it live via a dispatcher signal,
+    no reload required.
     """
 
     _attr_has_entity_name = True
+    # Suffix appended to the operator's zone name in the display. Subclass
+    # overrides for `_duree` / `_derniere_tonte`.
+    _name_suffix: str = ""
 
-    def __init__(self, coordinator: NavimowCoordinator, boundary_id: int) -> None:
+    def __init__(
+        self,
+        coordinator: NavimowCoordinator,
+        config_entry: ConfigEntry,
+        boundary_id: int,
+    ) -> None:
         super().__init__(coordinator)
         self._boundary_id = boundary_id
+        self._config_entry = config_entry
         self._attr_device_info = _zone_device_info(coordinator)
-        # Fallback name until PR 4's options flow provides a friendly one.
-        # ``_attr_name`` is set (not ``translation_key``) because per-zone
-        # names are dynamic and translation keys resolve statically at
-        # load — see design §6, aggregate below carries the key.
-        self._attr_name = f"Zone #{boundary_id}"
+        # ``_attr_name`` is set directly (not via ``translation_key``)
+        # because per-zone names are dynamic and translation keys
+        # resolve statically at load — see design §6.
+        self._refresh_name()
+
+    def _refresh_name(self) -> None:
+        self._attr_name = _zone_display_name(
+            self._config_entry, self._boundary_id, self._name_suffix
+        )
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to the rename signal so the display refreshes live."""
+        await super().async_added_to_hass()
+
+        @callback
+        def _on_names_updated() -> None:
+            self._refresh_name()
+            self.async_write_ha_state()
+
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass,
+                f"{SIGNAL_ZONE_NAMES_UPDATED}_{self._config_entry.entry_id}",
+                _on_names_updated,
+            )
+        )
 
     @property
     def _record(self) -> ZoneRecord | None:
@@ -479,9 +616,9 @@ class _NavimowZoneEntity(CoordinatorEntity[NavimowCoordinator], SensorEntity):
 
     @property
     def available(self) -> bool:
-        # Present as long as the registry still knows this boundary. The
-        # ``forget`` service (PR 4) removes the entity outright rather
-        # than flipping `available` to False.
+        # Present as long as the registry still knows this boundary.
+        # ``forget`` (§7) removes the entity from the registry outright
+        # rather than flipping `available` to False.
         return self._record is not None
 
 
@@ -496,8 +633,13 @@ class NavimowZoneSurfaceSensor(_NavimowZoneEntity):
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_icon = "mdi:texture-box"
 
-    def __init__(self, coordinator: NavimowCoordinator, boundary_id: int) -> None:
-        super().__init__(coordinator, boundary_id)
+    def __init__(
+        self,
+        coordinator: NavimowCoordinator,
+        config_entry: ConfigEntry,
+        boundary_id: int,
+    ) -> None:
+        super().__init__(coordinator, config_entry, boundary_id)
         self._attr_unique_id = f"{DOMAIN}_{coordinator.device.id}_zone_{boundary_id}"
 
     @property
@@ -533,16 +675,21 @@ class NavimowZoneDurationSensor(_NavimowZoneEntity):
     _attr_device_class = SensorDeviceClass.DURATION
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_icon = "mdi:timer-outline"
+    # HA display fallback: FR shows "5 min", EN shows "5 minutes", etc.
+    # The native unit stays seconds so history-graph charts do not
+    # shatter on a unit change if a later phase widens the range.
+    _name_suffix = " durée"
 
-    def __init__(self, coordinator: NavimowCoordinator, boundary_id: int) -> None:
-        super().__init__(coordinator, boundary_id)
+    def __init__(
+        self,
+        coordinator: NavimowCoordinator,
+        config_entry: ConfigEntry,
+        boundary_id: int,
+    ) -> None:
+        super().__init__(coordinator, config_entry, boundary_id)
         self._attr_unique_id = (
             f"{DOMAIN}_{coordinator.device.id}_zone_{boundary_id}_duration"
         )
-        # HA display fallback: FR shows "5 min", EN shows "5 minutes",
-        # etc. The native unit stays seconds so history-graph charts do
-        # not shatter on a unit change if PR 4 or later widens the range.
-        self._attr_name = f"Zone #{boundary_id} durée"
 
     @property
     def native_value(self) -> int | None:
@@ -557,13 +704,18 @@ class NavimowZoneLastMowedSensor(_NavimowZoneEntity):
 
     _attr_device_class = SensorDeviceClass.TIMESTAMP
     _attr_icon = "mdi:calendar-clock"
+    _name_suffix = " dernière tonte"
 
-    def __init__(self, coordinator: NavimowCoordinator, boundary_id: int) -> None:
-        super().__init__(coordinator, boundary_id)
+    def __init__(
+        self,
+        coordinator: NavimowCoordinator,
+        config_entry: ConfigEntry,
+        boundary_id: int,
+    ) -> None:
+        super().__init__(coordinator, config_entry, boundary_id)
         self._attr_unique_id = (
             f"{DOMAIN}_{coordinator.device.id}_zone_{boundary_id}_last_mowed"
         )
-        self._attr_name = f"Zone #{boundary_id} dernière tonte"
 
     @property
     def native_value(self) -> datetime | None:

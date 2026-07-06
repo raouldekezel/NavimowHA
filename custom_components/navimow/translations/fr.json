@@ -31,9 +31,32 @@
   "options": {
     "step": {
       "init": {
-        "title": "Options Navimow",
-        "description": "Configurer les options de l'intégration Navimow"
+        "title": "Zones",
+        "menu_options": {
+          "rename_zone": "Renommer une zone",
+          "forget_zone": "Oublier une zone"
+        }
+      },
+      "rename_zone": {
+        "title": "Renommer une zone",
+        "description": "Renommer une zone : laisser le nom vide pour revenir à Zone #<id>.",
+        "data": {
+          "boundary_id": "Zone",
+          "name": "Nom"
+        }
+      },
+      "forget_zone": {
+        "title": "Oublier une zone",
+        "description": "Oublier une zone : retire ses trois capteurs. Si le robot tond à nouveau cette zone, elle sera redécouverte comme Zone #<id>.",
+        "data": {
+          "boundary_id": "Zone",
+          "confirm": "Confirmer la suppression"
+        }
       }
+    },
+    "abort": {
+      "no_zones": "Aucune zone n'a encore été découverte — lancer une tonte.",
+      "forget_cancelled": "Suppression non confirmée."
     }
   },
   "entity": {
