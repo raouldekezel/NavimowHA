@@ -47,7 +47,7 @@ Each `run_finished` event payload already carries everything needed:
 
 ## 2. Scope
 
-**In scope (FEAT-04a — this design):**
+**In scope (this design):**
 
 - A pure, HA-agnostic `ZoneRegistry` class (mirrors `run_tracker.py` testability), fed by the `run_finished` events the coordinator already forwards, and **rebuilt from `history` at startup** — it holds no persisted state of its own.
 - Per-zone entity family: last-mow surface, duration, last-mowed timestamp, plus a zone-size estimate derived from the last complete pass.
@@ -55,9 +55,9 @@ Each `run_finished` event payload already carries everything needed:
 - Dynamic (lazy) entity creation as new boundaries are discovered.
 - Friendly zone naming **and** zone removal via an options flow.
 
-**Deferred (FEAT-04b — separate PR):**
+**Deferred to a later phase — separate PR:**
 
-- Per-zone posture **bounding box** (`bbox`) and the `navimow.reset_posture_extents` service. These require joining the type-1 position stream (postureX/Y, ~2 s) with the type-2 boundary stream (~30–90 s) — a distinct piece of plumbing with recorder-write implications. Split out so 4a ships clean. See §11.
+- Per-zone posture **bounding box** (`bbox`) and the `navimow.reset_posture_extents` service. These require joining the type-1 position stream (postureX/Y, ~2 s) with the type-2 boundary stream (~30–90 s) — a distinct piece of plumbing with recorder-write implications. Split out so this ships clean. See §11.
 
 **Non-goals:**
 
@@ -118,7 +118,7 @@ class ZoneRecord:
     last_cmp_max: int = 0                  # completeness of last pass, 0..10000
     size_estimate_m2: float | None = None  # LAST complete pass, precise (m²)
     last_result: str | None = None         # "completed" / "interrupted"
-    # FEAT-04b:
+    # Deferred (posture bbox):
     bbox: dict[str, float] | None = None   # {x_min,y_min,x_max,y_max}, meters
 
 
@@ -220,10 +220,10 @@ Anchored on `boundary_id` in the `unique_id`, so an app rename (which does not c
 
 | Entity | State | Class / unit | Key attributes |
 | --- | --- | --- | --- |
-| `sensor.<slug>_zone_<id>` | `ceil(last_surface_m2)` | area, m² (int) | `boundary_id`, `size_estimate` (ceil), `last_surface_precise`, `last_cmp_max`, `last_result`, `bbox` (4b) |
+| `sensor.<slug>_zone_<id>` | `ceil(last_surface_m2)` | area, m² (int) | `boundary_id`, `size_estimate` (ceil), `last_surface_precise`, `last_cmp_max`, `last_result`, `bbox` (deferred) |
 | `sensor.<slug>_zone_<id>_duree` | `last_duration_s` | duration, s | `boundary_id` |
 | `sensor.<slug>_zone_<id>_derniere_tonte` | `last_mowed_ms` → dt | timestamp | `boundary_id`, `last_result` |
-| `sensor.<slug>_zones` (aggregate) | zone **count** | — | `zone_ids`, `total_area` (ceil, Σ size estimates), per-zone summary map, `global_bbox` (4b) |
+| `sensor.<slug>_zones` (aggregate) | zone **count** | — | `zone_ids`, `total_area` (ceil, Σ size estimates), per-zone summary map, `global_bbox` (deferred) |
 
 `unique_id` scheme: `f"{DOMAIN}_{device.id}_zone_{boundary_id}"`, `..._zone_{boundary_id}_duration`, `..._zone_{boundary_id}_last_mowed`, `..._zones`.
 
@@ -272,7 +272,7 @@ The dispatch fires from `_forward_run_events`, on the loop, after `history` is u
 
 The registry keeps **no persisted state**. It is a pure projection of the existing `history` list (already stored in the run-tracker Store), rebuilt in memory at every startup via `registry.rebuild(history)`.
 
-This is the direct consequence of dropping lifetime counters: every remaining field (`last_*`, `size_estimate`) is recomputable from the runs in `history`. On the operator's install — 2–3 zones mown almost daily, `HISTORY_MAX = 50` ≈ two months — every zone is touched on nearly every run, so no zone ages out of the window and the projection is complete. There is therefore **no store-version bump, no migration, no new save path** for FEAT-04a. (Contrast the earlier draft, which persisted a per-zone aggregate — removed as redundant with `history`.)
+This is the direct consequence of dropping lifetime counters: every remaining field (`last_*`, `size_estimate`) is recomputable from the runs in `history`. On the operator's install — 2–3 zones mown almost daily, `HISTORY_MAX = 50` ≈ two months — every zone is touched on nearly every run, so no zone ages out of the window and the projection is complete. There is therefore **no store-version bump, no migration, no new save path** for FEAT-04. (Contrast the earlier draft, which persisted a per-zone aggregate — removed as redundant with `history`.)
 
 **Completeness caveat (accepted, documented, not solved).** Registry completeness equals the history window. On an install unlike the operator's — a zone mown rarely enough to fall out of the last `HISTORY_MAX` sessions — that zone is reborn *anonymous* at its next mow (its options-map name still resolves by id, but a fresh `ZoneRecord` starts from that mow), and its previously-registered HA entities sit **orphaned** in the entity registry until the rebirth re-adds them. This is a bounded, visible limitation of the projection approach, not a bug; solving it would require the very lifetime persistence the operator declined. Flagged here so it is a known trade-off rather than a surprise.
 
@@ -280,17 +280,17 @@ This is the direct consequence of dropping lifetime counters: every remaining fi
 
 ## 10. Services
 
-FEAT-04a introduces **no new service**. Zone removal is the options-flow "forget" (§7). `navimow.reset_posture_extents` ships with FEAT-04b alongside the `bbox` it resets.
+FEAT-04 introduces **no new service**. Zone removal is the options-flow "forget" (§7). `navimow.reset_posture_extents` ships with the deferred posture-bbox phase alongside the `bbox` it resets.
 
 ---
 
-## 11. FEAT-04b — posture bounding box (deferred)
+## 11. Deferred — posture bounding box
 
 The `bbox` attribute and `reset_posture_extents` need per-zone posture extents, which only the type-1 stream carries (`postureX/Y`). The two streams are independent, but the coordinator holds both live: when a type-1 position arrives, the current boundary is `self.stats["boundary"]`. So the join is:
 
 > on each accepted type-1 position, fold `(x, y)` into `registry.zones[current_boundary].bbox`.
 
-Feasible, but: it couples the registry to the ~2 s position cadence (not just run-close), so it needs throttling and a persist-on-run-close-only policy (the bbox would then no longer be a pure `history` projection — it would need its *own* small persisted state, reopening §9 for that one field only); and `current_boundary` lags the crossing by up to one type-2 packet, mis-attributing a few early positions — acceptable for a bbox but worth documenting. Splitting it out keeps 4a strictly run-close-triggered and persistence-free.
+Feasible, but: it couples the registry to the ~2 s position cadence (not just run-close), so it needs throttling and a persist-on-run-close-only policy (the bbox would then no longer be a pure `history` projection — it would need its *own* small persisted state, reopening §9 for that one field only); and `current_boundary` lags the crossing by up to one type-2 packet, mis-attributing a few early positions — acceptable for a bbox but worth documenting. Splitting it out keeps this phase strictly run-close-triggered and persistence-free.
 
 ---
 
