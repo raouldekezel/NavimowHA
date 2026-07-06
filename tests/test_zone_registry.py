@@ -190,6 +190,43 @@ def test_empty_and_all_sentinel_run_are_noops():
     assert reg.zones == {}
 
 
+def test_degenerate_payload_preserves_prior_record():
+    """HARD-10: a run whose boundary carries only degenerate segments
+    (no timing, no sub, cmp=0) must NOT wipe the previously-recorded
+    last_* values. Real tracker never emits this shape; the guard is
+    hygiene against an out-of-band caller (future replay path, etc.)."""
+    reg = ZoneRegistry()
+    # Real complete pass first — establishes baseline memory.
+    reg.ingest_run(_run([_seg(1, 0, 10_000, 10_000, 0.0, 228.0)]))
+    baseline = reg.zones[1]
+    assert baseline.last_surface_m2 == pytest.approx(228.0)
+    assert baseline.last_mowed_ms == 10_000
+    assert baseline.size_estimate_m2 == pytest.approx(228.0)
+
+    # Degenerate payload: same boundary, all fields missing.
+    degenerate_seg = {"boundary_id": 1}  # no sub, no time, no cmp_max
+    reg.ingest_run(_run([degenerate_seg], end_time=20_000))
+
+    z1 = reg.zones[1]
+    # Every previously-recorded value is untouched.
+    assert z1.last_surface_m2 == pytest.approx(228.0)
+    assert z1.last_mowed_ms == 10_000
+    assert z1.last_duration_s == 10  # 10_000 ms → 10 s
+    assert z1.last_cmp_max == 10_000
+    assert z1.last_result == "completed"
+    assert z1.size_estimate_m2 == pytest.approx(228.0)
+
+
+def test_degenerate_payload_on_empty_registry_creates_no_record():
+    """Same hygiene guard: an empty registry receiving only a
+    degenerate boundary must stay empty. Nothing to preserve, nothing
+    to materialise — the boundary is not `newly_seen`."""
+    reg = ZoneRegistry()
+    seen = reg.ingest_run(_run([{"boundary_id": 1}], end_time=20_000))
+    assert seen == []
+    assert reg.zones == {}
+
+
 def test_defensive_none_fields_skip_per_field():
     # Contract for partial segments: each field is guarded independently.
     # A segment with sub but no time contributes to surface only; a segment
