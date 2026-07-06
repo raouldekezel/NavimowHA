@@ -55,11 +55,6 @@ class ZoneRegistry:
 
         newly_seen: list[int] = []
         for bid, segs in by_boundary.items():
-            if bid not in self.zones:
-                self.zones[bid] = ZoneRecord(boundary_id=bid)
-                newly_seen.append(bid)
-            rec = self.zones[bid]
-
             # Segments missing sub_entry/sub_exit are skipped defensively; in
             # practice every tracker-emitted segment carries them. When every
             # segment lacks sub the surface collapses to 0.0 rather than None
@@ -84,6 +79,25 @@ class ZoneRegistry:
             seg_last_times = [
                 s["last_time"] for s in segs if s.get("last_time") is not None
             ]
+
+            # HARD-10: preserve prior ZoneRecord on a fully-degenerate
+            # payload. If not a single segment carries usable data
+            # (no timing, no sub delta, no cmp progress), skip the
+            # boundary — never materialise a new record, never wipe a
+            # prior one. The tracker never emits such a payload today;
+            # this hardens the pure module against an out-of-band caller.
+            has_area = any(
+                s.get("sub_exit") is not None and s.get("sub_entry") is not None
+                for s in segs
+            )
+            if not seg_last_times and not has_area and cmp_max == 0:
+                continue
+
+            if bid not in self.zones:
+                self.zones[bid] = ZoneRecord(boundary_id=bid)
+                newly_seen.append(bid)
+            rec = self.zones[bid]
+
             rec.last_mowed_ms = max(seg_last_times) if seg_last_times else None
             rec.last_surface_m2 = round(surface, 2)
             rec.last_duration_s = round(duration_ms / 1000)
