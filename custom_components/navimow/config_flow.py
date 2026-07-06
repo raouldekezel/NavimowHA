@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import copy
 import logging
+import math
 from typing import Any
 
+import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
@@ -20,6 +23,7 @@ from .const import (
     MQTT_PASSWORD,
     MQTT_PORT,
     MQTT_USERNAME,
+    OPTIONS_KEY_ZONES,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -156,20 +160,148 @@ class NavimowOAuth2FlowHandler(
 
 
 class NavimowOptionsFlowHandler(config_entries.OptionsFlow):
-    """Handle Navimow options."""
+    """Handle Navimow options.
+
+    FEAT-04 PR 4 — menu-driven zone naming and removal. The zone
+    catalog itself lives in ``config_entry.options[OPTIONS_KEY_ZONES]``,
+    shaped ``{"<boundary_id>": {"name": "Prunier"}}`` — JSON forces the
+    id to a string. Renaming a zone updates its entry; forgetting a
+    zone drops the entry AND fires ``SIGNAL_ZONE_FORGOTTEN`` so the
+    sensor platform can remove the three per-zone entities.
+
+    The list of discoverable zones comes from the live coordinator's
+    ``zone_registry`` — no separate persisted directory of zones.
+    """
 
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        """Initialize options flow."""
         self._config_entry = config_entry
+
+    def _known_boundary_ids(self) -> list[int]:
+        """List boundary ids from every coordinator of this entry.
+
+        Falls back to the ids stored in options (previously-named zones
+        that may momentarily not appear in a fresh registry) so a
+        rename remains possible even if the runtime state is
+        transiently empty.
+        """
+        boundary_ids: set[int] = set()
+        try:
+            data = self.hass.data[DOMAIN][self._config_entry.entry_id]
+            for coord in data["coordinators"].values():
+                boundary_ids.update(coord.zone_registry.zones.keys())
+        except (KeyError, AttributeError):
+            pass
+        for str_id in self._config_entry.options.get(OPTIONS_KEY_ZONES, {}):
+            try:
+                boundary_ids.add(int(str_id))
+            except (TypeError, ValueError):
+                continue
+        return sorted(boundary_ids)
+
+    def _zone_label(self, boundary_id: int) -> str:
+        """User-facing label in the selector: current name (if any) +
+        boundary id + last-mowed surface for recognition.
+
+        Surface is presented ``math.ceil``'d for parity with the
+        per-zone sensor state (D-size). Round-and-ceil disagree by
+        1 m² on non-integers — the picker would read ``227`` while
+        the entity shows ``228`` on the same zone otherwise.
+        """
+        zones_opt = self._config_entry.options.get(OPTIONS_KEY_ZONES, {})
+        name = zones_opt.get(str(boundary_id), {}).get("name")
+        try:
+            data = self.hass.data[DOMAIN][self._config_entry.entry_id]
+            for coord in data["coordinators"].values():
+                rec = coord.zone_registry.zones.get(boundary_id)
+                if rec is not None and rec.last_surface_m2 is not None:
+                    surface_int = math.ceil(rec.last_surface_m2)
+                    if name:
+                        return f"{name} — #{boundary_id} ({surface_int} m²)"
+                    return f"#{boundary_id} ({surface_int} m²)"
+        except (KeyError, AttributeError):
+            pass
+        if name:
+            return f"{name} — #{boundary_id}"
+        return f"#{boundary_id}"
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Manage the options."""
-        if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
-
-        return self.async_show_form(
+        """Top-level menu — rename or forget."""
+        return self.async_show_menu(
             step_id="init",
-            data_schema=None,
+            menu_options=["rename_zone", "forget_zone"],
         )
+
+    async def async_step_rename_zone(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Zone rename step: pick a boundary + name."""
+        boundary_ids = self._known_boundary_ids()
+        if not boundary_ids:
+            return self.async_abort(reason="no_zones")
+
+        if user_input is not None:
+            new_options = copy.deepcopy(dict(self._config_entry.options))
+            zones = new_options.setdefault(OPTIONS_KEY_ZONES, {})
+            str_id = user_input["boundary_id"]
+            name = user_input["name"].strip()
+            if name:
+                zones[str_id] = {"name": name}
+            else:
+                # Empty name clears the mapping — sensor falls back to `#<id>`.
+                zones.pop(str_id, None)
+            return self.async_create_entry(title="", data=new_options)
+
+        choices = {str(bid): self._zone_label(bid) for bid in boundary_ids}
+        schema = vol.Schema(
+            {
+                vol.Required("boundary_id"): vol.In(choices),
+                vol.Required("name", default=""): str,
+            }
+        )
+        return self.async_show_form(step_id="rename_zone", data_schema=schema)
+
+    async def async_step_forget_zone(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Zone forget step: pick a boundary + confirm."""
+        boundary_ids = self._known_boundary_ids()
+        if not boundary_ids:
+            return self.async_abort(reason="no_zones")
+
+        if user_input is not None:
+            if not user_input.get("confirm"):
+                return self.async_abort(reason="forget_cancelled")
+            new_options = copy.deepcopy(dict(self._config_entry.options))
+            str_id = user_input["boundary_id"]
+            zones = new_options.get(OPTIONS_KEY_ZONES, {})
+            zones.pop(str_id, None)
+            new_options[OPTIONS_KEY_ZONES] = zones
+            # Fire the forget signal so the sensor platform can remove
+            # the three per-zone entities. Deferred import avoids a
+            # circular import at module load.
+            from homeassistant.helpers.dispatcher import async_dispatcher_send
+
+            from .const import SIGNAL_ZONE_FORGOTTEN
+
+            try:
+                data = self.hass.data[DOMAIN][self._config_entry.entry_id]
+                for device_id in data["coordinators"]:
+                    async_dispatcher_send(
+                        self.hass,
+                        f"{SIGNAL_ZONE_FORGOTTEN}_{device_id}",
+                        int(str_id),
+                    )
+            except (KeyError, AttributeError, ValueError):
+                pass
+            return self.async_create_entry(title="", data=new_options)
+
+        choices = {str(bid): self._zone_label(bid) for bid in boundary_ids}
+        schema = vol.Schema(
+            {
+                vol.Required("boundary_id"): vol.In(choices),
+                vol.Required("confirm", default=False): bool,
+            }
+        )
+        return self.async_show_form(step_id="forget_zone", data_schema=schema)

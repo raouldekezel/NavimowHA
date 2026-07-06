@@ -79,6 +79,20 @@ SIGNAL_POSITION_UPDATE: Final = "navimow_position_update"
 # dispatch with no listener is a documented no-op.
 SIGNAL_ZONE_DISCOVERED: Final = "navimow_zone_discovered"
 
+# FEAT-04 PR 4 — options-flow signals. `SIGNAL_ZONE_NAMES_UPDATED` fires when
+# the operator changes `options["zones"]`; per-zone entities read the new
+# name and call `async_write_ha_state`. `SIGNAL_ZONE_FORGOTTEN` fires when the
+# operator forgets a zone; the sensor platform removes the three entities
+# from the entity registry and the coordinator drops the record.
+SIGNAL_ZONE_NAMES_UPDATED: Final = "navimow_zone_names_updated"
+SIGNAL_ZONE_FORGOTTEN: Final = "navimow_zone_forgotten"
+
+# FEAT-04 PR 4 — key of the options subdict holding the operator's zone
+# renames. Shape: `{"1": {"name": "Prunier"}, "3": {"name": "Figuier"}}`.
+# JSON serialisation forces the boundary id to a string; sensors coerce back
+# to int when reading their own record.
+OPTIONS_KEY_ZONES: Final = "zones"
+
 # `vehicleState` value that means "docked and charging". The /state MQTT topic
 # reports `isDocked` in both idle-on-dock and charging cases; only the /location
 # `vehicleState` field distinguishes the two.

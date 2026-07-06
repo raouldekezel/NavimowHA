@@ -32,9 +32,32 @@
   "options": {
     "step": {
       "init": {
-        "title": "Navimow Options",
-        "description": "Configure Navimow integration options"
+        "title": "Zones",
+        "menu_options": {
+          "rename_zone": "Rename a zone",
+          "forget_zone": "Forget a zone"
+        }
+      },
+      "rename_zone": {
+        "title": "Rename a zone",
+        "description": "Rename a zone: leave the name blank to reset to Zone #<id>.",
+        "data": {
+          "boundary_id": "Zone",
+          "name": "Name"
+        }
+      },
+      "forget_zone": {
+        "title": "Forget a zone",
+        "description": "Forget a zone: removes its three sensors. If the robot mows this zone again, it will be re-discovered as Zone #<id>.",
+        "data": {
+          "boundary_id": "Zone",
+          "confirm": "Confirm removal"
+        }
       }
+    },
+    "abort": {
+      "no_zones": "No zones have been discovered yet — run a mow first.",
+      "forget_cancelled": "Removal was not confirmed."
     }
   },
   "entity": {
