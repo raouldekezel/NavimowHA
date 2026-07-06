@@ -33,6 +33,7 @@ from .const import (
     MQTT_STALE_SECONDS,
     POSITION_THROTTLE_SECONDS,
     SIGNAL_POSITION_UPDATE,
+    SIGNAL_ZONE_DISCOVERED,
     STALE_DROP_STREAK_TO_WARN,
     STORE_VERSION,
     TRACKER_HEARTBEAT_SECONDS,
@@ -44,6 +45,7 @@ from .run_tracker import EVENT_RUN_STARTED as _TRACKER_EVENT_RUN_STARTED
 from .run_tracker import STATE_RUNNING as _TRACKER_STATE_RUNNING
 from .run_tracker import Event as RunEvent
 from .run_tracker import RunTracker
+from .zone_registry import ZoneRegistry
 
 # Map internal tracker Event.kind → HA event bus event name. Keeps the
 # HA-facing surface a pure translation, so a future rename on either
@@ -141,6 +143,10 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Most-recently-closed run's `run_finished` payload; drives the
         # `last_run_*` sensors (started/duration/result).
         self.last_finished_run: dict[str, Any] | None = None
+        # FEAT-04 PR 2: pure per-boundary registry, fed by `_forward_run_events`
+        # on `run_finished` and rebuilt from `history` on restore. Holds no
+        # persisted state of its own — the projection is complete every boot.
+        self.zone_registry = ZoneRegistry()
         # `homeassistant.helpers.storage.Store` instance, created on
         # `async_setup` once the device id is known.
         self._store: Store | None = None
@@ -188,6 +194,11 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # dropped).
         self.history = list(history[-HISTORY_MAX:])
         self.last_finished_run = payload.get("last_finished_run")
+        # FEAT-04 PR 2: project the restored history onto the zone registry.
+        # The last complete pass per zone wins `size_estimate`, so every
+        # value the sensor platform (PR 3) will read is already correct
+        # before the first live packet arrives.
+        self.zone_registry.rebuild(self.history)
 
     def _build_store_payload(self) -> dict[str, Any]:
         # `snapshot()` already deep-copies `current_run` for us; the
@@ -398,6 +409,17 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     # FIFO trim — keep the most recent HISTORY_MAX entries.
                     self.history = self.history[-HISTORY_MAX:]
                 self.last_finished_run = entry
+                # FEAT-04 PR 2: fold this run into the zone registry and
+                # announce first-time boundaries so the sensor platform
+                # (PR 3) can lazy-add its per-zone entities. No listener
+                # exists yet in PR 2 — the dispatch is a documented no-op
+                # until then.
+                for boundary_id in self.zone_registry.ingest_run(entry):
+                    async_dispatcher_send(
+                        self.hass,
+                        f"{SIGNAL_ZONE_DISCOVERED}_{self.device.id}",
+                        boundary_id,
+                    )
         self._schedule_store_save()
 
     def _device_status_to_state(self, status: DeviceStatus) -> DeviceStateMessage:

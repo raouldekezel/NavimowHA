@@ -72,6 +72,13 @@ POSITION_THROTTLE_SECONDS: Final = 5
 # with the device_id).
 SIGNAL_POSITION_UPDATE: Final = "navimow_position_update"
 
+# FEAT-04 dispatcher signal fired the first time a `boundary_id` is seen in a
+# closed run. The sensor platform (PR 3) subscribes to
+# `f"{SIGNAL_ZONE_DISCOVERED}_{device_id}"` and lazy-adds the per-zone entity
+# family. PR 2 emits the signal even though no listener exists yet — a
+# dispatch with no listener is a documented no-op.
+SIGNAL_ZONE_DISCOVERED: Final = "navimow_zone_discovered"
+
 # `vehicleState` value that means "docked and charging". The /state MQTT topic
 # reports `isDocked` in both idle-on-dock and charging cases; only the /location
 # `vehicleState` field distinguishes the two.
