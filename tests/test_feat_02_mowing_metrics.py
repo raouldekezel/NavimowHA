@@ -106,6 +106,11 @@ def _make_coordinator():
 
     coordinator.last_finished_run = None
 
+    # FEAT-04 PR 2: fed by _forward_run_events on run_finished.
+    from custom_components.navimow.zone_registry import ZoneRegistry
+
+    coordinator.zone_registry = ZoneRegistry()
+
     coordinator._store = None
 
     coordinator._last_store_save_monotonic = 0.0

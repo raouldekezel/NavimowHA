@@ -259,6 +259,11 @@ def _make_coordinator_with_history():
     coord.run_tracker = RunTracker()
     coord.history = []
     coord.last_finished_run = None
+    # FEAT-04 PR 2: coordinator now owns a zone_registry; the tracker path
+    # feeds it on run_finished. Not exercised by this file's assertions.
+    from custom_components.navimow.zone_registry import ZoneRegistry
+
+    coord.zone_registry = ZoneRegistry()
     coord._store = None
     coord._last_store_save_monotonic = 0.0
     coord._build_data = MagicMock(return_value={})
