@@ -27,6 +27,7 @@ from custom_components.navimow.sensor import (
     NavimowZoneSurfaceSensor,
     _build_zone_trio,
     _wire_zone_discovery,
+    async_setup_entry,
 )
 from custom_components.navimow.zone_registry import ZoneRecord, ZoneRegistry
 
@@ -296,3 +297,123 @@ def test_wire_zone_discovery_signal_name_uses_device_id() -> None:
 
     signal = connect.call_args.args[1]
     assert signal == f"{SIGNAL_ZONE_DISCOVERED}_{coord.device.id}"
+
+
+# --------------------------------------------------------------------- #
+# 4. End-to-end async_setup_entry (Fable review of PR 3)                #
+# --------------------------------------------------------------------- #
+
+
+async def test_async_setup_entry_eager_creates_aggregate_and_trio_per_zone() -> None:
+    """End-to-end: with the registry pre-populated (as it is after PR 2's
+    restore), setup adds the static aggregate plus a per-zone trio for
+    every restored boundary — no dispatcher signal fires during setup.
+    Closes the one untested branch flagged in the review."""
+    coord = _make_coordinator(
+        {
+            1: _rec(1, surface=227.82, size_estimate=227.82),
+            3: _rec(3, surface=123.54, size_estimate=123.54),
+        }
+    )
+    device = coord.device
+
+    hass = MagicMock()
+    hass.data = {
+        DOMAIN: {
+            "test-entry": {"devices": [device], "coordinators": {device.id: coord}}
+        }
+    }
+
+    config_entry = MagicMock()
+    config_entry.entry_id = "test-entry"
+
+    async_add_entities = MagicMock()
+
+    with patch(
+        "custom_components.navimow.sensor.async_dispatcher_connect",
+        return_value=lambda: None,
+    ) as connect:
+        await async_setup_entry(hass, config_entry, async_add_entities)
+
+    # Exactly one async_add_entities call at setup time.
+    async_add_entities.assert_called_once()
+    added = list(async_add_entities.call_args.args[0])
+
+    # Aggregate is present exactly once — the static, translation-keyed entity.
+    aggregates = [e for e in added if isinstance(e, NavimowZonesAggregateSensor)]
+    assert len(aggregates) == 1
+
+    # A trio (surface + duration + last_mowed) for each pre-restored boundary.
+    zone_entities = [
+        e
+        for e in added
+        if isinstance(
+            e,
+            (
+                NavimowZoneSurfaceSensor,
+                NavimowZoneDurationSensor,
+                NavimowZoneLastMowedSensor,
+            ),
+        )
+    ]
+    assert len(zone_entities) == 6  # 2 boundaries × 3 sensors
+    assert {e._boundary_id for e in zone_entities} == {1, 3}
+    # And each boundary got exactly one of each type.
+    for cls in (
+        NavimowZoneSurfaceSensor,
+        NavimowZoneDurationSensor,
+        NavimowZoneLastMowedSensor,
+    ):
+        assert {e._boundary_id for e in added if isinstance(e, cls)} == {1, 3}
+
+    # No dispatcher signal fires during setup — structurally impossible here:
+    # `sensor.py` only imports `async_dispatcher_connect`, not `_send`, so
+    # PR 2's "restore-does-not-dispatch" contract is respected end-to-end.
+    # The runtime listener is registered exactly once, unsub piped through
+    # config_entry.async_on_unload.
+    assert connect.call_count == 1
+    config_entry.async_on_unload.assert_called_once()
+
+
+async def test_async_setup_entry_with_no_restored_zones_still_adds_aggregate() -> None:
+    """Empty registry (fresh install, no history yet) → aggregate ships
+    anyway, no per-zone entities, listener connected for future
+    discoveries."""
+    coord = _make_coordinator({})  # empty registry
+    device = coord.device
+
+    hass = MagicMock()
+    hass.data = {
+        DOMAIN: {
+            "test-entry": {"devices": [device], "coordinators": {device.id: coord}}
+        }
+    }
+
+    config_entry = MagicMock()
+    config_entry.entry_id = "test-entry"
+
+    async_add_entities = MagicMock()
+
+    with patch(
+        "custom_components.navimow.sensor.async_dispatcher_connect",
+        return_value=lambda: None,
+    ) as connect:
+        await async_setup_entry(hass, config_entry, async_add_entities)
+
+    added = list(async_add_entities.call_args.args[0])
+    aggregates = [e for e in added if isinstance(e, NavimowZonesAggregateSensor)]
+    zone_entities = [
+        e
+        for e in added
+        if isinstance(
+            e,
+            (
+                NavimowZoneSurfaceSensor,
+                NavimowZoneDurationSensor,
+                NavimowZoneLastMowedSensor,
+            ),
+        )
+    ]
+    assert len(aggregates) == 1
+    assert zone_entities == []
+    assert connect.call_count == 1  # ready to receive first runtime discovery
