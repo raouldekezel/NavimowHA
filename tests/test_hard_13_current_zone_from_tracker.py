@@ -15,7 +15,11 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from custom_components.navimow.const import OPTIONS_KEY_ZONES
-from custom_components.navimow.run_tracker import STATE_IDLE, STATE_RUNNING
+from custom_components.navimow.run_tracker import (
+    STATE_IDLE,
+    STATE_PAUSED_DOCKED,
+    STATE_RUNNING,
+)
 from custom_components.navimow.sensor import (
     SENSOR_DESCRIPTIONS,
     _current_boundary,
@@ -95,6 +99,22 @@ def test_current_boundary_prefers_last_segment_on_interleaved_run() -> None:
         stats=None,
     )
     assert _current_boundary(coord) == 3
+
+
+def test_current_boundary_reads_from_tracker_when_paused_docked() -> None:
+    """Fable review pin: the fix also covers a restart during an
+    intra-run recharge pause (``STATE_PAUSED_DOCKED``), because
+    ``_current_run_or_none`` returns the run for both ``RUNNING`` and
+    ``PAUSED_DOCKED``. Explicit test so a future change to that
+    predicate can't silently regress the recharge-pause path."""
+    coord = _make_coord(
+        tracker_state=STATE_PAUSED_DOCKED,
+        tracker_zones=[{"boundary_id": 1}],
+        stats=None,
+        options={OPTIONS_KEY_ZONES: {"1": {"name": "Prunier"}}},
+    )
+    assert _current_boundary(coord) == 1
+    assert _current_zone_display(coord) == "Prunier"
 
 
 # --------------------------------------------------------------------- #
