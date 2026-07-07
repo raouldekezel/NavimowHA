@@ -40,7 +40,7 @@ from custom_components.navimow.run_tracker import (
     VS_DOCKED_IDLE,
     VS_DOCKED_UNPOWERED,
     VS_MOWING,
-    VS_PAUSED,
+    VS_MAPPING,
     VS_RETURNING,
     RunTracker,
 )
@@ -178,14 +178,21 @@ def test_dock_arrival_on_vs_3_completes() -> None:
 # --------------------------------------------------------------------- #
 
 
-def test_user_pause_holds_even_at_mp_99() -> None:
-    """`vs = 6` is a deliberate exclusion: user explicitly paused. Even
-    at `mp = 99` the run must not auto-close — the user is in control
-    and may resume. The run parks in PAUSED_DOCKED with no close event.
+def test_mapping_holds_even_at_mp_99() -> None:
+    """`vs = 6` is a deliberate exclusion: firmware post-mow map
+    consolidation (isMapping). Even at `mp = 99` the run must not
+    auto-close — the mapping phase is at-dock and immobile, closing
+    through it would race the consolidation. The run parks in
+    PAUSED_DOCKED with no close event.
+
+    (Historical note: the earlier test/label named vs = 6 an "explicit
+    user pause" — empirically wrong per the 2026-07-07 diag. The
+    behavioural invariant "vs = 6 holds the run" is unchanged; only
+    the reason is corrected.)
     """
     tracker = RunTracker()
     _open_at(tracker, mp=99)
-    events = tracker.process_vehicle_state(VS_PAUSED)
+    events = tracker.process_vehicle_state(VS_MAPPING)
     assert [e for e in events if e.kind == EVENT_RUN_FINISHED] == []
     assert tracker.state == STATE_PAUSED_DOCKED
 
@@ -272,15 +279,16 @@ def test_mp_99_while_returning_does_not_close() -> None:
 
 
 def test_fast_path_preempts_sustained_timer_when_user_unpauses() -> None:
-    """Sequence: mp reaches 99, user explicitly pauses (vs=6, hold),
-    then user resumes / dock is reached with vs=1. The vs=6 → vs=1
-    transition itself qualifies for the BUG-09 fast path — no need
-    to wait for the sustained-60 s timer. Documents the composition
-    of the two rules (user-pause hold + fast completion).
+    """Sequence: mp reaches 99, firmware enters post-mow mapping
+    (vs=6, hold), then transitions to vs=1 once consolidation
+    finishes. The vs=6 → vs=1 transition itself qualifies for the
+    BUG-09 fast path — no need to wait for the sustained-60 s timer.
+    Documents the composition of the two rules (isMapping hold + fast
+    completion).
     """
     tracker = RunTracker()
     _open_at(tracker, mp=99)
-    tracker.process_vehicle_state(VS_PAUSED)  # hold semantics
+    tracker.process_vehicle_state(VS_MAPPING)  # hold semantics
     assert tracker.state == STATE_PAUSED_DOCKED
 
     events = tracker.process_vehicle_state(VS_DOCKED_IDLE)
@@ -304,7 +312,7 @@ def test_sustained_timer_labels_completed_via_restore_race() -> None:
     """
     source = RunTracker()
     _open_at(source, mp=99)
-    source.process_vehicle_state(VS_PAUSED)
+    source.process_vehicle_state(VS_MAPPING)
     snap = source.snapshot()
     # Simulate a vs=1 landing between the last save and the restore
     # (the fast path never got called live because we crashed just
