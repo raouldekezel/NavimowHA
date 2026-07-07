@@ -46,6 +46,26 @@ def _current_run_or_none(c: NavimowCoordinator) -> dict[str, Any] | None:
     return None
 
 
+def _current_zone_display(c: NavimowCoordinator) -> str | None:
+    """HARD-11: resolve the current boundary's operator-chosen name.
+
+    Reads ``options["zones"]`` off the config entry stashed on the
+    coordinator; falls back to the short ``#<id>`` (not the verbose
+    ``Zone #<id>`` used by the per-zone entities) when no rename
+    exists — the sensor state is a live display, not an entity title.
+    """
+    boundary_id = (c.stats or {}).get("boundary")
+    if not boundary_id:
+        return None
+    entry = getattr(c, "config_entry", None)
+    if entry is not None:
+        zones_opt = entry.options.get(OPTIONS_KEY_ZONES, {}) or {}
+        name = (zones_opt.get(str(boundary_id)) or {}).get("name")
+        if name:
+            return name
+    return f"#{boundary_id}"
+
+
 def _run_state_display(c: NavimowCoordinator) -> str:
     """Map tracker (state, vehicle_state) to the display enum."""
     ts = c.run_tracker.state
@@ -142,7 +162,15 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
         native_unit_of_measurement=UnitOfArea.SQUARE_METERS,
         state_class=SensorStateClass.TOTAL_INCREASING,
         icon="mdi:grass",
-        value_fn=lambda c: (c.stats or {}).get("area_week"),
+        # HARD-11: ceil the cumulative weekly surface for parity with the
+        # per-zone / aggregate surfaces (FEAT-04 §6 D-size). `None`
+        # passes through unchanged so HA renders `unknown` at first
+        # boot when no type-2 has arrived yet.
+        value_fn=lambda c: (
+            math.ceil(v)
+            if (v := (c.stats or {}).get("area_week")) is not None
+            else None
+        ),
         # HARD-02: cumulative weekly counter must survive an HA restart.
         # The cloud stops publishing /location type-2 while the robot is
         # docked (FEAT-02 diag), so without RestoreSensor the value would
@@ -162,9 +190,13 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
         key="current_zone",
         translation_key="current_zone",
         icon="mdi:map-marker-radius",
-        value_fn=lambda c: (
-            f"#{b}" if (b := (c.stats or {}).get("boundary")) else None
-        ),
+        # HARD-11: resolve the operator-chosen name via the same helper
+        # the per-zone family uses. Falls back to `#<id>` when no name
+        # is set for this boundary (transit corridor, freshly-discovered
+        # zone). `config_entry` is stashed on the coordinator at setup
+        # time (see `async_setup_entry`); when missing (test seams that
+        # skip that plumbing) we drop back to the pre-HARD-11 raw form.
+        value_fn=lambda c: _current_zone_display(c),
         attrs_fn=lambda c: (
             {"boundary_id": c.stats.get("boundary")} if c.stats else None
         ),
@@ -302,6 +334,9 @@ async def async_setup_entry(
     entities: list[SensorEntity] = []
     for device in devices:
         coordinator = coordinators[device.id]
+        # HARD-11: stash the config entry so description-based value_fn's
+        # can reach `options["zones"]` (current_zone name resolution).
+        coordinator.config_entry = config_entry
         for description in SENSOR_DESCRIPTIONS:
             entities.append(
                 NavimowSensor(
