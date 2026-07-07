@@ -46,6 +46,29 @@ def _current_run_or_none(c: NavimowCoordinator) -> dict[str, Any] | None:
     return None
 
 
+def _current_boundary(c: NavimowCoordinator) -> int | None:
+    """HARD-13: pick the current boundary from the tracker first, from
+    ``stats`` as a fallback.
+
+    ``run_tracker`` state is restored from the Store at ``async_setup``,
+    so the current boundary survives an HA restart mid-mow. ``stats``
+    is not persisted (FEAT-02 design), so a restart would leave
+    ``current_zone`` on ``unknown`` until the next accepted type-2
+    packet — 30-90 s away at best, hours if the robot is idle.
+
+    The tracker filters BUG-06's ``boundary=0`` sentinel out of
+    ``current_run.zones``, so no risk of the sentinel leaking through
+    the tracker branch; the stats fallback still relies on the falsy
+    filter downstream.
+    """
+    run = _current_run_or_none(c)
+    if run is not None:
+        zones = run.get("zones")
+        if zones:
+            return zones[-1].get("boundary_id")
+    return (c.stats or {}).get("boundary")
+
+
 def _current_zone_display(c: NavimowCoordinator) -> str | None:
     """HARD-11: resolve the current boundary's operator-chosen name.
 
@@ -53,8 +76,11 @@ def _current_zone_display(c: NavimowCoordinator) -> str | None:
     coordinator; falls back to the short ``#<id>`` (not the verbose
     ``Zone #<id>`` used by the per-zone entities) when no rename
     exists — the sensor state is a live display, not an entity title.
+
+    HARD-13: the boundary comes from the tracker (survives restart)
+    with a stats fallback.
     """
-    boundary_id = (c.stats or {}).get("boundary")
+    boundary_id = _current_boundary(c)
     if not boundary_id:
         return None
     entry = getattr(c, "config_entry", None)
@@ -197,8 +223,11 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
         # time (see `async_setup_entry`); when missing (test seams that
         # skip that plumbing) we drop back to the pre-HARD-11 raw form.
         value_fn=lambda c: _current_zone_display(c),
+        # HARD-13: same fallback as value_fn — but `is not None` (not
+        # truthy) so BUG-06's session-init sentinel `boundary=0` still
+        # surfaces here for developer-tools debugging.
         attrs_fn=lambda c: (
-            {"boundary_id": c.stats.get("boundary")} if c.stats else None
+            {"boundary_id": b} if (b := _current_boundary(c)) is not None else None
         ),
     ),
     # === FEAT-05 (c) — tracker-driven run/zone sensors ===
