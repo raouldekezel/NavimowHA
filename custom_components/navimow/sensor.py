@@ -85,8 +85,9 @@ def _current_zone_display(c: NavimowCoordinator) -> str | None:
     ``Zone #<id>`` used by the per-zone entities) when no rename
     exists — the sensor state is a live display, not an entity title.
 
-    HARD-13: the boundary comes from the tracker (survives restart)
-    with a stats fallback.
+    BUG-11 / BUG-12: the boundary comes from the tracker alone
+    (survives restart, clears at end-of-run). See ``_current_boundary``
+    for the source-of-truth rationale.
     """
     boundary_id = _current_boundary(c)
     if not boundary_id:
