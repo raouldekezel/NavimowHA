@@ -118,30 +118,33 @@ def test_current_boundary_reads_from_tracker_when_paused_docked() -> None:
 
 
 # --------------------------------------------------------------------- #
-# 2. Legacy path: tracker idle, stats live                              #
+# 2. BUG-12 — stats fallback retired                                    #
 # --------------------------------------------------------------------- #
 
 
-def test_current_boundary_falls_back_to_stats_when_tracker_idle() -> None:
-    """No open run → sensor reads live type-2 stats. Matches the
-    pre-HARD-13 behaviour when the tracker hasn't yet moved to
-    RUNNING (edge case at the very start of a session, before the
-    first accepted type-2)."""
+def test_current_boundary_returns_none_when_tracker_idle() -> None:
+    """BUG-12: no stats fallback. Tracker idle → ``None`` even if
+    ``coordinator.stats`` still carries a boundary from the last run
+    (frozen since the cloud stops emitting type-2 at dock — the
+    fallback would render the last-mowed zone forever)."""
     coord = _make_coord(
         tracker_state=STATE_IDLE,
         tracker_zones=None,
         stats={"boundary": 3},
     )
-    assert _current_boundary(coord) == 3
+    assert _current_boundary(coord) is None
 
 
-def test_current_boundary_falls_back_to_stats_when_run_has_no_zones() -> None:
+def test_current_boundary_returns_none_when_run_has_no_zones() -> None:
+    """Zero-segment open run (edge: tracker moved to RUNNING but no
+    valid type-2 recorded yet, or all packets rejected by guards) →
+    ``None``."""
     coord = _make_coord(
         tracker_state=STATE_RUNNING,
-        tracker_zones=[],  # open run but zero segments yet
+        tracker_zones=[],
         stats={"boundary": 3},
     )
-    assert _current_boundary(coord) == 3
+    assert _current_boundary(coord) is None
 
 
 def test_current_boundary_returns_none_when_nothing_known() -> None:
@@ -154,24 +157,19 @@ def test_current_boundary_returns_none_when_nothing_known() -> None:
 # --------------------------------------------------------------------- #
 
 
-def test_bug_06_sentinel_still_filtered_by_display() -> None:
-    """boundary=0 (session-init) still collapses to ``None`` on
-    ``value_fn`` — the raw sentinel does not leak to the UI."""
+def test_bug_06_sentinel_never_leaks_via_tracker() -> None:
+    """The tracker's own ``_update_zone`` skips ``boundary=0``, so
+    ``current_run.zones`` never contains the sentinel. BUG-12 dropping
+    the stats fallback closes the only other leak path — the sensor is
+    now guaranteed sentinel-free."""
     coord = _make_coord(
         tracker_state=STATE_IDLE,
         tracker_zones=None,
         stats={"boundary": 0},
     )
     assert _current_zone_display(coord) is None
-
-
-def test_bug_06_sentinel_still_exposed_in_attrs_for_debug() -> None:
-    """The raw ``0`` still shows in attributes so the sentinel is
-    visible in developer-tools even after HARD-13."""
-    coord = _make_coord(
-        tracker_state=STATE_IDLE,
-        tracker_zones=None,
-        stats={"boundary": 0},
-    )
+    # No stats path → attrs also ``None`` (no ``boundary_id`` at all).
+    # Debugging BUG-06 sentinel behaviour now goes through log
+    # inspection on the tracker's DEBUG line, not entity attributes.
     attrs = _desc("current_zone").attrs_fn(coord)
-    assert attrs == {"boundary_id": 0}
+    assert attrs is None

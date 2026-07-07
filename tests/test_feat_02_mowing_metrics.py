@@ -204,15 +204,21 @@ def test_current_zone_sensor_renders_hash_prefixed_when_unmapped() -> None:
     """Boundary id is not sequential (1 = zone 1, 2 = tunnel/transit, 3 =
     zone 2 on the operator's install). Rendered as ``#<id>`` when no
     rename is set on the boundary — HARD-11 pins that fallback path.
-    Renaming to a friendly name is exercised in
-    ``test_hard_11_current_zone_and_ceil_weekly.py``.
+
+    BUG-12: source is the tracker (not ``coordinator.stats``); the
+    stats fallback was retired.
     """
+    from custom_components.navimow.run_tracker import STATE_RUNNING
+
     desc = _find_sensor("current_zone")
     coordinator = MagicMock()
-    coordinator.stats = {"boundary": 3}
-    # Explicitly clear the stashed config entry — MagicMock would otherwise
-    # yield a truthy fake for `getattr(c, "config_entry", None)`, and the
-    # helper would follow its options path.
+    coordinator.run_tracker = MagicMock()
+    coordinator.run_tracker.state = STATE_RUNNING
+    coordinator.run_tracker.current_run = {"zones": [{"boundary_id": 3}]}
+    coordinator.stats = None
+    # Clear the stashed config entry — MagicMock would otherwise yield a
+    # truthy fake for `getattr(c, "config_entry", None)`, and the helper
+    # would follow its options path.
     del coordinator.config_entry
 
     assert desc.value_fn(coordinator) == "#3"
