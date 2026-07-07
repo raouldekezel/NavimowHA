@@ -2,13 +2,17 @@
 
 Extends FEAT-01's parser and coordinator to handle mowing stats
 (mowingPercentage, currentMowProgress, subtotalArea, mowingWeekArea,
-currentMowBoundary). Adds three sensors: progression, weekly_area,
-current_zone.
+currentMowBoundary). Adds two sensors: weekly_area and current_zone.
+(``progression`` was retired by HARD-14 — the raw always-on sensor
+was superseded by the tracker-driven ``run_progress`` /
+``zone_progress``.)
 """
 
 from __future__ import annotations
 
 from unittest.mock import MagicMock
+
+from custom_components.navimow.sensor import SENSOR_DESCRIPTIONS
 
 # --------------------------------------------------------------------- #
 # 1. parser                                                             #
@@ -180,8 +184,7 @@ def test_progression_sensor_retired_by_hard_14() -> None:
     ``mowing_percentage`` / ``current_mow_progress`` / ``area_session``
     / ``action`` for the tracker; only the entity is gone.
     """
-    with __import__("pytest").raises(StopIteration):
-        _find_sensor("progression")
+    assert "progression" not in {d.key for d in SENSOR_DESCRIPTIONS}
 
 
 def test_weekly_area_sensor_reads_area_week() -> None:
