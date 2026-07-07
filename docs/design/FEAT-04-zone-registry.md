@@ -112,7 +112,7 @@ COMPLETE_PASS_CMP = 9900
 @dataclass
 class ZoneRecord:
     boundary_id: int
-    last_mowed_ms: int | None = None      # this zone's own last exit time
+    last_mowed_ms: int | None = None      # start of this zone's last visit (HARD-12)
     last_surface_m2: float | None = None  # Σ(sub_exit − sub_entry), precise
     last_duration_s: int | None = None    # in-zone mowing time, recharge incl.
     last_cmp_max: int = 0                  # completeness of last pass, 0..10000
@@ -193,14 +193,17 @@ def ingest_run(self, rf: dict) -> list[int]:
         )
         cmp_max = max((s.get("cmp_max") or 0) for s in segs)
 
-        # Fable correction: "last mowed" is when the robot last cut HERE,
-        # i.e. this boundary's own last exit — NOT the run's end_time. On
-        # a 1 → 3 run, using end_time would stamp zone 1 with the moment
-        # zone 3 finished (30–60 min late, semantically wrong).
-        seg_last_times = [
-            s["last_time"] for s in segs if s.get("last_time") is not None
+        # HARD-12: "last mowed" = **start** of this zone's last visit
+        # (min(first_time)), not the exit (max(last_time)). Aligns with
+        # `last_run_started` / `current_run_started` which are also
+        # start times. Fable's original correction (against using the
+        # run's `end_time` — which on a 1→3 run would stamp zone 1 with
+        # the moment zone 3 finished) still applies: first_time is
+        # zone-local too, so `last_mowed_ms != end_time` is preserved.
+        seg_first_times = [
+            s["first_time"] for s in segs if s.get("first_time") is not None
         ]
-        rec.last_mowed_ms = max(seg_last_times) if seg_last_times else None
+        rec.last_mowed_ms = min(seg_first_times) if seg_first_times else None
         rec.last_surface_m2 = round(surface, 2)
         rec.last_duration_s = round(duration_ms / 1000)
         rec.last_cmp_max = cmp_max
