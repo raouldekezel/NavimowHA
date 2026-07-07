@@ -13,6 +13,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from custom_components.navimow.const import OPTIONS_KEY_ZONES
+from custom_components.navimow.run_tracker import STATE_IDLE, STATE_RUNNING
 from custom_components.navimow.sensor import SENSOR_DESCRIPTIONS, _current_zone_display
 
 
@@ -21,15 +22,26 @@ def _desc(key: str):
 
 
 def _make_coord(*, boundary=None, area_week=None, options=None):
+    """Coordinator mock.
+
+    ``boundary`` seeds the tracker's current run (BUG-12: no more stats
+    fallback — the tracker is the sole source of ``current_zone``).
+    ``area_week`` seeds ``coordinator.stats`` for the ``weekly_area``
+    branch, which still legitimately reads from stats (HARD-02
+    restored counter).
+    """
     coord = MagicMock()
-    if boundary is None and area_week is None:
+    coord.run_tracker = MagicMock()
+    if boundary is None:
+        coord.run_tracker.state = STATE_IDLE
+        coord.run_tracker.current_run = None
+    else:
+        coord.run_tracker.state = STATE_RUNNING
+        coord.run_tracker.current_run = {"zones": [{"boundary_id": boundary}]}
+    if area_week is None:
         coord.stats = None
     else:
-        coord.stats = {}
-        if boundary is not None:
-            coord.stats["boundary"] = boundary
-        if area_week is not None:
-            coord.stats["area_week"] = area_week
+        coord.stats = {"area_week": area_week}
     if options is not None:
         entry = MagicMock()
         entry.options = options

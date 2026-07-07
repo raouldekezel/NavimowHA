@@ -47,26 +47,34 @@ def _current_run_or_none(c: NavimowCoordinator) -> dict[str, Any] | None:
 
 
 def _current_boundary(c: NavimowCoordinator) -> int | None:
-    """HARD-13: pick the current boundary from the tracker first, from
-    ``stats`` as a fallback.
+    """Read the current boundary from the tracker alone.
 
-    ``run_tracker`` state is restored from the Store at ``async_setup``,
-    so the current boundary survives an HA restart mid-mow. ``stats``
-    is not persisted (FEAT-02 design), so a restart would leave
-    ``current_zone`` on ``unknown`` until the next accepted type-2
-    packet — 30-90 s away at best, hours if the robot is idle.
+    BUG-11: source from ``run_tracker`` when it has an open run, so the
+    boundary survives an HA restart mid-mow. The tracker's snapshot is
+    restored from the Store before SDK callbacks register.
 
-    The tracker filters BUG-06's ``boundary=0`` sentinel out of
-    ``current_run.zones``, so no risk of the sentinel leaking through
-    the tracker branch; the stats fallback still relies on the falsy
-    filter downstream.
+    BUG-12: **no stats fallback**. ``coordinator.stats`` is intentionally
+    not persisted (FEAT-02 design), and — more importantly for this
+    branch — it is never cleared: the Navimow cloud stops emitting
+    type-2 packets as soon as the robot docks (design MQTT §5), so
+    ``stats["boundary"]`` freezes on the last-mowed value and would
+    render the last zone indefinitely after a run ends. Since ``stats``
+    is set **before** the tracker processes the same packet in
+    ``_handle_location_stats``, any time ``stats`` carries a fresh
+    boundary the tracker will have one too — the fallback was only ever
+    a defence against the tracker rejecting a packet (layer 1/2/3
+    guard) or against BUG-06's ``boundary=0`` sentinel, and in both
+    those cases ``None`` is the honest answer.
+
+    The tracker filters BUG-06's ``boundary=0`` out of
+    ``current_run.zones``, so the sentinel does not leak here either.
     """
     run = _current_run_or_none(c)
     if run is not None:
         zones = run.get("zones")
         if zones:
             return zones[-1].get("boundary_id")
-    return (c.stats or {}).get("boundary")
+    return None
 
 
 def _current_zone_display(c: NavimowCoordinator) -> str | None:
