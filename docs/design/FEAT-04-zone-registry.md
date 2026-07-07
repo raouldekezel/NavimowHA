@@ -249,7 +249,7 @@ Because the registry is loaded (rebuilt from `history`) *before* entities are ad
 Firmware boundary ids are opaque (`1`, `3` on the operator's install; `2` = transit corridor). The app names ("prunier" = #1, "figuier" = #3) are **not** in any MQTT payload. A single options flow handles both naming and removal:
 
 - A config-entry option `zones: {boundary_id: {name: str}}`, editable in the HA UI. For each known `boundary_id`: a name field, plus a "forget this zone" checkbox.
-- The map is the single source of truth, anchored on the id, and survives everything. The aggregate sensor and (optionally, later) BUG-06's `current_zone` resolve `#3 → "Figuier"` from it; unmapped ids fall back to `#<id>`.
+- The map is the single source of truth, anchored on the id, and survives everything. The aggregate sensor and BUG-06's `current_zone` (as of **HARD-11**) resolve `#3 → "Figuier"` from it; unmapped ids fall back to `#<id>`. `current_zone` keeps a **short** fallback (`#<id>`) rather than the verbose `Zone #<id>` used by the per-zone entities, because it's a live-state display, not an entity title.
 - Checking "forget" drops the registry record and removes the three per-zone entities (`entity_registry.async_remove`).
 
 This options flow **supersedes** the `navimow.forget_zone` service that #10 originally sketched — a checkbox reads better than a service call with a raw `boundary_id`. Caveat, same as any forget: if the zone still exists in the Segway app, the firmware re-announces it on the next mow and it is re-discovered. "Forget" is durable only for a zone actually removed from the map.
