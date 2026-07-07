@@ -1611,11 +1611,15 @@ def test_benign_paths_do_not_consult_invariant_deviation() -> None:
 # --------------------------------------------------------------------- #
 
 
-def test_restore_migrates_pre_hard_06_layer_3_drops_into_counter() -> None:
-    """A snapshot taken before HARD-06 carries `drops["layer_3"] = N`;
-    after HARD-06 that count lives under
-    `counters["invariant_deviations_observed"]`. Mirrors the layer-2
-    migration shipped on PR #60. Shape-tolerant both ways.
+def test_restore_of_pre_hard_06_snapshot_defaults_dropped_migration_to_zero() -> None:
+    """HARD-14: the pre-BUG-10 / pre-HARD-06 restore migrations were
+    retired. A snapshot carrying the legacy ``drops["layer_2"]`` /
+    ``drops["layer_3"]`` shape is still accepted (shape-tolerant), but
+    those retired keys are no longer folded into the counters — the
+    counter values simply default to 0 (cosmetic reset at worst).
+
+    ``pending_reset_holds`` remains a live counter and IS still
+    restored from ``drops``.
     """
     tracker = RunTracker()
     legacy_snap = {
@@ -1635,16 +1639,16 @@ def test_restore_migrates_pre_hard_06_layer_3_drops_into_counter() -> None:
         },
         "last_accepted_wk": 142.5,
         "last_accepted_time_ms": 1_000_000_060_000,
-        # Pre-HARD-06 shape — `drops["layer_3"]` present, no
-        # `invariant_deviations_observed` key under `counters`.
-        "drops": {"layer_3": 7, "pending_reset_holds": 3},
-        "counters": {"wk_regressions_observed": 2},
+        # Pre-HARD-06 shape — retired keys still present on disk, but
+        # they are NOT migrated any more (HARD-14).
+        "drops": {"layer_2": 4, "layer_3": 7, "pending_reset_holds": 3},
+        "counters": {},
     }
     assert tracker.restore(legacy_snap) is True
-    # `drops["layer_3"]` migrates into the new counter; `drops` sheds
-    # the retired key.
-    assert tracker.counters["invariant_deviations_observed"] == 7
-    assert tracker.counters["wk_regressions_observed"] == 2
+    # HARD-14: retired-key drops are ignored; counters default to 0.
+    assert tracker.counters["invariant_deviations_observed"] == 0
+    assert tracker.counters["wk_regressions_observed"] == 0
+    # `pending_reset_holds` is still restored from `drops` (live counter).
     assert tracker.drops == {"pending_reset_holds": 3}
     # Streak is in-memory only, always re-armed at zero on restore.
     assert tracker._invariant_deviation_streak == 0

@@ -157,8 +157,8 @@ class NavimowSensorEntityDescription(SensorEntityDescription):
     # `.storage/core.restore_state` and re-applied at HA startup, so a
     # cumulative counter (e.g. `area_week`) survives a restart even though
     # the cloud is silent on /location while the robot is docked. Session-
-    # scoped sensors (progression, current_zone) leave this False so a
-    # stale value never masks the "idle" reality.
+    # scoped sensors (e.g. `current_zone`) leave this False so a stale
+    # value never masks the "idle" reality.
     restore: bool = False
 
 
@@ -174,23 +174,16 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
         ),
     ),
     # === /location type 2 mowing metrics (FEAT-02) ===
-    NavimowSensorEntityDescription(
-        key="progression",
-        translation_key="progression",
-        native_unit_of_measurement=PERCENTAGE,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:progress-helper",
-        value_fn=lambda c: (c.stats or {}).get("mowing_percentage"),
-        attrs_fn=lambda c: (
-            {
-                "current_mow_progress": c.stats.get("current_mow_progress"),
-                "surface_session": c.stats.get("area_session"),
-                "action": c.stats.get("action"),
-            }
-            if c.stats
-            else None
-        ),
-    ),
+    #
+    # HARD-14: the raw `progression` sensor (state = `mowing_percentage`,
+    # attrs = `current_mow_progress` / `area_session` / `action`) was
+    # retired. It read `c.stats["mowing_percentage"]` unconditionally, so
+    # it froze at the last session's value (typically `100`) on a docked
+    # robot for hours — the exact defect tracked by HARD-05. The
+    # tracker-driven `run_progress` (task progress, `None` at rest) and
+    # `zone_progress` (per-zone `cmp_max`, also `None` at rest) surface
+    # the same information honestly. The parsers keep the fields alive
+    # for the tracker; only the sensor entity is gone.
     NavimowSensorEntityDescription(
         key="weekly_area",
         translation_key="weekly_area",

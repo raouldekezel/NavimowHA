@@ -172,21 +172,16 @@ def _find_sensor(key):
     return next(d for d in SENSOR_DESCRIPTIONS if d.key == key)
 
 
-def test_progression_sensor_reads_mowing_percentage() -> None:
-    desc = _find_sensor("progression")
-    coordinator = MagicMock()
-    coordinator.stats = {
-        "mowing_percentage": 42,
-        "current_mow_progress": 4200,
-        "area_session": 84.0,
-        "action": 5,
-    }
-
-    assert desc.value_fn(coordinator) == 42
-    attrs = desc.attrs_fn(coordinator)
-    assert attrs["current_mow_progress"] == 4200
-    assert attrs["surface_session"] == 84.0
-    assert attrs["action"] == 5
+def test_progression_sensor_retired_by_hard_14() -> None:
+    """HARD-14: ``sensor.<slug>_progression`` was retired. Its
+    responsibilities are covered by ``run_progress`` (task progress,
+    ``None`` at rest — tracker-driven) and ``zone_progress`` (per-zone
+    ``cmp_max`` / 100, ``None`` at rest). The parsers still extract
+    ``mowing_percentage`` / ``current_mow_progress`` / ``area_session``
+    / ``action`` for the tracker; only the entity is gone.
+    """
+    with __import__("pytest").raises(StopIteration):
+        _find_sensor("progression")
 
 
 def test_weekly_area_sensor_reads_area_week() -> None:
@@ -230,10 +225,19 @@ def test_sensors_return_none_when_stats_empty() -> None:
     """Before the first /location type-2 arrival, coordinator.stats is
     None. Sensors must return None (HA renders "unknown") rather than
     crash.
+
+    HARD-14: ``progression`` was retired — check ``weekly_area`` and
+    ``current_zone`` only. ``current_zone`` also needs an idle
+    ``run_tracker`` to produce ``None`` (BUG-12).
     """
+    from custom_components.navimow.run_tracker import STATE_IDLE
+
     coordinator = MagicMock()
     coordinator.stats = None
+    coordinator.run_tracker = MagicMock()
+    coordinator.run_tracker.state = STATE_IDLE
+    coordinator.run_tracker.current_run = None
 
-    for key in ("progression", "weekly_area", "current_zone"):
+    for key in ("weekly_area", "current_zone"):
         desc = _find_sensor(key)
         assert desc.value_fn(coordinator) is None

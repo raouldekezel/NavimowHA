@@ -989,39 +989,28 @@ class RunTracker:
         False when the version doesn't match (caller decides whether to
         drop the payload or upgrade it).
 
-        Tolerant of the pre-BUG-10 shape (`drops["layer_2"]` migrated
-        into `counters["wk_regressions_observed"]`), the pre-HARD-06
-        shape (`drops["layer_3"]` migrated into
-        `counters["invariant_deviations_observed"]` — same pattern as
-        the #60 layer-2 migration), and the pre-FEAT-06 shape (an open
-        run without `sub₀` degrades to `session_area = None` at
-        close — see below).
+        A pre-FEAT-06 snapshot may carry an open run without ``sub₀``;
+        that is left as-is so the next ``_close_run`` reports
+        ``session_area = None`` rather than fabricating a value from
+        the firmware task-scoped accumulator (the FEAT-06 bug).
         """
         if snap.get("version") != SNAPSHOT_VERSION:
             return False
         self.state = snap.get("state", STATE_IDLE)
         self.vehicle_state = snap.get("vehicle_state")
         self.current_run = snap.get("current_run")
-        # FEAT-06: a pre-FEAT-06 snapshot's open run has no `sub₀`. We
-        # leave it `None` on purpose — the next `_close_run` payload
-        # will report `session_area = None` rather than fabricate a
-        # value (e.g. defaulting to 0 would credit the entire firmware
-        # task-scoped accumulator as this session's area, which is
-        # exactly the bug FEAT-06 fixes). The very next `_open_run`
-        # after that close writes a real `sub₀` and the sensor exits
-        # the degraded window. History rows created before the deploy
-        # are already stored without `session_area`; downstream code
-        # tolerates its absence.
         self._last_accepted_wk = snap.get("last_accepted_wk")
         self._last_accepted_time_ms = snap.get("last_accepted_time_ms")
         drops = snap.get("drops") or {}
         counters = snap.get("counters") or {}
+        # HARD-14: pre-BUG-10 / pre-HARD-06 migrations retired. Snapshots
+        # written on those builds have long since been re-persisted in
+        # the current shape; the two observability counters simply
+        # default to 0 when absent (cosmetic reset at worst).
         self.counters = {
-            "wk_regressions_observed": counters.get(
-                "wk_regressions_observed", drops.get("layer_2", 0)
-            ),
+            "wk_regressions_observed": counters.get("wk_regressions_observed", 0),
             "invariant_deviations_observed": counters.get(
-                "invariant_deviations_observed", drops.get("layer_3", 0)
+                "invariant_deviations_observed", 0
             ),
         }
         self.drops = {
