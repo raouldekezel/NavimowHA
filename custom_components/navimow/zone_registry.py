@@ -75,9 +75,17 @@ class ZoneRegistry:
             )
             cmp_max = max((s.get("cmp_max") or 0) for s in segs)
 
-            # "last mowed" = this boundary's own last exit, NOT the run end.
-            seg_last_times = [
-                s["last_time"] for s in segs if s.get("last_time") is not None
+            # HARD-12: "last mowed" = **start** of this boundary's last visit
+            # (min(first_time)), not the exit (max(last_time)). Aligns with
+            # `last_run_started` / `current_run_started` which are also start
+            # times, so the operator sees a coherent set of session-start
+            # timestamps. Fable's original guard against using the run's
+            # `end_time` (which would stamp zone 1 with the moment zone 3
+            # finished on a 1→3 run) still applies — first_time is zone-local
+            # too, so the durable invariant `last_mowed_ms != end_time` is
+            # preserved.
+            seg_first_times = [
+                s["first_time"] for s in segs if s.get("first_time") is not None
             ]
 
             # HARD-10: preserve prior ZoneRecord on a fully-degenerate
@@ -90,7 +98,7 @@ class ZoneRegistry:
                 s.get("sub_exit") is not None and s.get("sub_entry") is not None
                 for s in segs
             )
-            if not seg_last_times and not has_area and cmp_max == 0:
+            if not seg_first_times and not has_area and cmp_max == 0:
                 continue
 
             if bid not in self.zones:
@@ -98,7 +106,7 @@ class ZoneRegistry:
                 newly_seen.append(bid)
             rec = self.zones[bid]
 
-            rec.last_mowed_ms = max(seg_last_times) if seg_last_times else None
+            rec.last_mowed_ms = min(seg_first_times) if seg_first_times else None
             rec.last_surface_m2 = round(surface, 2)
             rec.last_duration_s = round(duration_ms / 1000)
             rec.last_cmp_max = cmp_max

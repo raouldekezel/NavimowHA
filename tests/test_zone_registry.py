@@ -64,10 +64,13 @@ def test_interleaved_segments_sum_and_last_mowed():
     assert z1.last_surface_m2 == pytest.approx(228.0)
     # duration = (5000 - 0) + (14000 - 9000) = 10 s, excludes the zone-3 gap
     assert z1.last_duration_s == 10
-    # last_mowed = max last_time of this zone's own segments
-    assert z1.last_mowed_ms == 14_000
-    assert z3.last_mowed_ms == 9_000
-    # durable invariant: neither equals the run's end_time
+    # HARD-12: last_mowed = min(first_time) of this zone's own segments —
+    # the start of the FIRST visit in the run, not the last exit. On an
+    # interleaved 1→3→1 run, zone 1's stamp is the very first entry (0),
+    # not the second-visit entry (9_000). Aligns with `last_run_started`.
+    assert z1.last_mowed_ms == 0
+    assert z3.last_mowed_ms == 5_000
+    # Fable's durable invariant still holds: neither equals run's end_time.
     assert z1.last_mowed_ms != run["end_time"]
     assert z3.last_mowed_ms != run["end_time"]
 
@@ -82,7 +85,8 @@ def test_plain_sequential_run_last_mowed_ordering():
         end_time=200_000,
     )
     reg.ingest_run(run)
-    # zone 1 mowed strictly before zone 3, no return
+    # HARD-12: zone 1 started strictly before zone 3 (first_time is what
+    # `last_mowed_ms` now stores), so the ordering invariant survives.
     assert reg.zones[1].last_mowed_ms < reg.zones[3].last_mowed_ms
     assert reg.zones[3].last_mowed_ms != run["end_time"]
 
@@ -200,7 +204,9 @@ def test_degenerate_payload_preserves_prior_record():
     reg.ingest_run(_run([_seg(1, 0, 10_000, 10_000, 0.0, 228.0)]))
     baseline = reg.zones[1]
     assert baseline.last_surface_m2 == pytest.approx(228.0)
-    assert baseline.last_mowed_ms == 10_000
+    # HARD-12: last_mowed_ms is now the segment's first_time (0), not the
+    # last_time (10_000).
+    assert baseline.last_mowed_ms == 0
     assert baseline.size_estimate_m2 == pytest.approx(228.0)
 
     # Degenerate payload: same boundary, all fields missing.
@@ -210,7 +216,7 @@ def test_degenerate_payload_preserves_prior_record():
     z1 = reg.zones[1]
     # Every previously-recorded value is untouched.
     assert z1.last_surface_m2 == pytest.approx(228.0)
-    assert z1.last_mowed_ms == 10_000
+    assert z1.last_mowed_ms == 0  # baseline preserved
     assert z1.last_duration_s == 10  # 10_000 ms → 10 s
     assert z1.last_cmp_max == 10_000
     assert z1.last_result == "completed"
@@ -255,7 +261,9 @@ def test_defensive_none_fields_skip_per_field():
     assert z1.last_surface_m2 == pytest.approx(210.0)
     # duration = good (5 s) + bad_no_sub (3 s) = 8; bad_no_time skipped
     assert z1.last_duration_s == 8
-    # last_mowed = max of times present — bad_no_time skipped
-    assert z1.last_mowed_ms == 8_000  # max(5000, 8000)
+    # HARD-12: last_mowed_ms = min(first_time) of segments carrying it
+    # — bad_no_time is skipped (no first_time). min(good.first_time=0,
+    # bad_no_sub.first_time=5000) = 0.
+    assert z1.last_mowed_ms == 0
     # cmp_max reflects the highest across all segments (they all have it)
     assert z1.last_cmp_max == 10_000
