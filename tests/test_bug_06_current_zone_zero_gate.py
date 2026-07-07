@@ -26,6 +26,11 @@ def _get_desc(key: str):
 def _make_coordinator(stats):
     coordinator = MagicMock()
     coordinator.stats = stats
+    # HARD-11: current_zone now reads coordinator.config_entry.options
+    # when a name mapping exists. Clear the auto-generated MagicMock
+    # attribute so the helper falls back to the raw `#<id>` path this
+    # file is pinning.
+    del coordinator.config_entry
     return coordinator
 
 

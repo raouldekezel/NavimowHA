@@ -190,22 +190,30 @@ def test_progression_sensor_reads_mowing_percentage() -> None:
 
 
 def test_weekly_area_sensor_reads_area_week() -> None:
+    # HARD-11: ceil to the next m² for parity with the FEAT-04 rounding
+    # convention. Precise float is not exposed as an attribute today —
+    # add one if a card needs it.
     desc = _find_sensor("weekly_area")
     coordinator = MagicMock()
     coordinator.stats = {"area_week": 620.75}
 
-    assert desc.value_fn(coordinator) == 620.75
+    assert desc.value_fn(coordinator) == 621  # ceil(620.75)
 
 
-def test_current_zone_sensor_renders_hash_prefixed() -> None:
+def test_current_zone_sensor_renders_hash_prefixed_when_unmapped() -> None:
     """Boundary id is not sequential (1 = zone 1, 2 = tunnel/transit, 3 =
-    zone 2 on the operator's install). Rendered as `#<id>` so the user
-    can't confuse it with a sequential zone number. FEAT-04 (zone
-    registry) will resolve the label later.
+    zone 2 on the operator's install). Rendered as ``#<id>`` when no
+    rename is set on the boundary — HARD-11 pins that fallback path.
+    Renaming to a friendly name is exercised in
+    ``test_hard_11_current_zone_and_ceil_weekly.py``.
     """
     desc = _find_sensor("current_zone")
     coordinator = MagicMock()
     coordinator.stats = {"boundary": 3}
+    # Explicitly clear the stashed config entry — MagicMock would otherwise
+    # yield a truthy fake for `getattr(c, "config_entry", None)`, and the
+    # helper would follow its options path.
+    del coordinator.config_entry
 
     assert desc.value_fn(coordinator) == "#3"
     attrs = desc.attrs_fn(coordinator)
