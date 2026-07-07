@@ -88,8 +88,11 @@ FEAT-06 revised — session-scoped runs):
 BUG-09 (2026-07-04): the observed i210 firmware never emits `mp = 100`
 — tasks terminate at `mp = 99`. The completion criterion is therefore
 `mp ≥ MP_COMPLETION_THRESHOLD` (99) ∧ `vs ∈ {1, 2, 3}` (docked idle /
-charging / unpowered; user pause `vs = 6` excluded so a manual pause
-still holds the run even at `mp = 99`). Immediate close, no debounce.
+charging / catch-all "stopped"; `vs = 6` = post-mow mapping, excluded
+so the map-consolidation phase does not race the completion close).
+See `docs/diag/2026-07-07_map-01_vs-empirical/` — the earlier comment
+that named `vs = 6` an "explicit user pause" was empirically wrong.
+Immediate close, no debounce.
 The result label is centralised in `_close_run`: `completed` iff the
 last accepted `mp ≥ MP_COMPLETION_THRESHOLD`, else `interrupted` — so
 every close path (fast, reset, sustained-timer) labels consistently.
@@ -152,28 +155,52 @@ STATE_PAUSED_DOCKED = "paused_docked"
 STATE_COMPLETED = "completed"
 STATE_INTERRUPTED = "interrupted"
 
-# vehicleState values (from MAP-01 diag / #25).
+# vehicleState values (from MAP-01 diag / #25, corrected on 2026-07-07
+# via `docs/diag/2026-07-07_map-01_vs-empirical/`).
 VS_DOCKED_IDLE = 1
 VS_DOCKED_CHARGING = 2
+# vs = 3 is a **catch-all** for "not mowing, not returning, not
+# charging, not mapping". Observed sub-cases: (a) user pause emitted
+# off-dock during a mow (`/state = isPaused`), (b) transient at-dock
+# idle flip between charging samples (`/state = isIdel`), (c) docked
+# but unpowered (`/state = isDocked` on an unplugged base). The
+# historical name `_UNPOWERED` refers only to case (c); the symbol is
+# kept to minimise ripple across `DOCKED_STATES` and friends, but the
+# semantics are broader — the `/state` channel discriminates sub-cases
+# and posture confirms on-vs-off-dock.
 VS_DOCKED_UNPOWERED = 3
 VS_MOWING = 4
 VS_RETURNING = 5
-VS_PAUSED = 6
+# vs = 6 = firmware post-mow map-consolidation phase (isMapping in the
+# `/state` channel). The robot is at-dock and immobile during this
+# phase. The earlier label `VS_PAUSED` and its "explicit user pause"
+# comment were empirically wrong — real user pause emits vs = 3.
+VS_MAPPING = 6
 VS_TRANSIENT = 8  # firmware-reset transient (posture all-zero)
 
-# Any docked variant that puts an open run on hold.
+# Any docked variant that puts an open run on hold. vs = 6 (isMapping)
+# belongs here because the robot is at-dock and immobile during
+# post-mow map consolidation.
 DOCKED_STATES = frozenset(
-    {VS_DOCKED_IDLE, VS_DOCKED_CHARGING, VS_DOCKED_UNPOWERED, VS_PAUSED}
+    {VS_DOCKED_IDLE, VS_DOCKED_CHARGING, VS_DOCKED_UNPOWERED, VS_MAPPING}
 )
 # Docked-and-not-charging: signal that a recharge is not imminent.
-# vs=2 (charging) → resume coming; vs=6 (explicit pause) → user in
-# control, no timeout; vs ∈ {1, 3} → terminal for the open run once
-# sustained.
+# vs=2 (charging) → resume coming; vs=6 (isMapping post-mow) →
+# firmware consolidating, no timeout; vs ∈ {1, 3} → terminal for the
+# open run once sustained.
 DOCKED_NOT_CHARGING = frozenset({VS_DOCKED_IDLE, VS_DOCKED_UNPOWERED})
 
 # BUG-09: docked variants that qualify for the mp-completion criterion.
-# vs = 6 (explicit user pause) is excluded so a manual pause at mp = 99
-# still holds the run — the user is in control and may resume.
+# vs = 6 (isMapping post-mow) is excluded because it is a firmware
+# phase, not a terminal dock state — closing during isMapping would
+# race the consolidation.
+#
+# CAVEAT (documented 2026-07-07, `docs/diag/2026-07-07_map-01_vs-empirical/`):
+# vs = 3 belongs here for the docked/unpowered sub-case, but a real
+# user pause off-dock also emits vs = 3. A user pause at mp = 99 far
+# from the dock would trigger a completion close through this set even
+# though the robot is not at the dock. Not observed in the wild;
+# discussed in the diag findings as a follow-up.
 DOCKED_NOT_USER_PAUSED = frozenset(
     {VS_DOCKED_IDLE, VS_DOCKED_CHARGING, VS_DOCKED_UNPOWERED}
 )

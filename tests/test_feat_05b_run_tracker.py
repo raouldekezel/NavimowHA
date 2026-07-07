@@ -34,7 +34,7 @@ from custom_components.navimow.run_tracker import (
     VS_DOCKED_IDLE,
     VS_DOCKED_UNPOWERED,
     VS_MOWING,
-    VS_PAUSED,
+    VS_MAPPING,
     VS_TRANSIENT,
     WK_REGRESSION_STREAK_TO_WARN,
     RunTracker,
@@ -488,9 +488,10 @@ def test_vs_6_paused_holds_docked_indefinitely() -> None:
             }
         ],
     )
-    tracker.process_vehicle_state(VS_PAUSED)
+    tracker.process_vehicle_state(VS_MAPPING)
     assert tracker.state == STATE_PAUSED_DOCKED
-    # Timer NOT armed — user is in control.
+    # Timer NOT armed — firmware is consolidating the map, not a
+    # terminal state.
     assert tracker._interrupt_timer_started_at is None
 
     clock.advance(3600)  # 1 h paused
