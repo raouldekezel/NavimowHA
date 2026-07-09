@@ -81,9 +81,13 @@ def _current_zone_display(c: NavimowCoordinator) -> str | None:
     """HARD-11: resolve the current boundary's operator-chosen name.
 
     Reads ``options["zones"]`` off the config entry stashed on the
-    coordinator; falls back to the short ``#<id>`` (not the verbose
-    ``Zone #<id>`` used by the per-zone entities) when no rename
-    exists — the sensor state is a live display, not an entity title.
+    coordinator (HARD-15: via the shared ``_zone_raw_name`` helper —
+    the last duplicated options lookup); falls back to the short
+    ``#<id>`` (not the verbose ``Zone #<id>`` used by per-zone entities
+    and the ``zone_name`` attribute) when no rename exists — the
+    sensor state is a live display, not an entity title. Templates
+    correlate on ``boundary_id``, not the display string, so this
+    cosmetic divergence is intentional.
 
     BUG-11 / BUG-12: the boundary comes from the tracker alone
     (survives restart, clears at end-of-run). See ``_current_boundary``
@@ -94,8 +98,7 @@ def _current_zone_display(c: NavimowCoordinator) -> str | None:
         return None
     entry = getattr(c, "config_entry", None)
     if entry is not None:
-        zones_opt = entry.options.get(OPTIONS_KEY_ZONES, {}) or {}
-        name = (zones_opt.get(str(boundary_id)) or {}).get("name")
+        name = _zone_raw_name(entry, boundary_id)
         if name:
             return name
     return f"#{boundary_id}"
@@ -603,21 +606,34 @@ def _zone_device_info(coordinator: NavimowCoordinator) -> DeviceInfo:
     )
 
 
+def _zone_raw_name(config_entry: ConfigEntry, boundary_id: int) -> str | None:
+    """HARD-15: return the operator's chosen name for ``boundary_id``,
+    or ``None`` when unmapped (missing key, or empty-string reset).
+
+    Single source-of-truth for
+    ``config_entry.options[OPTIONS_KEY_ZONES][str(boundary_id)]["name"]``
+    reads; ``_zone_display_name`` / ``_current_zone_display`` and the
+    per-zone ``zone_name`` attribute all route through here and
+    decorate ``None`` with their own fallback string.
+    """
+    zones_opt = config_entry.options.get(OPTIONS_KEY_ZONES, {}) or {}
+    entry = zones_opt.get(str(boundary_id))
+    name = (entry or {}).get("name")
+    return name if name else None
+
+
 def _zone_display_name(
     config_entry: ConfigEntry, boundary_id: int, suffix: str = ""
 ) -> str:
     """Compose the entity display name.
 
-    Reads the operator's chosen name from
-    ``config_entry.options[OPTIONS_KEY_ZONES][str(boundary_id)]["name"]``
+    HARD-15: reads the operator's chosen name via ``_zone_raw_name``
     and falls back to ``Zone #<id>`` when unmapped. Optional ``suffix``
-    (`` durée`` / `` dernière tonte``) is appended verbatim. This is
-    the one place per-zone naming lives; PR 4's options-update signal
-    re-derives it and calls ``async_write_ha_state``.
+    (`` durée`` / `` dernière tonte``) is appended verbatim. PR 4's
+    options-update signal re-derives it and calls
+    ``async_write_ha_state``.
     """
-    zones_opt = config_entry.options.get(OPTIONS_KEY_ZONES, {}) or {}
-    entry = zones_opt.get(str(boundary_id))
-    name = (entry or {}).get("name")
+    name = _zone_raw_name(config_entry, boundary_id)
     base = name if name else f"Zone #{boundary_id}"
     return f"{base}{suffix}"
 
@@ -681,6 +697,30 @@ class _NavimowZoneEntity(CoordinatorEntity[NavimowCoordinator], SensorEntity):
         return self.coordinator.zone_registry.zones.get(self._boundary_id)
 
     @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """HARD-15: the two consumer-facing fields common to the three
+        per-zone sub-classes.
+
+        ``boundary_id`` is the stable join key (unchanged across an
+        app-side rename); ``zone_name`` is the display-ready string —
+        the operator's rename (options-flow PR 4) or the
+        ``Zone #<id>`` fallback, matching the entity title. Templates
+        display ``zone_name`` and correlate on ``boundary_id`` (the
+        divergence with ``current_zone``'s shorter ``#<id>`` fallback
+        is intentional and cosmetic — see ``_current_zone_display``).
+
+        Sub-classes merge this dict into their own attributes rather
+        than shadow it, so all three sensors expose the pair.
+        """
+        if self._record is None:
+            return None
+        name = _zone_raw_name(self._config_entry, self._boundary_id)
+        return {
+            "boundary_id": self._boundary_id,
+            "zone_name": name if name else f"Zone #{self._boundary_id}",
+        }
+
+    @property
     def available(self) -> bool:
         # Present as long as the registry still knows this boundary.
         # ``forget`` (§7) removes the entity from the registry outright
@@ -721,7 +761,7 @@ class NavimowZoneSurfaceSensor(_NavimowZoneEntity):
         if rec is None:
             return None
         return {
-            "boundary_id": self._boundary_id,
+            **(super().extra_state_attributes or {}),
             "size_estimate": (
                 math.ceil(rec.size_estimate_m2)
                 if rec.size_estimate_m2 is not None
@@ -795,7 +835,10 @@ class NavimowZoneLastMowedSensor(_NavimowZoneEntity):
         rec = self._record
         if rec is None:
             return None
-        return {"last_result": rec.last_result}
+        return {
+            **(super().extra_state_attributes or {}),
+            "last_result": rec.last_result,
+        }
 
 
 class NavimowZonesAggregateSensor(CoordinatorEntity[NavimowCoordinator], SensorEntity):
