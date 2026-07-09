@@ -7,7 +7,7 @@ dedicated to the Navimow i210 LiDAR Pro.
 
 - Targets the Navimow i210 LiDAR Pro specifically.
 - Adds the live mower position, read from the undocumented `/location` MQTT channel.
-- Adds mowing metrics: progression, weekly mowed area and current zone.
+- Adds basic mowing metrics: progression, weekly mowed area and current zone.
 - Adds a cloud-connectivity binary sensor that reflects the MQTT link to the Navimow cloud.
 - Surfaces a silent MQTT outage within ~90 s and falls back to an HTTP poll, instead of showing stale state for up to an hour.
 - Quiets the log: routine ~40-minute token-refresh reconnects no longer spam a WARNING.
@@ -16,6 +16,11 @@ dedicated to the Navimow i210 LiDAR Pro.
 - Replaces the inherited Chinese user-facing strings and developer comments with English.
 - Redacts sensitive tokens and serials from logs.
 - Adds a documented library of real-device MQTT traces with their interpretation ([`docs/diag/`](https://github.com/raouldekezel/NavimowHA/tree/deploy/docs/diag)), plus a pytest test suite and CI.
+- Allows mowing zones to be named from the integration options (e.g. "Prunier", "Figuier").
+- Adds per-zone metrics (last-mown and total area, last-mow duration, last-mow time) plus aggregate zones sensors.
+  Zones (and their entities) are discovered (and created) automatically as the mower visits them.
+- Adds per-session mowing tracking where a session can include multiple zones and charging pauses.
+  An history of recent sessions supports showing the mowing history.
 - Miscellaneous issues fixed (see the [Releases](https://github.com/raouldekezel/NavimowHA/releases) page).
 
 # Navimow for Home Assistant
