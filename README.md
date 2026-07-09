@@ -11,7 +11,7 @@ dedicated to the Navimow i210 LiDAR Pro.
 - Adds a cloud-connectivity binary sensor that reflects the MQTT link to the Navimow cloud.
 - Surfaces a silent MQTT outage within ~90 s and falls back to an HTTP poll, instead of showing stale state for up to an hour.
 - Quiets the log: routine ~40-minute token-refresh reconnects no longer spam a WARNING.
-- Persists the weekly mowed area across a Home Assistant restart.
+- Persists sensor states across a Home Assistant restart.
 - Fixes battery flicker and a spurious "#0" current-zone at the start of each mow.
 - Replaces the inherited Chinese user-facing strings and developer comments with English.
 - Redacts sensitive tokens and serials from logs.
