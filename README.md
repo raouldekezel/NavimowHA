@@ -17,7 +17,7 @@ dedicated to the Navimow i210 LiDAR Pro.
 - Redacts sensitive tokens and serials from logs.
 - Adds a documented library of real-device MQTT traces with their interpretation ([`docs/diag/`](https://github.com/raouldekezel/NavimowHA/tree/deploy/docs/diag)), plus a pytest test suite and CI.
 - Allows mowing zones to be named from the integration options (e.g. "Prunier", "Figuier").
-- Adds per-zone metrics (last-mown and total area, last-mow duration, last-mow time) plus aggregate zones sensors.
+- Adds per-zone metrics (eg last-mowed and total area, last-mow duration) plus aggregate zones sensors.
   Zones (and their entities) are discovered (and created) automatically as the mower visits them.
 - Adds per-session mowing tracking where a session can include multiple zones and charging pauses.
   An history of recent sessions supports showing the mowing history.
