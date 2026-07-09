@@ -75,8 +75,8 @@ FEAT-06 revised — session-scoped runs):
     RUNNING ─vs ∈ {1,2,3,6}─▶ PAUSED_DOCKED
     PAUSED_DOCKED ─fresh type-2, strict progress─▶ RUNNING   (resume,
         same run — intra-run recharge dock does not split)
-    RUNNING/PAUSED_DOCKED ─mp ≥ MP_COMPLETION_THRESHOLD (99)
-        ∧ vs ∈ {1,2,3}─▶ COMPLETED [run_finished]
+    RUNNING/PAUSED_DOCKED ─(mp ≥ 100 OR (mp ≥ 99 ∧ zones[-1].cmp_max
+        ≥ 10000)) ∧ vs ∈ {1,2,3}─▶ COMPLETED [run_finished]
     RUNNING/PAUSED_DOCKED ─fresh reset (sub < last, sub < ceiling)─▶
         close open run [run_finished], open new run [run_started]
     PAUSED_DOCKED ─vs ∈ {1,3} sustained 60 s─▶ INTERRUPTED
@@ -85,9 +85,8 @@ FEAT-06 revised — session-scoped runs):
         open NEW run [run_started] (FEAT-06 / #54)
     COMPLETED/INTERRUPTED ─fresh reset (sub < ceiling)─▶ open new run
 
-BUG-09 (2026-07-04): the observed i210 firmware never emits `mp = 100`
-— tasks terminate at `mp = 99`. The completion criterion is therefore
-`mp ≥ MP_COMPLETION_THRESHOLD` (99) ∧ `vs ∈ {1, 2, 3}` (docked idle /
+BUG-09 (2026-07-04): the completion criterion is
+`mp ≥ MP_COMPLETION_THRESHOLD` ∧ `vs ∈ {1, 2, 3}` (docked idle /
 charging / catch-all "stopped"; `vs = 6` = post-mow mapping, excluded
 so the map-consolidation phase does not race the completion close).
 See `docs/diag/2026-07-07_map-01_vs-empirical/` — the earlier comment
@@ -96,6 +95,25 @@ Immediate close, no debounce.
 The result label is centralised in `_close_run`: `completed` iff the
 last accepted `mp ≥ MP_COMPLETION_THRESHOLD`, else `interrupted` — so
 every close path (fast, reset, sustained-timer) labels consistently.
+
+BUG-14 (2026-07-09, #89): threshold raised from 99 to 100 because a
+firmware plateau at `mp = 99` is *indistinguishable from a recharge
+return* on `mp` alone: on 2026-07-09 a real day was closed prematurely
+on the recharge dock at `mp = 99`, splitting a single logical session
+in two. Both plateaus (99 and 100) have been observed in the wild
+(2026-05-25 & 2026-07-04 afternoon reached 100; 2026-07-04 morning
+peaked at 99).
+
+BUG-14 refinement (same day, operator-designed): also close when
+`mp ≥ 99 ∧ zones[-1].cmp_max ≥ 10000`. The zone-scoped `cmp` reaches
+10000 when the firmware confirms the last active zone is 100 % mowed,
+giving an independent completion signal that discriminates a real
+finish from a recharge return. On the 2026-07-09 day, the resume
+after recharge added `cmp = 10000` on the same last-active boundary,
+so the second dock arrival closes the (single, continuous) session as
+`completed` rather than leaving it to a `interrupted` sustained-timer
+close. Runs whose `mp` and `cmp` both plateau below the thresholds
+still close via the sustained-timer path with `interrupted`.
 
 FEAT-06 (2026-07-05, #54): a run maps to a **user session** — an
 activation → final dock cycle. Intra-run recharge docks (vs=2 while
@@ -205,13 +223,33 @@ DOCKED_NOT_USER_PAUSED = frozenset(
     {VS_DOCKED_IDLE, VS_DOCKED_CHARGING, VS_DOCKED_UNPOWERED}
 )
 
-# BUG-09: mp threshold that marks a task-scoped run as complete. The
-# observed i210 firmware never emits `mp = 100` — tasks terminate at
-# `mp = 99` (2026-07-04 diag: real run peaked at 99, robot returned to
-# dock, no further mp progression). Set to 99 to catch normal
-# completions while remaining strict enough that a mid-run recharge
-# pause at `mp < 99` still holds PAUSED_DOCKED.
-MP_COMPLETION_THRESHOLD = 99
+# BUG-14 (2026-07-09, #89): threshold raised from 99 to 100. The
+# earlier value (99) was chosen when the only observed firmware plateau
+# was 99, but the recharge-at-mp-99 pathology surfaced on 2026-07-09:
+# the operator's real day was mow (mp reaches 99) → return dock with
+# battery 15 % to recharge → resume and finish → dock again. With
+# threshold 99 the first dock arrival closed the run as `completed`
+# (false positive: it was a recharge, not a finish), the mini-return
+# after recharge opened a new session, and one logical session was
+# split into two runs.
+MP_COMPLETION_THRESHOLD = 100
+
+# BUG-14 refinement: firmware tasks whose task-scoped `mp` plateaus at
+# 99 without ever emitting 100 can still be discriminated from a
+# recharge return by the zone-scoped `currentMowProgress` (`cmp`):
+# `cmp = 10000` means the firmware confirms the currently-active zone
+# is 100 % mowed. Combined with the task-scoped `mp = 99` at dock, that
+# is credibly a real finish (task's last zone is done, only mp is
+# late-plateauing). Below the threshold — the run keeps holding in
+# PAUSED_DOCKED as a recharge candidate.
+MP_PARTIAL_THRESHOLD = 99
+CMP_ZONE_COMPLETE_THRESHOLD = 10000
+# Trade-off: on a multizone task where the robot finishes zone A
+# (cmp=10000) and returns to dock to recharge before starting zone B,
+# this rule closes as `completed` — the residual false positive. Not
+# observed in the corpus (2026-05-25 multizone ran without an inter-
+# zone recharge); noted here so a future report can reproduce it.
+# `session_area` and `zones[]` remain correct on either label.
 
 # Seconds a PAUSED_DOCKED run must remain in DOCKED_NOT_CHARGING before
 # it is declared INTERRUPTED. 60 s ≈ 30 type-1 samples at the 2 s
@@ -828,17 +866,18 @@ class RunTracker:
         self._interrupt_timer_started_at = None
 
     def _close_run(self) -> Event:
-        """Close the currently open run. The result label is derived
-        from the last accepted `mowing_percentage`: `completed` iff
-        `last_mp >= MP_COMPLETION_THRESHOLD`, else `interrupted`.
+        """Close the currently open run. The result label is centralised
+        here (BUG-09) so every close path — the fast BUG-09 completion
+        criterion, a fresh reset, the sustained-60 s interruption timer,
+        a resolved pending reset — labels the same way. The sustained-
+        timer path on 2026-07-04 used to hardcode `interrupted` and thus
+        mis-labeled a genuinely completed run whose close it caught
+        after the battery finished charging.
 
-        Centralising the decision here (BUG-09) means every close path
-        — the fast BUG-09 completion criterion, a fresh reset, the
-        sustained-60 s interruption timer, a resolved pending reset —
-        labels the same way. The sustained-timer path on 2026-07-04
-        used to hardcode `interrupted` and thus mis-labeled a genuinely
-        completed run whose close it caught after the battery finished
-        charging.
+        BUG-14 label rule: `completed` iff
+        `last_mp ≥ MP_COMPLETION_THRESHOLD (100)`, OR
+        `last_mp ≥ MP_PARTIAL_THRESHOLD (99) ∧ zones[-1].cmp_max ≥
+        CMP_ZONE_COMPLETE_THRESHOLD (10000)`.
         """
         assert self.current_run is not None, "close_run without an open run"
         r = self.current_run
@@ -847,12 +886,7 @@ class RunTracker:
         duration_ms: int | None = None
         if start is not None and end is not None:
             duration_ms = end - start
-        last_mp = r.get("last_mp")
-        result = (
-            RESULT_COMPLETED
-            if last_mp is not None and last_mp >= MP_COMPLETION_THRESHOLD
-            else RESULT_INTERRUPTED
-        )
+        result = RESULT_COMPLETED if self._is_completed() else RESULT_INTERRUPTED
         # FEAT-06 (#54): per-session area = last_sub − sub₀. Reflects
         # what the *session* mowed; the firmware's `subtotalArea`
         # continues across tasks, so raw `last_sub` on its own would
@@ -882,28 +916,45 @@ class RunTracker:
         )
 
     def _maybe_complete_run(self) -> Event | None:
-        """BUG-09 completion criterion: `last_mp ≥ MP_COMPLETION_THRESHOLD`
-        (99) ∧ `vehicle_state ∈ DOCKED_NOT_USER_PAUSED` (`{1, 2, 3}`).
-        Immediate close with no debounce. Returns the close event, or
-        `None` when the criterion is not met.
+        """BUG-09 completion criterion (BUG-14 refined): close on
+        `mp ≥ 100`, OR on `mp ≥ 99 ∧ zones[-1].cmp_max ≥ 10000`, with
+        `vehicle_state ∈ DOCKED_NOT_USER_PAUSED` (`{1, 2, 3}`) in either
+        case. Immediate close with no debounce. Returns the close event,
+        or `None` when neither branch fires.
 
         Called from `process_type2` (after accumulator update, so the
-        just-accepted packet's `mp` is visible) and `process_vehicle_state`
-        (after the vs update, so a dock arrival while `last_mp` was
-        already ≥ threshold fires the close even before the next type-2).
-        Either ordering — mp-crosses-threshold-then-dock, or
-        dock-arrives-then-mp-refresh — is handled.
+        just-accepted packet's `mp` / `cmp` is visible) and
+        `process_vehicle_state` (after the vs update, so a dock arrival
+        while `last_mp` / `last_cmp` was already at threshold fires the
+        close even before the next type-2). Either ordering — signal-
+        crosses-threshold-then-dock, or dock-arrives-then-signal-refresh
+        — is handled.
         """
         if self.state not in (STATE_RUNNING, STATE_PAUSED_DOCKED):
             return None
-        if self.current_run is None:
-            return None
-        last_mp = self.current_run.get("last_mp")
-        if last_mp is None or last_mp < MP_COMPLETION_THRESHOLD:
-            return None
         if self.vehicle_state not in DOCKED_NOT_USER_PAUSED:
             return None
+        if not self._is_completed():
+            return None
         return self._close_run()
+
+    def _is_completed(self) -> bool:
+        """Whether the current run has reached the BUG-14 completion
+        rule. Used both by `_maybe_complete_run` (fast path) and
+        `_close_run` (label derivation) so the two never disagree.
+        """
+        if self.current_run is None:
+            return False
+        last_mp = self.current_run.get("last_mp")
+        if last_mp is None:
+            return False
+        if last_mp >= MP_COMPLETION_THRESHOLD:
+            return True
+        if last_mp >= MP_PARTIAL_THRESHOLD:
+            zones = self.current_run.get("zones") or []
+            if zones and (zones[-1].get("cmp_max") or 0) >= CMP_ZONE_COMPLETE_THRESHOLD:
+                return True
+        return False
 
     def _event_run_started(self) -> Event:
         assert self.current_run is not None

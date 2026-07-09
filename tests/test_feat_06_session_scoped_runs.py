@@ -104,7 +104,7 @@ def test_2026_07_04_full_day_yields_exactly_two_sessions() -> None:
                 "type": 2,
                 "currentMowBoundary": 1,
                 "currentMowProgress": 9906,
-                "mowingPercentage": 99,
+                "mowingPercentage": 100,
                 "subtotalArea": "118.0",
                 "mowingWeekArea": "1063.0",
                 "mowStartType": 0,
@@ -200,7 +200,7 @@ def test_afternoon_new_session_ignores_echo_of_morning_close_packet() -> None:
             {
                 "type": 2,
                 "currentMowBoundary": 1,
-                "mowingPercentage": 99,
+                "mowingPercentage": 100,
                 "subtotalArea": "118.0",
                 "mowingWeekArea": "1063.0",
                 "mowStartType": 0,
@@ -218,7 +218,7 @@ def test_afternoon_new_session_ignores_echo_of_morning_close_packet() -> None:
             {
                 "type": 2,
                 "currentMowBoundary": 1,
-                "mowingPercentage": 99,
+                "mowingPercentage": 100,
                 "subtotalArea": "118.0",
                 "mowingWeekArea": "1063.0",
                 "mowStartType": 0,
@@ -290,7 +290,7 @@ def test_close_plus_new_session_writes_two_history_rows_not_one() -> None:
     coord.handle_location_item(
         {
             "type": 2,
-            "mowingPercentage": 99,
+            "mowingPercentage": 100,
             "subtotalArea": "118.0",
             "mowingWeekArea": "1063.0",
             "mowStartType": 0,
@@ -316,7 +316,7 @@ def test_close_plus_new_session_writes_two_history_rows_not_one() -> None:
             "time": _AFTERNOON_START_MS,
         }
     )
-    # Later afternoon packet reaches mp=99 while vs=4 (still mowing).
+    # Later afternoon packet reaches mp=100 while vs=4 (still mowing).
     coord.handle_location_item(
         {
             "type": 2,
@@ -359,7 +359,7 @@ def test_session_area_equals_last_sub_minus_sub0() -> None:
             },
             {
                 "type": 2,
-                "mowingPercentage": 99,
+                "mowingPercentage": 100,
                 "subtotalArea": "42.5",
                 "mowingWeekArea": "42.5",
                 "time": 1_000_000_120_000,
@@ -393,7 +393,7 @@ def test_session_area_none_on_pre_feat_06_open_snapshot() -> None:
             "last_time": 1_000_000_060_000,
             "last_sub": 42.5,
             "last_wk": 42.5,
-            "last_mp": 99,
+            "last_mp": 100,
             "zones": [],
         },
         "last_accepted_wk": 42.5,
@@ -714,7 +714,7 @@ def test_feat_06_fixture_drift_yields_complete_second_session_no_warn(
                 "type": 2,
                 "currentMowBoundary": 1,
                 "currentMowProgress": 9906,
-                "mowingPercentage": 99,
+                "mowingPercentage": 100,
                 "subtotalArea": "118.0",
                 "mowingWeekArea": "1063.0",
                 "mowStartType": 0,
