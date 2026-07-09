@@ -23,6 +23,8 @@ dedicated to the Navimow i210 LiDAR Pro.
   An history of recent sessions supports showing the mowing history.
 - Miscellaneous issues fixed (see the [Releases](https://github.com/raouldekezel/NavimowHA/releases) page).
 
+```This fork is undergoing active changes and lives in the deploy branch ```
+
 # Navimow for Home Assistant
 
 <p align="center">
