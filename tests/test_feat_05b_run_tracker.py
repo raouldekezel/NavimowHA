@@ -33,8 +33,8 @@ from custom_components.navimow.run_tracker import (
     VS_DOCKED_CHARGING,
     VS_DOCKED_IDLE,
     VS_DOCKED_UNPOWERED,
-    VS_MOWING,
     VS_MAPPING,
+    VS_MOWING,
     VS_TRANSIENT,
     WK_REGRESSION_STREAK_TO_WARN,
     RunTracker,
@@ -1567,15 +1567,16 @@ def test_benign_paths_do_not_consult_invariant_deviation() -> None:
     assert kinds == [EVENT_RUN_FINISHED, EVENT_RUN_STARTED]
     assert tracker.counters["invariant_deviations_observed"] == 0
 
-    # Close via BUG-09 (mp ≥ 99, vs docked), then a fresh reset from
-    # COMPLETED (sub below ceiling) — again the observer stays silent.
+    # Close via BUG-09 (mp ≥ threshold, vs docked), then a fresh reset
+    # from COMPLETED (sub below ceiling) — again the observer stays
+    # silent. BUG-14 (#89): threshold is 100, not 99.
     _feed(
         tracker,
         [
             {
                 "type": 2,
                 "currentMowBoundary": 1,
-                "mowingPercentage": 99,
+                "mowingPercentage": 100,
                 "subtotalArea": "50.0",
                 "mowingWeekArea": "50.0",
                 "mowStartType": 1,
