@@ -626,14 +626,7 @@ class NavimowSensor(CoordinatorEntity[NavimowCoordinator], RestoreSensor):
 
         device = coordinator.device
         self._attr_unique_id = f"{DOMAIN}_{device.id}_{entity_description.key}"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, device.id)},
-            name=device.name,
-            manufacturer="Navimow",
-            model=device.model or "Unknown",
-            sw_version=device.firmware_version or None,
-            serial_number=device.serial_number or device.id,
-        )
+        self._attr_device_info = _device_info(coordinator)
 
     async def async_added_to_hass(self) -> None:
         """Seed the restore cache from the last stored value (HARD-02)
@@ -699,13 +692,23 @@ class NavimowSensor(CoordinatorEntity[NavimowCoordinator], RestoreSensor):
 # === FEAT-04 PR 3 — per-zone family + aggregate ==========================
 
 
-def _zone_device_info(coordinator: NavimowCoordinator) -> DeviceInfo:
-    """Repeat the same ``DeviceInfo`` shape as ``NavimowSensor``.
+def _device_info(coordinator: NavimowCoordinator) -> DeviceInfo:
+    """HARD-07: single source of truth for the mower's ``DeviceInfo``.
 
-    Zones sit on the mower's device — the design was explicit that we do
-    not create a per-zone device (§6): dynamic naming, the ability to
-    survive a firmware id renumbering, and options-flow-driven renames
-    are all data the integration owns, not the device registry.
+    All Navimow entities — `NavimowSensor` (FEAT-02 / run family),
+    `NavimowPositionSensor` (FEAT-01, dispatcher-driven), and the
+    zone family (`_NavimowZoneEntity` sub-classes + the aggregate,
+    FEAT-04 PR 3) — attach to the same mower device via the shared
+    `identifiers={(DOMAIN, device.id)}`. Keeping the description in
+    one place prevents the silent-drift trap where the device entry
+    starts taking whichever entity registered last after a partial
+    metadata edit.
+
+    Zones sit on the mower's device on purpose — the design was
+    explicit that we do not create a per-zone device (FEAT-04 §6):
+    dynamic naming, the ability to survive a firmware id renumbering,
+    and options-flow-driven renames are all data the integration
+    owns, not the device registry.
     """
     device = coordinator.device
     return DeviceInfo(
@@ -776,7 +779,7 @@ class _NavimowZoneEntity(CoordinatorEntity[NavimowCoordinator], SensorEntity):
         super().__init__(coordinator)
         self._boundary_id = boundary_id
         self._config_entry = config_entry
-        self._attr_device_info = _zone_device_info(coordinator)
+        self._attr_device_info = _device_info(coordinator)
         # ``_attr_name`` is set directly (not via ``translation_key``)
         # because per-zone names are dynamic and translation keys
         # resolve statically at load — see design §6.
@@ -979,7 +982,7 @@ class NavimowZonesAggregateSensor(CoordinatorEntity[NavimowCoordinator], SensorE
     def __init__(self, coordinator: NavimowCoordinator) -> None:
         super().__init__(coordinator)
         self._attr_unique_id = f"{DOMAIN}_{coordinator.device.id}_zones"
-        self._attr_device_info = _zone_device_info(coordinator)
+        self._attr_device_info = _device_info(coordinator)
 
     @property
     def native_value(self) -> int:
@@ -1039,14 +1042,7 @@ class NavimowPositionSensor(SensorEntity):
         self._device_id = device.id
         self._position: dict[str, Any] | None = coordinator.position
         self._attr_unique_id = f"{DOMAIN}_{device.id}_position"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, device.id)},
-            name=device.name,
-            manufacturer="Navimow",
-            model=device.model or "Unknown",
-            sw_version=device.firmware_version or None,
-            serial_number=device.serial_number or device.id,
-        )
+        self._attr_device_info = _device_info(coordinator)
 
     async def async_added_to_hass(self) -> None:
         self.async_on_remove(
