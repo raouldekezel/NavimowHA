@@ -1,19 +1,23 @@
-"""FEAT-08 (#88) — first-class zone surface entities.
+"""FEAT-08 (#88) — first-class zone area entities.
 
-Exercises the two additive entities:
+Exercises the two additive entities (post-naming-scheme keys):
 
-- ``NavimowZoneTotalAreaSensor`` — per-zone ``<slug>_zone_<id>_surface``,
+- ``NavimowZoneTotalAreaSensor`` — per-zone ``<slug>_zone_<id>_total_area``,
   ``ceil(size_estimate_m2)`` from the last complete pass, ``None`` until
-  the first complete pass lands, precise float + timestamp in attrs.
-- ``NavimowZonesTotalAreaSensor`` — aggregate ``<slug>_zones_surface_totale``,
-  ``ceil(Σ size_estimate_m2)``, ``translation_key`` set, ``per_zone`` map
-  + ``zone_ids`` list in attrs.
+  the first complete pass lands, ``area_precise`` (float) +
+  ``last_complete_pass_at`` (timestamp) in attrs.
+- ``NavimowZonesTotalAreaSensor`` — aggregate ``<slug>_zones_total_area``,
+  ``ceil(Σ size_estimate_m2)``, ``translation_key`` set, ``area_precise``
+  + ``zone_ids`` + ``zone_names`` in attrs.
 
-Plus the two wire seams:
+Plus the wire seams:
 
 - Setup adds one ``NavimowZoneTotalAreaSensor`` per restored boundary and one
   static ``NavimowZonesTotalAreaSensor``.
-- Runtime discovery adds the new per-zone entity alongside the trio.
+- Runtime discovery adds the total-area entity alongside the last-area,
+  duration, and last-mowed siblings (the family is a quartet).
+- Forget sweeps all four unique_ids (`_last_area`, `_last_duration`,
+  `_last_mowed`, `_total_area`).
 
 Registry-level: ``ZoneRecord.size_estimate_updated_ms`` is stamped at the
 start of the visit that most recently reached
@@ -475,8 +479,8 @@ async def test_runtime_discovery_adds_area_sensor_alongside_trio() -> None:
 # --------------------------------------------------------------------- #
 
 
-async def test_forget_removes_surface_entity_from_registry() -> None:
-    """PR 4's forget-zone flow must sweep the ``_surface`` entity too
+async def test_forget_removes_total_area_entity_from_registry() -> None:
+    """PR 4's forget-zone flow must sweep the ``_total_area`` entity too
     (issue #88): a lingering ``unavailable`` after the record is dropped
     would be visible to the operator in the sensor list.
     """

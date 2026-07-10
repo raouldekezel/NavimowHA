@@ -507,6 +507,12 @@ async def _async_migrate_unique_ids(hass: HomeAssistant, entry: ConfigEntry) -> 
     ZONE_BARE = re.compile(r"^(navimow_.+?_zone_)(\d+)$")
     # zone_<id>_duration — rename to `_last_duration`.
     ZONE_DURATION = re.compile(r"^(navimow_.+?_zone_)(\d+)_duration$")
+    # zone_<id>_surface — the first-commit placeholder key on this
+    # PR. Never shipped in a merged prerelease (the fork's release
+    # cadence releases only from merged `deploy`), so in practice this
+    # branch fires only for a developer who installed the branch head
+    # before the naming pass. Belt-and-braces per review round 2.
+    ZONE_SURFACE = re.compile(r"^(navimow_.+?_zone_)(\d+)_surface$")
 
     for e in list(ent_reg.entities.values()):
         if e.config_entry_id != entry.entry_id:
@@ -542,6 +548,13 @@ async def _async_migrate_unique_ids(hass: HomeAssistant, entry: ConfigEntry) -> 
         m = ZONE_DURATION.match(uid)
         if m:
             new_uid = f"{m.group(1)}{m.group(2)}_last_duration"
+            ent_reg.async_update_entity(e.entity_id, new_unique_id=new_uid)
+            _LOGGER.info("FEAT-08 unique_id migration: %s → %s", uid, new_uid)
+            continue
+
+        m = ZONE_SURFACE.match(uid)
+        if m:
+            new_uid = f"{m.group(1)}{m.group(2)}_total_area"
             ent_reg.async_update_entity(e.entity_id, new_unique_id=new_uid)
             _LOGGER.info("FEAT-08 unique_id migration: %s → %s", uid, new_uid)
             continue

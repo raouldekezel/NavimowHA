@@ -1148,26 +1148,33 @@ class NavimowZonesAggregateSensor(CoordinatorEntity[NavimowCoordinator], SensorE
 
 
 class NavimowZonesTotalAreaSensor(CoordinatorEntity[NavimowCoordinator], SensorEntity):
-    """FEAT-08 — first-class Σ zone surface, ceil'd.
+    """FEAT-08 — first-class Σ zone total-area, ceil'd.
 
     Sibling to ``NavimowZonesAggregateSensor``: same registry, same
     update path. The count aggregate answers "how many zones has the
-    robot discovered?"; this one answers "what's the mowed acreage?"
-    for the dashboard's headline number.
+    robot discovered?"; this one answers "what's the total mowed
+    acreage?" for the dashboard's headline number.
 
-    Design decisions (issue #88):
+    Design decisions (issue #88 + comment naming scheme):
 
-    - **Not folded into the count aggregate** (which keeps its own
-      ``total_area`` attr for backward-compat). The count sensor rarely
-      changes; this one nudges on each complete pass and belongs on a
-      separate history graph.
-    - **``ceil`` state, precise not exposed** at the aggregate level.
-      Precise floats live on the per-zone ``_surface`` entities where
-      the granularity matters; the aggregate rounds up once at the sum
-      to avoid drift from N-zone floor'd summation.
-    - **Zones without a complete pass contribute 0** — same rule as the
-      count aggregate's ``total_area`` attribute, kept explicit here so
-      the state stays honest before all zones have been fully mowed.
+    - **Not folded into the count aggregate.** The count sensor rarely
+      changes; this one nudges on each complete pass and belongs on
+      its own history graph. The count aggregate was trimmed in the
+      naming pass — its former ``total_area`` and ``per_zone`` attrs
+      are gone (this entity is the canonical source for total area,
+      the per-zone entities own the per-boundary breakdown).
+    - **``ceil`` state + ``area_precise`` attr** — the uniform
+      contract across every m² sensor (``weekly_area``,
+      ``zone_<id>_last_area``, ``zone_<id>_total_area``,
+      ``zones_total_area``, ``last_run_area``). Round-up happens once
+      at the sum to avoid drift from N-zone floor'd summation.
+    - **``zone_names`` parallel to ``zone_ids``** (per #88 2026-07-10
+      13:05 comment) — a card can render "Prunier: 228, Figuier: 124"
+      without cross-referencing another entity. The rename dispatcher
+      keeps it live.
+    - **Zones without a complete pass contribute 0** — kept explicit
+      so the state stays honest before every zone has been fully
+      mowed.
     """
 
     _attr_has_entity_name = True

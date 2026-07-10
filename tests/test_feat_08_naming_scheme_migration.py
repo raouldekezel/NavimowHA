@@ -19,7 +19,6 @@ from custom_components.navimow import _async_migrate_unique_ids
 from custom_components.navimow.const import DOMAIN
 from custom_components.navimow.sensor import SENSOR_DESCRIPTIONS
 
-
 # --------------------------------------------------------------------- #
 # 1. entity_registry unique_id migration                                #
 # --------------------------------------------------------------------- #
@@ -50,15 +49,12 @@ async def test_migration_renames_the_three_static_keys() -> None:
     ent_reg.entities = MagicMock()
     ent_reg.entities.values.return_value = list(entities.values())
 
-    with patch(
-        "homeassistant.helpers.entity_registry.async_get", return_value=ent_reg
-    ):
+    with patch("homeassistant.helpers.entity_registry.async_get", return_value=ent_reg):
         await _async_migrate_unique_ids(MagicMock(), _make_entry())
 
     # Verify each unique_id was renamed to its `current_*` counterpart.
     calls = {
-        c.kwargs["new_unique_id"]
-        for c in ent_reg.async_update_entity.call_args_list
+        c.kwargs["new_unique_id"] for c in ent_reg.async_update_entity.call_args_list
     }
     assert f"{DOMAIN}_DEV_current_run_state" in calls
     assert f"{DOMAIN}_DEV_current_run_progress" in calls
@@ -76,19 +72,38 @@ async def test_migration_renames_per_zone_bare_and_duration_ids() -> None:
     ent_reg.entities = MagicMock()
     ent_reg.entities.values.return_value = [_fake_entity(u) for u in zone_ids]
 
-    with patch(
-        "homeassistant.helpers.entity_registry.async_get", return_value=ent_reg
-    ):
+    with patch("homeassistant.helpers.entity_registry.async_get", return_value=ent_reg):
         await _async_migrate_unique_ids(MagicMock(), _make_entry())
 
     calls = {
-        c.kwargs["new_unique_id"]
-        for c in ent_reg.async_update_entity.call_args_list
+        c.kwargs["new_unique_id"] for c in ent_reg.async_update_entity.call_args_list
     }
     assert f"{DOMAIN}_DEV_zone_1_last_area" in calls
     assert f"{DOMAIN}_DEV_zone_1_last_duration" in calls
     assert f"{DOMAIN}_DEV_zone_3_last_area" in calls
     assert f"{DOMAIN}_DEV_zone_3_last_duration" in calls
+
+
+async def test_migration_renames_surface_placeholder_to_total_area() -> None:
+    """Belt-and-braces (review round 2): the first-commit placeholder
+    key `_surface` never shipped in a merged prerelease, but a
+    developer who installed the branch head before the naming pass
+    would carry those unique_ids. Migrate them rather than orphan."""
+    ent_reg = MagicMock()
+    ent_reg.entities = MagicMock()
+    ent_reg.entities.values.return_value = [
+        _fake_entity(f"{DOMAIN}_DEV_zone_1_surface"),
+        _fake_entity(f"{DOMAIN}_DEV_zone_3_surface"),
+    ]
+
+    with patch("homeassistant.helpers.entity_registry.async_get", return_value=ent_reg):
+        await _async_migrate_unique_ids(MagicMock(), _make_entry())
+
+    calls = {
+        c.kwargs["new_unique_id"] for c in ent_reg.async_update_entity.call_args_list
+    }
+    assert f"{DOMAIN}_DEV_zone_1_total_area" in calls
+    assert f"{DOMAIN}_DEV_zone_3_total_area" in calls
 
 
 async def test_migration_leaves_already_migrated_ids_alone() -> None:
@@ -112,9 +127,7 @@ async def test_migration_leaves_already_migrated_ids_alone() -> None:
     ent_reg.entities = MagicMock()
     ent_reg.entities.values.return_value = [_fake_entity(u) for u in stable]
 
-    with patch(
-        "homeassistant.helpers.entity_registry.async_get", return_value=ent_reg
-    ):
+    with patch("homeassistant.helpers.entity_registry.async_get", return_value=ent_reg):
         await _async_migrate_unique_ids(MagicMock(), _make_entry())
 
     ent_reg.async_update_entity.assert_not_called()
@@ -132,9 +145,7 @@ async def test_migration_ignores_other_platforms_and_other_entries() -> None:
     ent_reg.entities = MagicMock()
     ent_reg.entities.values.return_value = entities
 
-    with patch(
-        "homeassistant.helpers.entity_registry.async_get", return_value=ent_reg
-    ):
+    with patch("homeassistant.helpers.entity_registry.async_get", return_value=ent_reg):
         await _async_migrate_unique_ids(MagicMock(), _make_entry())
 
     ent_reg.async_update_entity.assert_not_called()
@@ -152,9 +163,7 @@ async def test_migration_last_mowed_zone_id_not_matched_by_bare_pattern() -> Non
         _fake_entity(f"{DOMAIN}_DEV_zone_1_last_mowed"),
     ]
 
-    with patch(
-        "homeassistant.helpers.entity_registry.async_get", return_value=ent_reg
-    ):
+    with patch("homeassistant.helpers.entity_registry.async_get", return_value=ent_reg):
         await _async_migrate_unique_ids(MagicMock(), _make_entry())
 
     ent_reg.async_update_entity.assert_not_called()
