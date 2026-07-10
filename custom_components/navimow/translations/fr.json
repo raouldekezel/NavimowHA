@@ -73,14 +73,14 @@
       "current_zone": {
         "name": "Zone courante"
       },
-      "run_progress": {
-        "name": "Progression de la tonte"
+      "current_run_progress": {
+        "name": "Progression de la tonte en cours"
       },
-      "zone_progress": {
-        "name": "Progression de la zone"
+      "current_zone_progress": {
+        "name": "Progression de la zone en cours"
       },
-      "run_state": {
-        "name": "État de la tonte",
+      "current_run_state": {
+        "name": "État de la tonte en cours",
         "state": {
           "idle": "Au repos",
           "running": "En cours",
@@ -106,6 +106,9 @@
       },
       "last_run_zones": {
         "name": "Zones de la dernière tonte"
+      },
+      "last_run_area": {
+        "name": "Surface de la dernière tonte"
       },
       "zones": {
         "name": "Zones"

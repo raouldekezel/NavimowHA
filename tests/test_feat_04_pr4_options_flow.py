@@ -22,9 +22,9 @@ from custom_components.navimow.const import (
     SIGNAL_ZONE_NAMES_UPDATED,
 )
 from custom_components.navimow.sensor import (
-    NavimowZoneDurationSensor,
+    NavimowZoneLastAreaSensor,
+    NavimowZoneLastDurationSensor,
     NavimowZoneLastMowedSensor,
-    NavimowZoneSurfaceSensor,
     _wire_options_update_listener,
     _wire_zone_forget,
     _zone_display_name,
@@ -83,10 +83,12 @@ def test_display_name_uses_options_map_when_present() -> None:
 def test_zone_entities_read_name_from_options_on_construction() -> None:
     coord = _make_coordinator({1: _rec(1)})
     entry = _make_entry({OPTIONS_KEY_ZONES: {"1": {"name": "Prunier"}}})
-    surf = NavimowZoneSurfaceSensor(coord, entry, 1)
-    dur = NavimowZoneDurationSensor(coord, entry, 1)
+    surf = NavimowZoneLastAreaSensor(coord, entry, 1)
+    dur = NavimowZoneLastDurationSensor(coord, entry, 1)
     lm = NavimowZoneLastMowedSensor(coord, entry, 1)
-    assert surf.name == "Prunier"
+    # FEAT-08 renames appended ` dernière surface` to the last-area
+    # sensor for parallelism with ` dernière tonte`.
+    assert surf.name == "Prunier dernière surface"
     assert dur.name == "Prunier durée"
     assert lm.name == "Prunier dernière tonte"
 

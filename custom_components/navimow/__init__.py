@@ -452,6 +452,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "unload_flag": _unload_flag,
         }
 
+        # FEAT-08 (#88 naming): apply the one-time unique_id migration
+        # BEFORE forwarding to platforms — otherwise the freshly-built
+        # entities would race the migration and register under the old
+        # ids, orphaning HA history. See ``_async_migrate_unique_ids``.
+        await _async_migrate_unique_ids(hass, entry)
+
         # Forward to the platforms
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -462,6 +468,89 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     except Exception as err:
         _LOGGER.exception("Error setting up Navimow integration: %s", err)
         raise ConfigEntryNotReady(f"Error setting up integration: {err}") from err
+
+
+async def _async_migrate_unique_ids(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """FEAT-08 (#88 comment): rename existing entity_registry entries
+    from the pre-comment scheme to the ``current`` / ``last`` /
+    ``total`` naming.
+
+    Migrations (per config entry, static-suffix + per-zone patterns):
+
+    - ``_run_state`` → ``_current_run_state``
+    - ``_run_progress`` → ``_current_run_progress``
+    - ``_zone_progress`` → ``_current_zone_progress``
+    - ``_zone_<id>`` → ``_zone_<id>_last_area``
+    - ``_zone_<id>_duration`` → ``_zone_<id>_last_duration``
+
+    ``_zone_<id>_last_mowed`` is unchanged (already ``last``-scoped);
+    ``zones_total_area`` / ``last_run_area`` / ``zones`` are new or
+    unchanged keys and need no migration.
+
+    Idempotent: an entry already carrying the new unique_id (fresh
+    install, or a second setup after migration) is left alone.
+    """
+    import re
+
+    from homeassistant.helpers import entity_registry as er
+
+    ent_reg = er.async_get(hass)
+
+    STATIC_RENAMES = {
+        "run_state": "current_run_state",
+        "run_progress": "current_run_progress",
+        "zone_progress": "current_zone_progress",
+    }
+    # zone_<id> where the unique_id ends there — the base per-zone
+    # last-area sensor. Doesn't match `zone_<id>_duration` /
+    # `zone_<id>_last_mowed` / etc. — the `$` anchors on end of string.
+    ZONE_BARE = re.compile(r"^(navimow_.+?_zone_)(\d+)$")
+    # zone_<id>_duration — rename to `_last_duration`.
+    ZONE_DURATION = re.compile(r"^(navimow_.+?_zone_)(\d+)_duration$")
+
+    for e in list(ent_reg.entities.values()):
+        if e.config_entry_id != entry.entry_id:
+            continue
+        if e.platform != DOMAIN:
+            continue
+        uid = e.unique_id
+
+        # Static suffix renames (guarded by DOMAIN prefix — a false
+        # positive would need `navimow_<...>_run_state` from a
+        # different platform, which the platform check above already
+        # excludes). Idempotency guard: skip when the prefix already
+        # carries `_current` / `_last` — those unique_ids are the
+        # migration's own output.
+        renamed = False
+        for old, new in STATIC_RENAMES.items():
+            suffix = f"_{old}"
+            if not (uid.endswith(suffix) and uid.startswith(f"{DOMAIN}_")):
+                continue
+            prefix = uid[: -len(suffix)]
+            if prefix.endswith("_current") or prefix.endswith("_last"):
+                # Already migrated (`current_run_state`) — the endswith
+                # check on `_run_state` alone would otherwise re-fire.
+                continue
+            new_uid = f"{prefix}_{new}"
+            ent_reg.async_update_entity(e.entity_id, new_unique_id=new_uid)
+            _LOGGER.info("FEAT-08 unique_id migration: %s → %s", uid, new_uid)
+            renamed = True
+            break
+        if renamed:
+            continue
+
+        m = ZONE_DURATION.match(uid)
+        if m:
+            new_uid = f"{m.group(1)}{m.group(2)}_last_duration"
+            ent_reg.async_update_entity(e.entity_id, new_unique_id=new_uid)
+            _LOGGER.info("FEAT-08 unique_id migration: %s → %s", uid, new_uid)
+            continue
+
+        m = ZONE_BARE.match(uid)
+        if m:
+            new_uid = f"{m.group(1)}{m.group(2)}_last_area"
+            ent_reg.async_update_entity(e.entity_id, new_unique_id=new_uid)
+            _LOGGER.info("FEAT-08 unique_id migration: %s → %s", uid, new_uid)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

@@ -28,9 +28,9 @@ from unittest.mock import MagicMock
 from custom_components.navimow.const import OPTIONS_KEY_ZONES
 from custom_components.navimow.run_tracker import STATE_IDLE, STATE_RUNNING
 from custom_components.navimow.sensor import (
-    NavimowZoneDurationSensor,
+    NavimowZoneLastAreaSensor,
+    NavimowZoneLastDurationSensor,
     NavimowZoneLastMowedSensor,
-    NavimowZoneSurfaceSensor,
     _current_zone_display,
     _zone_display_name,
     _zone_raw_name,
@@ -177,10 +177,10 @@ def _trio_attrs(coord, entry, boundary_id: int) -> dict:
     """Return the three sub-classes' ``extra_state_attributes`` keyed
     by the sensor short name (surface / duration / last_mowed)."""
     return {
-        "surface": NavimowZoneSurfaceSensor(
+        "surface": NavimowZoneLastAreaSensor(
             coord, entry, boundary_id
         ).extra_state_attributes,
-        "duration": NavimowZoneDurationSensor(
+        "duration": NavimowZoneLastDurationSensor(
             coord, entry, boundary_id
         ).extra_state_attributes,
         "last_mowed": NavimowZoneLastMowedSensor(
@@ -256,7 +256,7 @@ def test_zone_name_reflects_options_mutation_without_reload() -> None:
     this test locks the value-side of the contract."""
     coord = _make_coordinator({1: _rec(1)})
     entry = _make_entry({OPTIONS_KEY_ZONES: {"1": {"name": "Prunier"}}})
-    surf = NavimowZoneSurfaceSensor(coord, entry, 1)
+    surf = NavimowZoneLastAreaSensor(coord, entry, 1)
     assert surf.extra_state_attributes["zone_name"] == "Prunier"
     # Rename via the options flow — same in-place mutation the real
     # NavimowOptionsFlowHandler.async_step_rename performs.
@@ -284,11 +284,13 @@ def test_subclass_attrs_still_present_and_merged() -> None:
         }
     )
     entry = _make_entry({OPTIONS_KEY_ZONES: {"1": {"name": "Prunier"}}})
-    surf = NavimowZoneSurfaceSensor(coord, entry, 1).extra_state_attributes
+    surf = NavimowZoneLastAreaSensor(coord, entry, 1).extra_state_attributes
     lm = NavimowZoneLastMowedSensor(coord, entry, 1).extra_state_attributes
-    # Surface keeps its own fields.
-    assert surf["size_estimate"] == 228
-    assert surf["last_surface_precise"] == 227.82
+    # LastArea keeps its own fields (FEAT-08 naming: `area_precise`,
+    # `size_estimate` was promoted to the dedicated `_total_area`
+    # sensor and no longer surfaces here).
+    assert "size_estimate" not in surf
+    assert surf["area_precise"] == 227.82
     assert surf["last_cmp_max"] == 10_000
     # And gains the base pair.
     assert surf["boundary_id"] == 1

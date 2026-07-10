@@ -30,8 +30,8 @@ from custom_components.navimow.sensor import (
     SENSOR_DESCRIPTIONS,
     NavimowPositionSensor,
     NavimowSensor,
+    NavimowZoneLastAreaSensor,
     NavimowZonesAggregateSensor,
-    NavimowZoneSurfaceSensor,
     _device_info,
 )
 from custom_components.navimow.zone_registry import ZoneRecord, ZoneRegistry
@@ -152,7 +152,7 @@ def test_three_families_produce_identical_device_info() -> None:
         entity_description=_first_description("battery"),
     )
     position = NavimowPositionSensor(coord)
-    zone_surface = NavimowZoneSurfaceSensor(coord, entry, 1)
+    zone_surface = NavimowZoneLastAreaSensor(coord, entry, 1)
     aggregate = NavimowZonesAggregateSensor(coord)
 
     infos = [
@@ -181,7 +181,7 @@ def test_all_families_share_identifiers() -> None:
             entity_description=_first_description("battery"),
         )._attr_device_info["identifiers"],
         NavimowPositionSensor(coord)._attr_device_info["identifiers"],
-        NavimowZoneSurfaceSensor(coord, entry, 1)._attr_device_info["identifiers"],
+        NavimowZoneLastAreaSensor(coord, entry, 1)._attr_device_info["identifiers"],
         NavimowZonesAggregateSensor(coord)._attr_device_info["identifiers"],
     )
     unique = {frozenset(ids) for ids in families}

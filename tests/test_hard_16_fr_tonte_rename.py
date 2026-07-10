@@ -41,11 +41,15 @@ def _en_sensor(key: str) -> dict:
 
 
 def test_run_progress_uses_tonte() -> None:
-    assert _fr_sensor("run_progress")["name"] == "Progression de la tonte"
+    # FEAT-08 (#88 comment): keys renamed to `current_*` — the FR
+    # vocabulary reads "en cours" for parallelism with the noun.
+    assert (
+        _fr_sensor("current_run_progress")["name"] == "Progression de la tonte en cours"
+    )
 
 
 def test_run_state_uses_tonte() -> None:
-    assert _fr_sensor("run_state")["name"] == "État de la tonte"
+    assert _fr_sensor("current_run_state")["name"] == "État de la tonte en cours"
 
 
 def test_current_run_started_uses_tonte_en_cours() -> None:
@@ -67,15 +71,18 @@ def test_last_run_result_uses_tonte() -> None:
 
 
 def test_no_passage_left_on_any_renamed_key() -> None:
-    """Belt-and-braces: none of the six renamed name strings still
-    carries the word ``passage`` (case-insensitive)."""
+    """Belt-and-braces: none of the renamed name strings still carries
+    the word ``passage`` (case-insensitive). Post-FEAT-08 the run
+    family expanded to include `current_run_state` /
+    `current_run_progress` (renamed from `run_state` / `run_progress`)."""
     for key in (
-        "run_progress",
-        "run_state",
+        "current_run_progress",
+        "current_run_state",
         "current_run_started",
         "last_run_started",
         "last_run_duration",
         "last_run_result",
+        "last_run_area",  # FEAT-08 promotion
     ):
         name = _fr_sensor(key)["name"]
         assert "passage" not in name.lower(), f"{key} → {name!r}"
@@ -88,8 +95,9 @@ def test_no_passage_left_on_any_renamed_key() -> None:
 
 def test_run_state_enum_unchanged() -> None:
     """The nested ``state.*`` sub-dict qualifies the outcome, not the
-    noun. It must stay identical."""
-    state = _fr_sensor("run_state")["state"]
+    noun. It must stay identical (post-FEAT-08 rename, the key is now
+    `current_run_state`)."""
+    state = _fr_sensor("current_run_state")["state"]
     assert state == {
         "idle": "Au repos",
         "running": "En cours",
@@ -108,9 +116,10 @@ def test_last_run_result_enum_unchanged() -> None:
 
 def test_zone_progress_stays_on_zone() -> None:
     """The zone family carries its own noun (``zone``, not
-    ``tonte``) — scope discipline. HARD-16 renames the run family
-    only."""
-    assert _fr_sensor("zone_progress")["name"] == "Progression de la zone"
+    ``tonte``). Post-FEAT-08 the key is `current_zone_progress`."""
+    assert (
+        _fr_sensor("current_zone_progress")["name"] == "Progression de la zone en cours"
+    )
 
 
 def test_current_zone_stays_on_zone() -> None:
@@ -131,12 +140,13 @@ def test_battery_and_position_untouched() -> None:
 
 
 def test_english_names_untouched() -> None:
-    """The EN noun-alignment (run → session or run → mow) is a
-    separate discussion; HARD-16 only ships the FR rename. Locking the
-    six EN strings guards against an accidental cross-locale edit."""
-    assert _en_sensor("run_progress")["name"] == "Run progress"
-    assert _en_sensor("run_state")["name"] == "Run state"
+    """The EN strings track the FEAT-08 key rename mechanically (the
+    display carries the key's `current`/`last` prefix). Locking them
+    here guards against an accidental cross-locale edit."""
+    assert _en_sensor("current_run_progress")["name"] == "Current run progress"
+    assert _en_sensor("current_run_state")["name"] == "Current run state"
     assert _en_sensor("current_run_started")["name"] == "Current run started"
     assert _en_sensor("last_run_started")["name"] == "Last run started"
     assert _en_sensor("last_run_duration")["name"] == "Last run duration"
     assert _en_sensor("last_run_result")["name"] == "Last run result"
+    assert _en_sensor("last_run_area")["name"] == "Last run area"

@@ -2,7 +2,7 @@
 
 Exercises the two additive entities:
 
-- ``NavimowZoneAreaSensor`` — per-zone ``<slug>_zone_<id>_surface``,
+- ``NavimowZoneTotalAreaSensor`` — per-zone ``<slug>_zone_<id>_surface``,
   ``ceil(size_estimate_m2)`` from the last complete pass, ``None`` until
   the first complete pass lands, precise float + timestamp in attrs.
 - ``NavimowZonesTotalAreaSensor`` — aggregate ``<slug>_zones_surface_totale``,
@@ -11,7 +11,7 @@ Exercises the two additive entities:
 
 Plus the two wire seams:
 
-- Setup adds one ``NavimowZoneAreaSensor`` per restored boundary and one
+- Setup adds one ``NavimowZoneTotalAreaSensor`` per restored boundary and one
   static ``NavimowZonesTotalAreaSensor``.
 - Runtime discovery adds the new per-zone entity alongside the trio.
 
@@ -30,9 +30,9 @@ from homeassistant.const import UnitOfArea
 
 from custom_components.navimow.const import DOMAIN
 from custom_components.navimow.sensor import (
-    NavimowZoneAreaSensor,
     NavimowZonesAggregateSensor,
     NavimowZonesTotalAreaSensor,
+    NavimowZoneTotalAreaSensor,
     async_setup_entry,
 )
 from custom_components.navimow.zone_registry import (
@@ -40,7 +40,6 @@ from custom_components.navimow.zone_registry import (
     ZoneRecord,
     ZoneRegistry,
 )
-
 
 # --------------------------------------------------------------------- #
 # Fixtures                                                              #
@@ -150,7 +149,7 @@ def test_registry_advances_stamp_on_next_complete_pass() -> None:
 
 
 # --------------------------------------------------------------------- #
-# 2. NavimowZoneAreaSensor contracts                                    #
+# 2. NavimowZoneTotalAreaSensor contracts                                    #
 # --------------------------------------------------------------------- #
 
 
@@ -177,7 +176,7 @@ def test_area_sensor_state_ceils_size_estimate() -> None:
     coord = _make_coordinator(
         {1: _rec_with_estimate(1, size_estimate=227.82, updated_ms=1_779_694_000_000)}
     )
-    ent = NavimowZoneAreaSensor(coord, _make_entry(), 1)
+    ent = NavimowZoneTotalAreaSensor(coord, _make_entry(), 1)
     assert ent.native_value == 228
     assert ent.native_unit_of_measurement == UnitOfArea.SQUARE_METERS
     assert ent.device_class == SensorDeviceClass.AREA
@@ -187,7 +186,7 @@ def test_area_sensor_state_none_before_first_complete_pass() -> None:
     """No fake ``0`` fallback — the state stays honest at
     ``unknown`` until a complete pass lands."""
     coord = _make_coordinator({3: ZoneRecord(boundary_id=3)})
-    ent = NavimowZoneAreaSensor(coord, _make_entry(), 3)
+    ent = NavimowZoneTotalAreaSensor(coord, _make_entry(), 3)
     assert ent.native_value is None
     # The record IS present, so the entity is `available`.
     assert ent.available is True
@@ -195,7 +194,7 @@ def test_area_sensor_state_none_before_first_complete_pass() -> None:
 
 def test_area_sensor_state_none_when_boundary_missing() -> None:
     coord = _make_coordinator({})
-    ent = NavimowZoneAreaSensor(coord, _make_entry(), 1)
+    ent = NavimowZoneTotalAreaSensor(coord, _make_entry(), 1)
     assert ent.native_value is None
     assert ent.extra_state_attributes is None
     assert ent.available is False
@@ -204,16 +203,14 @@ def test_area_sensor_state_none_when_boundary_missing() -> None:
 def test_area_sensor_attributes_carry_precise_float_and_timestamp() -> None:
     # 1_779_694_000_000 ms = 2026-05-25 07:26:40 UTC
     coord = _make_coordinator(
-        {
-            1: _rec_with_estimate(
-                1, size_estimate=227.82, updated_ms=1_779_694_000_000
-            )
-        }
+        {1: _rec_with_estimate(1, size_estimate=227.82, updated_ms=1_779_694_000_000)}
     )
-    ent = NavimowZoneAreaSensor(coord, _make_entry(), 1)
+    ent = NavimowZoneTotalAreaSensor(coord, _make_entry(), 1)
     attrs = ent.extra_state_attributes
     assert attrs["boundary_id"] == 1
-    assert attrs["size_estimate_precise"] == 227.82
+    # FEAT-08 uniform naming: precise float uses `area_precise` on
+    # every area sensor.
+    assert attrs["area_precise"] == 227.82
     got = attrs["last_complete_pass_at"]
     assert isinstance(got, datetime)
     assert got.tzinfo == UTC
@@ -233,25 +230,27 @@ def test_area_sensor_attributes_timestamp_none_before_first_complete_pass() -> N
         # size_estimate_m2 is None → size_estimate_updated_ms stays None too.
     )
     coord = _make_coordinator({3: rec})
-    ent = NavimowZoneAreaSensor(coord, _make_entry(), 3)
+    ent = NavimowZoneTotalAreaSensor(coord, _make_entry(), 3)
     attrs = ent.extra_state_attributes
-    assert attrs["size_estimate_precise"] is None
+    assert attrs["area_precise"] is None
     assert attrs["last_complete_pass_at"] is None
 
 
-def test_area_sensor_unique_id_uses_surface_suffix() -> None:
+def test_area_sensor_unique_id_uses_total_area_suffix() -> None:
     coord = _make_coordinator(
         {7: _rec_with_estimate(7, size_estimate=100.0, updated_ms=1_000)}
     )
-    ent = NavimowZoneAreaSensor(coord, _make_entry(), 7)
-    assert ent.unique_id == f"{DOMAIN}_REDACTED-ROBOT-SERIAL_zone_7_surface"
+    ent = NavimowZoneTotalAreaSensor(coord, _make_entry(), 7)
+    # FEAT-08 naming: `_total_area`, migrated from the pre-comment
+    # placeholder `_surface`. Migration handled in `__init__.py`.
+    assert ent.unique_id == f"{DOMAIN}_REDACTED-ROBOT-SERIAL_zone_7_total_area"
 
 
 def test_area_sensor_fallback_name_carries_surface_suffix() -> None:
     coord = _make_coordinator(
         {3: _rec_with_estimate(3, size_estimate=123.5, updated_ms=1_000)}
     )
-    ent = NavimowZoneAreaSensor(coord, _make_entry(), 3)
+    ent = NavimowZoneTotalAreaSensor(coord, _make_entry(), 3)
     # `Zone #<id>` fallback + ` surface` HARD-11 suffix.
     assert ent.name == "Zone #3 surface"
 
@@ -264,7 +263,7 @@ def test_area_sensor_operator_rename_flows_to_display_name() -> None:
         {1: _rec_with_estimate(1, size_estimate=228.0, updated_ms=1_000)}
     )
     entry = _make_entry(options={"zones": {"1": {"name": "Prunier"}}})
-    ent = NavimowZoneAreaSensor(coord, entry, 1)
+    ent = NavimowZoneTotalAreaSensor(coord, entry, 1)
     assert ent.name == "Prunier surface"
 
 
@@ -289,9 +288,17 @@ def test_total_area_sensor_sums_ceiled_state() -> None:
 
 def test_total_area_sensor_zero_when_no_zones_yet() -> None:
     coord = _make_coordinator({})
+    coord.config_entry = _make_entry()
     ent = NavimowZonesTotalAreaSensor(coord)
     assert ent.native_value == 0
-    assert ent.extra_state_attributes == {"zone_ids": [], "per_zone": {}}
+    # FEAT-08 comment (#88, 2026-07-10): attrs are `zone_ids`,
+    # `zone_names` (parallel list), and `area_precise` (float sum,
+    # 0.0 when the registry is empty).
+    assert ent.extra_state_attributes == {
+        "zone_ids": [],
+        "zone_names": [],
+        "area_precise": 0,
+    }
 
 
 def test_total_area_sensor_zones_without_estimate_contribute_zero() -> None:
@@ -301,12 +308,35 @@ def test_total_area_sensor_zones_without_estimate_contribute_zero() -> None:
             3: ZoneRecord(boundary_id=3),  # no estimate yet
         }
     )
+    coord.config_entry = _make_entry()
     ent = NavimowZonesTotalAreaSensor(coord)
     assert ent.native_value == 228
     attrs = ent.extra_state_attributes
-    assert attrs["per_zone"][1] == 228
-    assert attrs["per_zone"][3] is None
     assert attrs["zone_ids"] == [1, 3]
+    # `zone_names` follows the same order as `zone_ids`. Fallback
+    # to `Zone #<id>` when no operator name is set.
+    assert attrs["zone_names"] == ["Zone #1", "Zone #3"]
+    # `area_precise` == precise sum before ceil.
+    assert attrs["area_precise"] == 228.0
+
+
+def test_total_area_sensor_zone_names_reflect_operator_renames() -> None:
+    """The `zone_names` attr must show the renamed zone as soon as the
+    options flow updates. The refresh dispatcher wiring is verified
+    separately; this test just pins the read path."""
+    coord = _make_coordinator(
+        {
+            1: _rec_with_estimate(1, size_estimate=228.0, updated_ms=1_000),
+            3: _rec_with_estimate(3, size_estimate=124.0, updated_ms=2_000),
+        }
+    )
+    coord.config_entry = _make_entry(
+        options={"zones": {"1": {"name": "Prunier"}, "3": {"name": "Figuier"}}}
+    )
+    ent = NavimowZonesTotalAreaSensor(coord)
+    attrs = ent.extra_state_attributes
+    assert attrs["zone_ids"] == [1, 3]
+    assert attrs["zone_names"] == ["Prunier", "Figuier"]
 
 
 def test_total_area_sensor_translation_key_set() -> None:
@@ -353,7 +383,7 @@ async def test_async_setup_entry_adds_area_sensor_per_zone_plus_total_area() -> 
         await async_setup_entry(hass, config_entry, async_add_entities)
 
     added = list(async_add_entities.call_args.args[0])
-    area_entities = [e for e in added if isinstance(e, NavimowZoneAreaSensor)]
+    area_entities = [e for e in added if isinstance(e, NavimowZoneTotalAreaSensor)]
     total_area = [e for e in added if isinstance(e, NavimowZonesTotalAreaSensor)]
     count_agg = [e for e in added if isinstance(e, NavimowZonesAggregateSensor)]
     # One area sensor per pre-restored boundary.
@@ -385,7 +415,7 @@ async def test_async_setup_entry_no_zones_still_adds_total_area_aggregate() -> N
         await async_setup_entry(hass, config_entry, async_add_entities)
 
     added = list(async_add_entities.call_args.args[0])
-    area_entities = [e for e in added if isinstance(e, NavimowZoneAreaSensor)]
+    area_entities = [e for e in added if isinstance(e, NavimowZoneTotalAreaSensor)]
     total_area = [e for e in added if isinstance(e, NavimowZonesTotalAreaSensor)]
     assert area_entities == []
     assert len(total_area) == 1
@@ -400,7 +430,7 @@ async def test_runtime_discovery_adds_area_sensor_alongside_trio() -> None:
     """Full end-to-end via ``async_setup_entry`` — the runtime-discovery
     callback captured from the dispatcher wiring must, when fired with a
     fresh boundary, add exactly four sensors including the new
-    ``NavimowZoneAreaSensor``. Mirrors the setup-time quartet.
+    ``NavimowZoneTotalAreaSensor``. Mirrors the setup-time quartet.
     """
     coord = _make_coordinator({})  # empty registry — force runtime discovery
     device = coord.device
@@ -437,7 +467,7 @@ async def test_runtime_discovery_adds_area_sensor_alongside_trio() -> None:
     async_add_entities.assert_called_once()
     added = async_add_entities.call_args.args[0]
     assert len(added) == 4
-    assert any(isinstance(e, NavimowZoneAreaSensor) for e in added)
+    assert any(isinstance(e, NavimowZoneTotalAreaSensor) for e in added)
 
 
 # --------------------------------------------------------------------- #
@@ -497,11 +527,10 @@ async def test_forget_removes_surface_entity_from_registry() -> None:
         on_forget = captured[2]
         on_forget(1)
 
-    # The four suffixes must all have been probed on the entity registry.
-    probed = {
-        call.args[2] for call in ent_reg.async_get_entity_id.call_args_list
-    }
-    assert f"{DOMAIN}_{device.id}_zone_1" in probed
-    assert f"{DOMAIN}_{device.id}_zone_1_duration" in probed
+    # FEAT-08 naming: the four suffixes are `_last_area`,
+    # `_last_duration`, `_last_mowed`, `_total_area`.
+    probed = {call.args[2] for call in ent_reg.async_get_entity_id.call_args_list}
+    assert f"{DOMAIN}_{device.id}_zone_1_last_area" in probed
+    assert f"{DOMAIN}_{device.id}_zone_1_last_duration" in probed
     assert f"{DOMAIN}_{device.id}_zone_1_last_mowed" in probed
-    assert f"{DOMAIN}_{device.id}_zone_1_surface" in probed
+    assert f"{DOMAIN}_{device.id}_zone_1_total_area" in probed

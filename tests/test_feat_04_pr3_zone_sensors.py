@@ -21,11 +21,11 @@ from homeassistant.const import UnitOfArea, UnitOfTime
 
 from custom_components.navimow.const import DOMAIN, SIGNAL_ZONE_DISCOVERED
 from custom_components.navimow.sensor import (
-    NavimowZoneDurationSensor,
+    NavimowZoneLastAreaSensor,
+    NavimowZoneLastDurationSensor,
     NavimowZoneLastMowedSensor,
     NavimowZonesAggregateSensor,
-    NavimowZoneSurfaceSensor,
-    _build_zone_trio,
+    _build_zone_family,
     _wire_zone_discovery,
     async_setup_entry,
 )
@@ -82,21 +82,23 @@ def _rec(
 
 def test_surface_state_ceils_precise_value_and_exposes_precise_attr() -> None:
     coord = _make_coordinator({1: _rec(1, surface=227.82, size_estimate=227.82)})
-    ent = NavimowZoneSurfaceSensor(coord, _make_entry(), 1)
-    # ceil(227.82) = 228 m², precise float retained in attr.
+    ent = NavimowZoneLastAreaSensor(coord, _make_entry(), 1)
+    # ceil(227.82) = 228 m², precise float retained in attr `area_precise`
+    # (FEAT-08 uniform naming). `size_estimate` was promoted to the
+    # dedicated `NavimowZoneTotalAreaSensor` and dropped from this dict.
     assert ent.native_value == 228
     assert ent.native_unit_of_measurement == UnitOfArea.SQUARE_METERS
     attrs = ent.extra_state_attributes
     assert attrs["boundary_id"] == 1
-    assert attrs["size_estimate"] == 228
-    assert attrs["last_surface_precise"] == 227.82
+    assert "size_estimate" not in attrs  # promoted
+    assert attrs["area_precise"] == 227.82
     assert attrs["last_cmp_max"] == 10_000
     assert attrs["last_result"] == "completed"
 
 
 def test_surface_returns_none_when_registry_lacks_boundary() -> None:
     coord = _make_coordinator({})
-    ent = NavimowZoneSurfaceSensor(coord, _make_entry(), 1)
+    ent = NavimowZoneLastAreaSensor(coord, _make_entry(), 1)
     assert ent.native_value is None
     assert ent.extra_state_attributes is None
     assert ent.available is False
@@ -106,17 +108,20 @@ def test_surface_returns_none_when_record_has_no_surface_yet() -> None:
     # A newly-created ZoneRecord (first sighting, no run closed) has None
     # for last_surface_m2; the entity must render `unknown`, not crash.
     coord = _make_coordinator({3: ZoneRecord(boundary_id=3)})
-    ent = NavimowZoneSurfaceSensor(coord, _make_entry(), 3)
+    ent = NavimowZoneLastAreaSensor(coord, _make_entry(), 3)
     assert ent.native_value is None
     # But the record IS there, so `available` is True and attrs render.
     assert ent.available is True
     assert ent.extra_state_attributes["boundary_id"] == 3
-    assert ent.extra_state_attributes["size_estimate"] is None
+    # FEAT-08 promotion: `size_estimate` moved to the dedicated
+    # total-area entity — no longer surfaces here.
+    assert "size_estimate" not in ent.extra_state_attributes
+    assert ent.extra_state_attributes["area_precise"] is None
 
 
 def test_duration_entity_native_value_and_class() -> None:
     coord = _make_coordinator({1: _rec(1, duration=2400)})
-    ent = NavimowZoneDurationSensor(coord, _make_entry(), 1)
+    ent = NavimowZoneLastDurationSensor(coord, _make_entry(), 1)
     assert ent.native_value == 2400
     assert ent.native_unit_of_measurement == UnitOfTime.SECONDS
     assert ent.device_class == SensorDeviceClass.DURATION
@@ -133,25 +138,31 @@ def test_last_mowed_entity_returns_utc_datetime() -> None:
 
 
 def test_zone_entities_carry_fallback_name_until_pr4() -> None:
-    """PR 3 → PR 4 handoff: names are ``#<id>``. PR 4 will override
-    ``_attr_name`` from the options flow map."""
-    coord = _make_coordinator({3: _rec(3, surface=123.5)})
-    surf = NavimowZoneSurfaceSensor(coord, _make_entry(), 3)
-    dur = NavimowZoneDurationSensor(coord, _make_entry(), 3)
+    """PR 3 → PR 4 handoff: names are ``Zone #<id>`` + FEAT-08 suffix.
+    PR 4's options flow overrides the ``Zone #<id>`` base."""
+    coord = _make_coordinator({3: _rec(3, surface=123.5, size_estimate=123.5)})
+    surf = NavimowZoneLastAreaSensor(coord, _make_entry(), 3)
+    dur = NavimowZoneLastDurationSensor(coord, _make_entry(), 3)
     lm = NavimowZoneLastMowedSensor(coord, _make_entry(), 3)
-    assert surf.name == "Zone #3"
+    # FEAT-08 renames appended a ` dernière surface` suffix to the
+    # last-area sensor for parallelism with ` dernière tonte`.
+    assert surf.name == "Zone #3 dernière surface"
     assert dur.name == "Zone #3 durée"
     assert lm.name == "Zone #3 dernière tonte"
 
 
 def test_zone_entities_unique_ids_anchored_on_boundary_id() -> None:
     coord = _make_coordinator({7: _rec(7)})
-    trio = _build_zone_trio(coord, _make_entry(), 7)
-    ids = {e.unique_id for e in trio}
+    family = _build_zone_family(coord, _make_entry(), 7)
+    ids = {e.unique_id for e in family}
+    # FEAT-08: the family is now four entities; the base zone_<id>
+    # id was renamed to `_last_area` and the size-estimate sensor
+    # arrived as `_total_area` (migration handled in `__init__.py`).
     assert ids == {
-        f"{DOMAIN}_REDACTED-ROBOT-SERIAL_zone_7",
-        f"{DOMAIN}_REDACTED-ROBOT-SERIAL_zone_7_duration",
+        f"{DOMAIN}_REDACTED-ROBOT-SERIAL_zone_7_last_area",
+        f"{DOMAIN}_REDACTED-ROBOT-SERIAL_zone_7_last_duration",
         f"{DOMAIN}_REDACTED-ROBOT-SERIAL_zone_7_last_mowed",
+        f"{DOMAIN}_REDACTED-ROBOT-SERIAL_zone_7_total_area",
     }
 
 
@@ -171,7 +182,12 @@ def test_aggregate_state_is_zone_count() -> None:
     assert agg.native_value == 2
 
 
-def test_aggregate_attributes_sum_size_estimates_ceiled_and_carry_ids() -> None:
+def test_aggregate_attributes_carry_only_zone_ids_after_feat_08() -> None:
+    """FEAT-08 (#88 comment): `total_area` was promoted to its own
+    sensor `zones_total_area`, `per_zone` was dissolved into the
+    per-zone family. The count aggregate's attrs shrink to just
+    `zone_ids` so a template can't accidentally read a stale summary
+    from here instead of the dedicated entities."""
     coord = _make_coordinator(
         {
             1: _rec(1, size_estimate=227.82, result="completed"),
@@ -180,17 +196,15 @@ def test_aggregate_attributes_sum_size_estimates_ceiled_and_carry_ids() -> None:
     )
     agg = NavimowZonesAggregateSensor(coord)
     attrs = agg.extra_state_attributes
-    # ceil(227.82) + ceil(123.54) = 228 + 124 = 352
-    assert attrs["total_area"] == 352
-    assert attrs["zone_ids"] == [1, 3]
-    assert attrs["per_zone"][1]["size_estimate"] == 228
-    assert attrs["per_zone"][3]["size_estimate"] == 124
+    assert attrs == {"zone_ids": [1, 3]}
+    assert "total_area" not in attrs  # promoted
+    assert "per_zone" not in attrs  # dissolved
 
 
-def test_aggregate_ignores_zones_without_size_estimate_yet() -> None:
-    """A zone born via `_forget` recreation, or one still waiting for
-    its first complete pass, has ``size_estimate_m2 = None``. It counts
-    in the number of zones but contributes 0 to ``total_area``."""
+def test_aggregate_count_state_still_reflects_registry_size() -> None:
+    """A zone still waiting for its first complete pass counts in the
+    aggregate's state (the total surface question moves to
+    `zones_total_area`)."""
     coord = _make_coordinator(
         {
             1: _rec(1, size_estimate=228.0),
@@ -198,10 +212,7 @@ def test_aggregate_ignores_zones_without_size_estimate_yet() -> None:
         }
     )
     agg = NavimowZonesAggregateSensor(coord)
-    assert agg.native_value == 2
-    attrs = agg.extra_state_attributes
-    assert attrs["total_area"] == 228  # only zone 1 contributes
-    assert attrs["per_zone"][3]["size_estimate"] is None
+    assert agg.native_value == 2  # count only
 
 
 def test_aggregate_translation_key_is_set_for_static_name() -> None:
@@ -370,8 +381,8 @@ async def test_async_setup_entry_eager_creates_aggregate_and_trio_per_zone() -> 
         if isinstance(
             e,
             (
-                NavimowZoneSurfaceSensor,
-                NavimowZoneDurationSensor,
+                NavimowZoneLastAreaSensor,
+                NavimowZoneLastDurationSensor,
                 NavimowZoneLastMowedSensor,
             ),
         )
@@ -380,8 +391,8 @@ async def test_async_setup_entry_eager_creates_aggregate_and_trio_per_zone() -> 
     assert {e._boundary_id for e in zone_entities} == {1, 3}
     # And each boundary got exactly one of each type.
     for cls in (
-        NavimowZoneSurfaceSensor,
-        NavimowZoneDurationSensor,
+        NavimowZoneLastAreaSensor,
+        NavimowZoneLastDurationSensor,
         NavimowZoneLastMowedSensor,
     ):
         assert {e._boundary_id for e in added if isinstance(e, cls)} == {1, 3}
@@ -433,8 +444,8 @@ async def test_async_setup_entry_with_no_restored_zones_still_adds_aggregate() -
         if isinstance(
             e,
             (
-                NavimowZoneSurfaceSensor,
-                NavimowZoneDurationSensor,
+                NavimowZoneLastAreaSensor,
+                NavimowZoneLastDurationSensor,
                 NavimowZoneLastMowedSensor,
             ),
         )
