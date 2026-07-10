@@ -110,8 +110,8 @@ def _feed_vs(coord, vs: int) -> None:
 
 def test_run_progress_is_none_at_idle() -> None:
     coord = _make_coordinator()
-    assert _desc("run_progress").value_fn(coord) is None
-    assert _desc("zone_progress").value_fn(coord) is None
+    assert _desc("current_run_progress").value_fn(coord) is None
+    assert _desc("current_zone_progress").value_fn(coord) is None
 
 
 def test_run_progress_reads_last_mp_while_running() -> None:
@@ -129,9 +129,9 @@ def test_run_progress_reads_last_mp_while_running() -> None:
         },
     )
     assert coord.run_tracker.state == STATE_RUNNING
-    assert _desc("run_progress").value_fn(coord) == 42
+    assert _desc("current_run_progress").value_fn(coord) == 42
     # cmp_max=4700 → 47.0 %
-    assert _desc("zone_progress").value_fn(coord) == 47.0
+    assert _desc("current_zone_progress").value_fn(coord) == 47.0
 
 
 def test_run_progress_held_during_paused_docked() -> None:
@@ -151,8 +151,8 @@ def test_run_progress_held_during_paused_docked() -> None:
     coord.run_tracker.process_vehicle_state(VS_DOCKED_IDLE)
     assert coord.run_tracker.state == STATE_PAUSED_DOCKED
     # Values are held (still readable) during pause.
-    assert _desc("run_progress").value_fn(coord) == 42
-    assert _desc("zone_progress").value_fn(coord) == 47.0
+    assert _desc("current_run_progress").value_fn(coord) == 42
+    assert _desc("current_zone_progress").value_fn(coord) == 47.0
 
 
 def test_run_progress_drops_to_none_on_completed() -> None:
@@ -172,8 +172,8 @@ def test_run_progress_drops_to_none_on_completed() -> None:
     # BUG-09: mp=100 alone doesn't close — need a dock arrival too.
     _feed_vs(coord, VS_DOCKED_CHARGING)
     assert coord.run_tracker.state == STATE_COMPLETED
-    assert _desc("run_progress").value_fn(coord) is None
-    assert _desc("zone_progress").value_fn(coord) is None
+    assert _desc("current_run_progress").value_fn(coord) is None
+    assert _desc("current_zone_progress").value_fn(coord) is None
 
 
 # --------------------------------------------------------------------- #
@@ -183,7 +183,7 @@ def test_run_progress_drops_to_none_on_completed() -> None:
 
 def test_run_state_idle() -> None:
     coord = _make_coordinator()
-    assert _desc("run_state").value_fn(coord) == "idle"
+    assert _desc("current_run_state").value_fn(coord) == "idle"
 
 
 def test_run_state_running_vs_returning() -> None:
@@ -199,9 +199,9 @@ def test_run_state_running_vs_returning() -> None:
         },
     )
     coord.vehicle_state = VS_MOWING
-    assert _desc("run_state").value_fn(coord) == "running"
+    assert _desc("current_run_state").value_fn(coord) == "running"
     coord.vehicle_state = VS_RETURNING
-    assert _desc("run_state").value_fn(coord) == "returning"
+    assert _desc("current_run_state").value_fn(coord) == "returning"
 
 
 def test_run_state_paused() -> None:
@@ -218,7 +218,7 @@ def test_run_state_paused() -> None:
     )
     coord.run_tracker.process_vehicle_state(VS_DOCKED_IDLE)
     coord.vehicle_state = VS_DOCKED_IDLE
-    assert _desc("run_state").value_fn(coord) == "paused"
+    assert _desc("current_run_state").value_fn(coord) == "paused"
 
 
 # --------------------------------------------------------------------- #

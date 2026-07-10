@@ -73,14 +73,14 @@
       "current_zone": {
         "name": "Current zone"
       },
-      "run_progress": {
-        "name": "Run progress"
+      "current_run_progress": {
+        "name": "Current run progress"
       },
-      "zone_progress": {
-        "name": "Zone progress"
+      "current_zone_progress": {
+        "name": "Current zone progress"
       },
-      "run_state": {
-        "name": "Run state",
+      "current_run_state": {
+        "name": "Current run state",
         "state": {
           "idle": "Idle",
           "running": "Running",
@@ -107,8 +107,14 @@
       "last_run_zones": {
         "name": "Last run zones"
       },
+      "last_run_area": {
+        "name": "Last run area"
+      },
       "zones": {
         "name": "Zones"
+      },
+      "zones_total_area": {
+        "name": "Zones — total area"
       }
     },
     "binary_sensor": {

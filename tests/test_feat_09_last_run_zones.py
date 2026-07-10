@@ -434,6 +434,40 @@ def test_last_run_result_value_fn_and_attrs_regression() -> None:
     assert d.value_fn(coord) == "completed"
     attrs = d.attrs_fn(coord)
     assert attrs["zones"] == payload["zones"]
-    assert attrs["session_area"] == 353.55
+    # FEAT-08 (#88 comment naming): `session_area` was promoted out of
+    # `last_run_result` attrs into its own `last_run_area` sensor.
+    assert "session_area" not in attrs
     assert attrs["mow_start_type"] == 1
     assert attrs["history"] == ["h1", "h2"]
+
+
+def test_last_run_area_promoted_sensor_reads_session_area() -> None:
+    """FEAT-08 promotion: the dedicated `last_run_area` sensor exposes
+    `session_area` as its ceil'd state and the precise float as
+    `area_precise` (uniform naming across all area sensors)."""
+    d = _get_description("last_run_area")
+    assert d is not None
+    coord = _make_coordinator(
+        last_finished_run={"result": "completed", "session_area": 353.55}
+    )
+    assert d.value_fn(coord) == 354  # ceil(353.55)
+    assert d.attrs_fn(coord) == {"area_precise": 353.55}
+
+
+def test_last_run_area_state_none_when_no_closed_run() -> None:
+    d = _get_description("last_run_area")
+    coord = _make_coordinator()  # no last_finished_run
+    assert d.value_fn(coord) is None
+    assert d.attrs_fn(coord) is None
+
+
+def test_last_run_area_state_none_when_session_area_missing() -> None:
+    """Some tracker paths degrade to `session_area = None` (e.g. the
+    first close after a pre-FEAT-06 store restore); the sensor must
+    render `unknown`, not crash."""
+    d = _get_description("last_run_area")
+    coord = _make_coordinator(
+        last_finished_run={"result": "completed", "session_area": None}
+    )
+    assert d.value_fn(coord) is None
+    assert d.attrs_fn(coord) is None

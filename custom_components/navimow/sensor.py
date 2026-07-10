@@ -262,6 +262,16 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
             if (v := (c.stats or {}).get("area_week")) is not None
             else None
         ),
+        # FEAT-08 (#88 naming): expose the precise float as `area_precise`
+        # — uniform contract across every area sensor
+        # (`weekly_area`, `zone_<id>_last_area`, `zone_<id>_total_area`,
+        # `zones_total_area`, `last_run_area`) so a template reads the
+        # same attribute name on any of them.
+        attrs_fn=lambda c: (
+            {"area_precise": v}
+            if (v := (c.stats or {}).get("area_week")) is not None
+            else None
+        ),
         # HARD-02: cumulative weekly counter must survive an HA restart.
         # The cloud stops publishing /location type-2 while the robot is
         # docked (FEAT-02 diag), so without RestoreSensor the value would
@@ -319,9 +329,12 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
     # Operator-decided: keep the raw firmware `mp`, do not renormalise
     # to session scope — the number honestly reflects the task the
     # firmware is executing.
+    # FEAT-08 (#88 naming): renamed `run_progress` → `current_run_progress`
+    # to align with the `current` / `last` axis. Migration lives in
+    # `__init__.py::_async_migrate_unique_ids`.
     NavimowSensorEntityDescription(
-        key="run_progress",
-        translation_key="run_progress",
+        key="current_run_progress",
+        translation_key="current_run_progress",
         native_unit_of_measurement=PERCENTAGE,
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:progress-check",
@@ -329,11 +342,12 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
             r["last_mp"] if (r := _current_run_or_none(c)) is not None else None
         ),
     ),
-    # `zone_progress` (%): `currentMowProgress / 100` of the current
-    # zone, held during pause, `None` at rest.
+    # `current_zone_progress` (%): `currentMowProgress / 100` of the
+    # current zone, held during pause, `None` at rest. Renamed from
+    # `zone_progress` per FEAT-08 (#88 naming).
     NavimowSensorEntityDescription(
-        key="zone_progress",
-        translation_key="zone_progress",
+        key="current_zone_progress",
+        translation_key="current_zone_progress",
         native_unit_of_measurement=PERCENTAGE,
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:progress-helper",
@@ -343,15 +357,16 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
             else None
         ),
     ),
-    # `run_state`: enum idle/running/paused/returning. `returning`
-    # heuristic documented in `_run_state_display`. `options` must
-    # match every value the display fn can return — HA's enum-checks
-    # block short-circuits when `options is None` (no error raised),
-    # so declaring them here enables value-in-options validation and
+    # `current_run_state`: enum idle/running/paused/returning. Renamed
+    # from `run_state` per FEAT-08 (#88 naming). `returning` heuristic
+    # documented in `_run_state_display`. `options` must match every
+    # value the display fn can return — HA's enum-checks block
+    # short-circuits when `options is None` (no error raised), so
+    # declaring them here enables value-in-options validation and
     # exposes the OPTIONS capability attribute for the frontend.
     NavimowSensorEntityDescription(
-        key="run_state",
-        translation_key="run_state",
+        key="current_run_state",
+        translation_key="current_run_state",
         device_class=SensorDeviceClass.ENUM,
         options=["idle", "running", "paused", "returning"],
         icon="mdi:state-machine",
@@ -397,10 +412,14 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
         ),
     ),
     # `last_run_result` — `completed` / `interrupted` for the last
-    # **closed** session, with `zones`, `session_area`,
-    # `mow_start_type`, and `history` as attributes (feeds the future
-    # green/red run history card). Same subject as the other two
-    # `last_run_*` sensors (FEAT-06).
+    # **closed** session, with `zones`, `mow_start_type`, and `history`
+    # as attributes (feeds the future green/red run history card). Same
+    # subject as the other two `last_run_*` sensors (FEAT-06).
+    #
+    # FEAT-08 (#88 naming): `session_area` was promoted out — the
+    # dedicated `last_run_area` sensor below carries the value + its
+    # `area_precise` float. Kept off the attribute dict so a template
+    # doesn't sprout two ways to read the same fact.
     NavimowSensorEntityDescription(
         key="last_run_result",
         translation_key="last_run_result",
@@ -413,11 +432,35 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
         attrs_fn=lambda c: (
             {
                 "zones": c.last_finished_run.get("zones"),
-                "session_area": c.last_finished_run.get("session_area"),
                 "mow_start_type": c.last_finished_run.get("mow_start_type"),
                 "history": c.history,
             }
             if c.last_finished_run
+            else None
+        ),
+    ),
+    # FEAT-08 (#88 naming): `last_run_area` promoted from the
+    # `session_area` attribute of `last_run_result`. `session_area` is
+    # the tracker's `last_sub − sub₀` — the surface actually mowed in
+    # the last closed session, honest under interruption. `ceil` state
+    # + `area_precise` attr for the uniform area contract.
+    NavimowSensorEntityDescription(
+        key="last_run_area",
+        translation_key="last_run_area",
+        device_class=SensorDeviceClass.AREA,
+        native_unit_of_measurement=UnitOfArea.SQUARE_METERS,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:texture-box",
+        value_fn=lambda c: (
+            math.ceil(v)
+            if c.last_finished_run
+            and (v := c.last_finished_run.get("session_area")) is not None
+            else None
+        ),
+        attrs_fn=lambda c: (
+            {"area_precise": v}
+            if c.last_finished_run
+            and (v := c.last_finished_run.get("session_area")) is not None
             else None
         ),
     ),
@@ -480,24 +523,35 @@ async def async_setup_entry(
         # lazily on `SIGNAL_ZONE_DISCOVERED` for boundaries that appear
         # at runtime.
         entities.append(NavimowZonesAggregateSensor(coordinator))
+        # FEAT-08: first-class total-area aggregate — a dashboard card
+        # binds on `state = ceil(Σ size_estimate)` directly, without
+        # pulling the value out of an attribute. The count aggregate
+        # above is now trimmed to just `zone_ids` (FEAT-08 attr promotion).
+        entities.append(NavimowZonesTotalAreaSensor(coordinator))
         for boundary_id in coordinator.zone_registry.zones:
-            entities.extend(_build_zone_trio(coordinator, config_entry, boundary_id))
+            entities.extend(_build_zone_family(coordinator, config_entry, boundary_id))
         _wire_zone_discovery(hass, config_entry, coordinator, async_add_entities)
         _wire_zone_forget(hass, config_entry, coordinator)
         _wire_options_update_listener(hass, config_entry)
     async_add_entities(entities)
 
 
-def _build_zone_trio(
+def _build_zone_family(
     coordinator: NavimowCoordinator,
     config_entry: ConfigEntry,
     boundary_id: int,
 ) -> list[SensorEntity]:
-    """Return the three per-zone sensors for a boundary."""
+    """Return the four per-zone sensors for a boundary.
+
+    FEAT-08 (#88): renamed from ``_build_zone_trio`` — the family
+    grew to include ``NavimowZoneTotalAreaSensor`` (the size-estimate
+    entity) alongside the three original last-mow sensors.
+    """
     return [
-        NavimowZoneSurfaceSensor(coordinator, config_entry, boundary_id),
-        NavimowZoneDurationSensor(coordinator, config_entry, boundary_id),
+        NavimowZoneLastAreaSensor(coordinator, config_entry, boundary_id),
+        NavimowZoneLastDurationSensor(coordinator, config_entry, boundary_id),
         NavimowZoneLastMowedSensor(coordinator, config_entry, boundary_id),
+        NavimowZoneTotalAreaSensor(coordinator, config_entry, boundary_id),
     ]
 
 
@@ -524,7 +578,7 @@ def _wire_zone_discovery(
         if boundary_id in known:
             return
         known.add(boundary_id)
-        async_add_entities(_build_zone_trio(coordinator, config_entry, boundary_id))
+        async_add_entities(_build_zone_family(coordinator, config_entry, boundary_id))
 
     @callback
     def _on_forget(boundary_id: int) -> None:
@@ -568,7 +622,12 @@ def _wire_zone_forget(
 
         ent_reg = er.async_get(hass)
         device_id = coordinator.device.id
-        for suffix in ("", "_duration", "_last_mowed"):
+        # FEAT-08 (#88 naming): the four suffixes reflect the new
+        # per-zone family — `_last_area`, `_last_duration`,
+        # `_last_mowed`, `_total_area`. Any lingering entity after
+        # the record is dropped would show up as `unavailable` in
+        # the sensor list.
+        for suffix in ("_last_area", "_last_duration", "_last_mowed", "_total_area"):
             uid = f"{DOMAIN}_{device_id}_zone_{boundary_id}{suffix}"
             entity_id = ent_reg.async_get_entity_id("sensor", DOMAIN, uid)
             if entity_id:
@@ -843,11 +902,17 @@ class _NavimowZoneEntity(CoordinatorEntity[NavimowCoordinator], SensorEntity):
         return self._record is not None
 
 
-class NavimowZoneSurfaceSensor(_NavimowZoneEntity):
-    """Last-mow surface for one boundary, presented ``ceil``'d to the next m².
+class NavimowZoneLastAreaSensor(_NavimowZoneEntity):
+    """Last-mow area for one boundary, ``ceil``'d to the next m².
 
-    Attributes carry the precise float (``last_surface_precise``) and the
-    zone-size estimate derived from the last complete pass. Design §6.
+    FEAT-08 (#88 naming): renamed from ``NavimowZoneSurfaceSensor``
+    (unique_id ``zone_<id>`` → ``zone_<id>_last_area``). The
+    `zone_<id>_total_area` sibling now carries the size-estimate as its
+    own state; the two coexist by design — last-mow answers "did we
+    finish the zone last time?", total answers "how big is this zone?".
+
+    Attributes carry the precise float as ``area_precise`` — uniform
+    contract across every area sensor.
     """
 
     # HARD-08: same rationale as `weekly_area` — `SensorDeviceClass.AREA`
@@ -858,6 +923,9 @@ class NavimowZoneSurfaceSensor(_NavimowZoneEntity):
     _attr_native_unit_of_measurement = UnitOfArea.SQUARE_METERS
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_icon = "mdi:texture-box"
+    # FR display: "Prunier dernière surface" — parallel to
+    # ` dernière tonte` on the timestamp sibling.
+    _name_suffix = " dernière surface"
 
     def __init__(
         self,
@@ -866,7 +934,9 @@ class NavimowZoneSurfaceSensor(_NavimowZoneEntity):
         boundary_id: int,
     ) -> None:
         super().__init__(coordinator, config_entry, boundary_id)
-        self._attr_unique_id = f"{DOMAIN}_{coordinator.device.id}_zone_{boundary_id}"
+        self._attr_unique_id = (
+            f"{DOMAIN}_{coordinator.device.id}_zone_{boundary_id}_last_area"
+        )
 
     @property
     def native_value(self) -> int | None:
@@ -880,22 +950,24 @@ class NavimowZoneSurfaceSensor(_NavimowZoneEntity):
         rec = self._record
         if rec is None:
             return None
+        # FEAT-08 (#88 naming): `size_estimate` was promoted to
+        # `NavimowZoneTotalAreaSensor` and dropped from this attr dict
+        # to keep one canonical source for that quantity.
         return {
             **(super().extra_state_attributes or {}),
-            "size_estimate": (
-                math.ceil(rec.size_estimate_m2)
-                if rec.size_estimate_m2 is not None
-                else None
-            ),
-            "last_surface_precise": rec.last_surface_m2,
+            "area_precise": rec.last_surface_m2,
             "last_cmp_max": rec.last_cmp_max,
             "last_result": rec.last_result,
         }
 
 
-class NavimowZoneDurationSensor(_NavimowZoneEntity):
+class NavimowZoneLastDurationSensor(_NavimowZoneEntity):
     """Last-mow in-zone wall-clock duration (recharge inside a segment
-    included). Design §5 D1."""
+    included). Design §5 D1.
+
+    FEAT-08 (#88 naming): renamed from ``NavimowZoneDurationSensor``
+    (unique_id ``zone_<id>_duration`` → ``zone_<id>_last_duration``).
+    """
 
     _attr_native_unit_of_measurement = UnitOfTime.SECONDS
     _attr_device_class = SensorDeviceClass.DURATION
@@ -914,7 +986,7 @@ class NavimowZoneDurationSensor(_NavimowZoneEntity):
     ) -> None:
         super().__init__(coordinator, config_entry, boundary_id)
         self._attr_unique_id = (
-            f"{DOMAIN}_{coordinator.device.id}_zone_{boundary_id}_duration"
+            f"{DOMAIN}_{coordinator.device.id}_zone_{boundary_id}_last_duration"
         )
 
     @property
@@ -961,6 +1033,80 @@ class NavimowZoneLastMowedSensor(_NavimowZoneEntity):
         }
 
 
+class NavimowZoneTotalAreaSensor(_NavimowZoneEntity):
+    """FEAT-08 — first-class zone total area (last complete pass).
+
+    The sibling ``NavimowZoneLastAreaSensor`` renders the *last mow's*
+    surface (honest under interruptions, but shrinks below the real
+    zone size when a firmware task straddles sessions and the tracker
+    sees only its incremental `sub` delta — the operator observed
+    96 m² for a 228 m² zone on ``raoul.11``). This sensor exposes the
+    quantity a dashboard actually wants for the ``Prunier: 228 m²``
+    tile: ``ceil(size_estimate_m2)`` from the last complete pass
+    (``cmp_max >= COMPLETE_PASS_CMP``), auto-corrected on the next
+    complete pass — the last-wins semantics of the registry (§4).
+
+    Design decisions (issue #88 + comment naming scheme):
+
+    - **`_total_area` key** (not `_surface`): the naming axis is
+      ``total`` = full zone size vs ``last`` = last-mow surface,
+      uniform with `zones_total_area` / `last_run_area` / etc.
+    - **State is `None` until the first complete pass** — no fake ``0``
+      fallback. HA renders ``unknown`` and the tile stays honest.
+    - **Reads the registry directly** — no new source, no new signal,
+      same update path as the sibling per-zone entities.
+    - **`area_precise` attr** — uniform contract across every area
+      sensor (`weekly_area`, `_last_area`, `_total_area`,
+      `zones_total_area`, `last_run_area`).
+    """
+
+    # HARD-08 alignment: `SensorDeviceClass.AREA` + m² for per-user
+    # unit conversion + typed history graphs. `ceil`'d int state
+    # (§6 D-size), precise float in the attributes.
+    _attr_device_class = SensorDeviceClass.AREA
+    _attr_native_unit_of_measurement = UnitOfArea.SQUARE_METERS
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:texture-box"
+    # `<zone name> surface` on the display (FR). Raoul confirmed on
+    # #88 (2026-07-10 comment): "surface" reads naturally in French
+    # for the zone-size tile even though the key uses `area`.
+    _name_suffix = " surface"
+
+    def __init__(
+        self,
+        coordinator: NavimowCoordinator,
+        config_entry: ConfigEntry,
+        boundary_id: int,
+    ) -> None:
+        super().__init__(coordinator, config_entry, boundary_id)
+        self._attr_unique_id = (
+            f"{DOMAIN}_{coordinator.device.id}_zone_{boundary_id}_total_area"
+        )
+
+    @property
+    def native_value(self) -> int | None:
+        rec = self._record
+        if rec is None or rec.size_estimate_m2 is None:
+            return None
+        return math.ceil(rec.size_estimate_m2)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        rec = self._record
+        if rec is None:
+            return None
+        stamp = rec.size_estimate_updated_ms
+        return {
+            **(super().extra_state_attributes or {}),
+            "area_precise": rec.size_estimate_m2,
+            "last_complete_pass_at": (
+                datetime.fromtimestamp(stamp / 1000, tz=UTC)
+                if stamp is not None
+                else None
+            ),
+        }
+
+
 class NavimowZonesAggregateSensor(CoordinatorEntity[NavimowCoordinator], SensorEntity):
     """Static aggregate over all zones.
 
@@ -990,31 +1136,114 @@ class NavimowZonesAggregateSensor(CoordinatorEntity[NavimowCoordinator], SensorE
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        zones = self.coordinator.zone_registry.zones
-        zone_ids = sorted(zones.keys())
-        # `total_area` = spatial sum of size estimates, ceil'd. Zones
-        # without an estimate yet (no complete pass) contribute 0 — the
-        # aggregate stays honest until the first complete pass.
-        total = sum(
-            math.ceil(rec.size_estimate_m2)
-            for rec in zones.values()
+        # FEAT-08 (#88 naming): `total_area` and `per_zone` were
+        # promoted out — `zones_total_area` carries the sum and each
+        # boundary owns its own `zone_<id>_total_area` / `_last_area`
+        # sensors. Keeping the count sensor's attrs down to `zone_ids`
+        # avoids a template accidentally reading a stale summary here
+        # instead of the dedicated entities.
+        return {
+            "zone_ids": sorted(self.coordinator.zone_registry.zones.keys()),
+        }
+
+
+class NavimowZonesTotalAreaSensor(CoordinatorEntity[NavimowCoordinator], SensorEntity):
+    """FEAT-08 — first-class Σ zone total-area, ceil'd.
+
+    Sibling to ``NavimowZonesAggregateSensor``: same registry, same
+    update path. The count aggregate answers "how many zones has the
+    robot discovered?"; this one answers "what's the total mowed
+    acreage?" for the dashboard's headline number.
+
+    Design decisions (issue #88 + comment naming scheme):
+
+    - **Not folded into the count aggregate.** The count sensor rarely
+      changes; this one nudges on each complete pass and belongs on
+      its own history graph. The count aggregate was trimmed in the
+      naming pass — its former ``total_area`` and ``per_zone`` attrs
+      are gone (this entity is the canonical source for total area,
+      the per-zone entities own the per-boundary breakdown).
+    - **``ceil`` state + ``area_precise`` attr** — the uniform
+      contract across every m² sensor (``weekly_area``,
+      ``zone_<id>_last_area``, ``zone_<id>_total_area``,
+      ``zones_total_area``, ``last_run_area``). Round-up happens once
+      at the sum to avoid drift from N-zone floor'd summation.
+    - **``zone_names`` parallel to ``zone_ids``** (per #88 2026-07-10
+      13:05 comment) — a card can render "Prunier: 228, Figuier: 124"
+      without cross-referencing another entity. The rename dispatcher
+      keeps it live.
+    - **Zones without a complete pass contribute 0** — kept explicit
+      so the state stays honest before every zone has been fully
+      mowed.
+    """
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "zones_total_area"
+    _attr_device_class = SensorDeviceClass.AREA
+    _attr_native_unit_of_measurement = UnitOfArea.SQUARE_METERS
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:texture-box"
+
+    def __init__(self, coordinator: NavimowCoordinator) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{DOMAIN}_{coordinator.device.id}_zones_total_area"
+        self._attr_device_info = _device_info(coordinator)
+
+    async def async_added_to_hass(self) -> None:
+        """Wire the FEAT-08 zone-rename refresh so ``zone_names`` in
+        attrs stays in sync without waiting for the next coordinator
+        tick (parallel to HARD-15's per-zone entity refresh)."""
+        await super().async_added_to_hass()
+        entry = getattr(self.coordinator, "config_entry", None)
+        if entry is None:
+            return
+
+        @callback
+        def _on_names_updated() -> None:
+            self.async_write_ha_state()
+
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass,
+                f"{SIGNAL_ZONE_NAMES_UPDATED}_{entry.entry_id}",
+                _on_names_updated,
+            )
+        )
+
+    @property
+    def native_value(self) -> int:
+        return math.ceil(self._total_precise())
+
+    def _total_precise(self) -> float:
+        return sum(
+            rec.size_estimate_m2
+            for rec in self.coordinator.zone_registry.zones.values()
             if rec.size_estimate_m2 is not None
         )
-        per_zone = {
-            bid: {
-                "size_estimate": (
-                    math.ceil(rec.size_estimate_m2)
-                    if rec.size_estimate_m2 is not None
-                    else None
-                ),
-                "last_result": rec.last_result,
-            }
-            for bid, rec in zones.items()
-        }
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        zones = self.coordinator.zone_registry.zones
+        zone_ids = sorted(zones.keys())
+        # `zone_names`: parallel list in the same order as `zone_ids`.
+        # Uses the operator-chosen name from options when present, falls
+        # back to `Zone #<id>` (the same fallback per-zone entities show
+        # in their title, so a card can join id ↔ name unambiguously).
+        # Comment on #88 (2026-07-10 13:05): "we may want a boundary
+        # and zone_names for the zones_total_area we'll see".
+        entry = getattr(self.coordinator, "config_entry", None)
+
+        def _name(bid: int) -> str:
+            if entry is not None:
+                raw = _zone_raw_name(entry, bid)
+                if raw:
+                    return raw
+            return f"Zone #{bid}"
+
         return {
             "zone_ids": zone_ids,
-            "total_area": total,
-            "per_zone": per_zone,
+            "zone_names": [_name(bid) for bid in zone_ids],
+            "area_precise": self._total_precise(),
         }
 
 

@@ -22,9 +22,9 @@ from custom_components.navimow.const import (
     SIGNAL_ZONE_NAMES_UPDATED,
 )
 from custom_components.navimow.sensor import (
-    NavimowZoneDurationSensor,
+    NavimowZoneLastAreaSensor,
+    NavimowZoneLastDurationSensor,
     NavimowZoneLastMowedSensor,
-    NavimowZoneSurfaceSensor,
     _wire_options_update_listener,
     _wire_zone_forget,
     _zone_display_name,
@@ -83,10 +83,12 @@ def test_display_name_uses_options_map_when_present() -> None:
 def test_zone_entities_read_name_from_options_on_construction() -> None:
     coord = _make_coordinator({1: _rec(1)})
     entry = _make_entry({OPTIONS_KEY_ZONES: {"1": {"name": "Prunier"}}})
-    surf = NavimowZoneSurfaceSensor(coord, entry, 1)
-    dur = NavimowZoneDurationSensor(coord, entry, 1)
+    surf = NavimowZoneLastAreaSensor(coord, entry, 1)
+    dur = NavimowZoneLastDurationSensor(coord, entry, 1)
     lm = NavimowZoneLastMowedSensor(coord, entry, 1)
-    assert surf.name == "Prunier"
+    # FEAT-08 renames appended ` dernière surface` to the last-area
+    # sensor for parallelism with ` dernière tonte`.
+    assert surf.name == "Prunier dernière surface"
     assert dur.name == "Prunier durée"
     assert lm.name == "Prunier dernière tonte"
 
@@ -298,7 +300,10 @@ def test_wire_zone_forget_drops_registry_and_removes_entities() -> None:
 
     with patch("homeassistant.helpers.entity_registry.async_get") as ent_reg_get:
         ent_reg = MagicMock()
-        ent_reg.async_get_entity_id.side_effect = ["s1", "s2", "s3"]
+        # FEAT-08 (#88): the sweep now covers four entities per boundary
+        # — trio + `_surface`. Any lingering `unavailable` after forget
+        # would be operator-visible, hence the extra sweep target.
+        ent_reg.async_get_entity_id.side_effect = ["s1", "s2", "s3", "s4"]
         ent_reg_get.return_value = ent_reg
 
         on_forget(1)
@@ -307,8 +312,8 @@ def test_wire_zone_forget_drops_registry_and_removes_entities() -> None:
     assert 1 not in coord.zone_registry.zones
     # Boundary 3 untouched.
     assert 3 in coord.zone_registry.zones
-    # Three entities removed (surface, duration, last_mowed).
-    assert ent_reg.async_remove.call_count == 3
+    # Four entities removed: trio + FEAT-08 `_surface`.
+    assert ent_reg.async_remove.call_count == 4
 
 
 def test_wire_zone_forget_is_idempotent_on_unknown_boundary() -> None:

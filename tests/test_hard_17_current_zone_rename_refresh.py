@@ -90,14 +90,16 @@ def test_other_last_run_descriptors_still_opt_out() -> None:
 def test_battery_and_position_still_opt_out() -> None:
     """Non-zone sensors have no reason to wake on a rename. Locks the
     scope discipline of this ticket: only the two zone-name-reading
-    descriptors opt in."""
+    descriptors opt in. Post-FEAT-08 the state/progress keys carry the
+    `current_` prefix."""
     for key in (
         "battery",
         "weekly_area",
-        "run_progress",
-        "zone_progress",
-        "run_state",
+        "current_run_progress",
+        "current_zone_progress",
+        "current_run_state",
         "current_run_started",
+        "last_run_area",  # FEAT-08 promotion
     ):
         d = _get_description(key)
         assert d is not None

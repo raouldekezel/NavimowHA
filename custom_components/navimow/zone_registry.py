@@ -28,6 +28,14 @@ class ZoneRecord:
     last_duration_s: int | None = None
     last_cmp_max: int = 0
     size_estimate_m2: float | None = None
+    # FEAT-08: start-time of the visit that most recently refreshed
+    # `size_estimate_m2`. Paired with the estimate so the operator can
+    # tell when the current zone-size figure was last calibrated —
+    # useful after an app-side reshape (the estimate auto-corrects on
+    # the next complete pass, this stamp says which pass "won").
+    # Aligned with `last_mowed_ms` semantics (start of the visit, not
+    # its exit — HARD-12).
+    size_estimate_updated_ms: int | None = None
     last_result: str | None = None
     bbox: dict[str, float] | None = None  # deferred posture-bbox phase, unused here
 
@@ -113,6 +121,13 @@ class ZoneRegistry:
             rec.last_result = result
             if cmp_max >= COMPLETE_PASS_CMP:
                 rec.size_estimate_m2 = round(surface, 2)  # last complete wins
+                # FEAT-08: stamp the complete pass. `min(seg_first_times)`
+                # matches `last_mowed_ms` semantics (start of the visit).
+                # `rebuild` replays history oldest-to-newest, so this too
+                # ends on the *most recent* complete pass.
+                rec.size_estimate_updated_ms = (
+                    min(seg_first_times) if seg_first_times else None
+                )
         return newly_seen
 
     def rebuild(self, history: list[dict]) -> None:

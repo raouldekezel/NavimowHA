@@ -5,13 +5,13 @@ formatting parity across area sensors.
 Two entities are touched:
 
 - ``sensor.<slug>_weekly_area`` (FEAT-02).
-- ``NavimowZoneSurfaceSensor`` per-boundary surface (FEAT-04 PR 3).
+- ``NavimowZoneLastAreaSensor`` per-boundary surface (FEAT-04 PR 3).
 
 Kept out (as per the ticket):
 
 - ``sensor.<slug>_zones.total_area`` — that's an *attribute value* on
   an integer-count sensor. Device classes belong to entities.
-- ``NavimowZoneDurationSensor`` / ``NavimowZoneLastMowedSensor`` —
+- ``NavimowZoneLastDurationSensor`` / ``NavimowZoneLastMowedSensor`` —
   duration / timestamp, not area.
 
 Every test exercises one seam:
@@ -35,10 +35,10 @@ from homeassistant.const import UnitOfArea
 
 from custom_components.navimow.sensor import (
     SENSOR_DESCRIPTIONS,
-    NavimowZoneDurationSensor,
+    NavimowZoneLastAreaSensor,
+    NavimowZoneLastDurationSensor,
     NavimowZoneLastMowedSensor,
     NavimowZonesAggregateSensor,
-    NavimowZoneSurfaceSensor,
 )
 from custom_components.navimow.zone_registry import ZoneRecord, ZoneRegistry
 
@@ -101,7 +101,7 @@ def test_weekly_area_unit_and_state_class_unchanged() -> None:
 
 
 # --------------------------------------------------------------------- #
-# 2. NavimowZoneSurfaceSensor class attribute                           #
+# 2. NavimowZoneLastAreaSensor class attribute                           #
 # --------------------------------------------------------------------- #
 
 
@@ -112,7 +112,7 @@ def test_zone_surface_instance_carries_area_device_class() -> None:
     too, so this is the correct assertion shape."""
     coord = _make_coordinator({1: _rec(1)})
     entry = _make_entry()
-    surf = NavimowZoneSurfaceSensor(coord, entry, 1)
+    surf = NavimowZoneLastAreaSensor(coord, entry, 1)
     assert surf.device_class is SensorDeviceClass.AREA
 
 
@@ -120,7 +120,7 @@ def test_zone_surface_unit_and_state_class_unchanged() -> None:
     """Same trio pinning as ``weekly_area``: the whole triple has to
     stay coherent for HA to accept it."""
     coord = _make_coordinator({1: _rec(1)})
-    surf = NavimowZoneSurfaceSensor(coord, _make_entry(), 1)
+    surf = NavimowZoneLastAreaSensor(coord, _make_entry(), 1)
     assert surf.native_unit_of_measurement == UnitOfArea.SQUARE_METERS
     assert surf.state_class is SensorStateClass.MEASUREMENT
 
@@ -131,7 +131,7 @@ def test_zone_surface_native_value_still_m2_ceiled() -> None:
     metadata, not by our value_fn — so we must NOT ourselves start
     converting)."""
     coord = _make_coordinator({1: _rec(1, surface=227.82)})
-    surf = NavimowZoneSurfaceSensor(coord, _make_entry(), 1)
+    surf = NavimowZoneLastAreaSensor(coord, _make_entry(), 1)
     assert surf.native_value == math.ceil(227.82) == 228
 
 
@@ -158,17 +158,20 @@ def test_duration_and_last_mowed_are_not_area() -> None:
     the aggregate check above."""
     coord = _make_coordinator({1: _rec(1)})
     entry = _make_entry()
-    dur = NavimowZoneDurationSensor(coord, entry, 1)
+    dur = NavimowZoneLastDurationSensor(coord, entry, 1)
     lm = NavimowZoneLastMowedSensor(coord, entry, 1)
     assert dur.device_class is not SensorDeviceClass.AREA
     assert lm.device_class is not SensorDeviceClass.AREA
 
 
 def test_no_other_descriptor_silently_became_area() -> None:
-    """The two AREA-eligible descriptors are exactly {weekly_area}.
-    ``NavimowZoneSurfaceSensor`` sits outside ``SENSOR_DESCRIPTIONS``
-    (per-boundary sub-class), so the descriptor-side count is 1."""
+    """The AREA-eligible descriptors: ``weekly_area`` (cumulative) and
+    ``last_run_area`` (promoted from `last_run_result.session_area` in
+    FEAT-08 comment). Per-boundary and per-aggregate area sensors
+    (``NavimowZoneLastAreaSensor`` / ``NavimowZoneTotalAreaSensor`` /
+    ``NavimowZonesTotalAreaSensor``) sit outside
+    ``SENSOR_DESCRIPTIONS`` (dedicated classes, not table entries)."""
     area_keys = {
         d.key for d in SENSOR_DESCRIPTIONS if d.device_class is SensorDeviceClass.AREA
     }
-    assert area_keys == {"weekly_area"}, area_keys
+    assert area_keys == {"weekly_area", "last_run_area"}, area_keys
