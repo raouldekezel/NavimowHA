@@ -288,6 +288,15 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
         attrs_fn=lambda c: (
             {"boundary_id": b} if (b := _current_boundary(c)) is not None else None
         ),
+        # HARD-17: opt into FEAT-09's dispatcher-driven rename refresh
+        # (via `NavimowSensor.async_added_to_hass`) so that renaming a
+        # zone in the options flow updates this tile instantly rather
+        # than at the next ≤30 s coordinator tick. The `value_fn` above
+        # reads `config_entry.options` each call, so pushing
+        # `async_write_ha_state` on `SIGNAL_ZONE_NAMES_UPDATED` is
+        # sufficient — no cache to bust. Same mechanism the per-zone
+        # entities use (HARD-15's `_refresh_name`).
+        refresh_on_zone_rename=True,
     ),
     # === FEAT-05 (c) — tracker-driven run/zone sensors ===
     # `run_progress` (%): held during `PAUSED_DOCKED`, `None` at rest.
