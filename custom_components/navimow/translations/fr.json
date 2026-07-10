@@ -74,13 +74,13 @@
         "name": "Zone courante"
       },
       "run_progress": {
-        "name": "Progression du passage"
+        "name": "Progression de la tonte"
       },
       "zone_progress": {
         "name": "Progression de la zone"
       },
       "run_state": {
-        "name": "État du passage",
+        "name": "État de la tonte",
         "state": {
           "idle": "Au repos",
           "running": "En cours",
@@ -89,16 +89,16 @@
         }
       },
       "current_run_started": {
-        "name": "Début du passage courant"
+        "name": "Début de la tonte en cours"
       },
       "last_run_started": {
-        "name": "Début du dernier passage"
+        "name": "Début de la dernière tonte"
       },
       "last_run_duration": {
-        "name": "Durée du dernier passage"
+        "name": "Durée de la dernière tonte"
       },
       "last_run_result": {
-        "name": "Résultat du dernier passage",
+        "name": "Résultat de la dernière tonte",
         "state": {
           "completed": "Terminé",
           "interrupted": "Interrompu"
