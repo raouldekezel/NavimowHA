@@ -244,6 +244,12 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
     NavimowSensorEntityDescription(
         key="weekly_area",
         translation_key="weekly_area",
+        # HARD-08: `SensorDeviceClass.AREA` (HA 2024.12+) unlocks the
+        # per-user unit-conversion (ft², etc.) HA drives from the device
+        # class + native unit pair, plus consistent icon/formatting and
+        # typed history graphs. `native_value` stays m²; conversion is
+        # HA-side, no code change on our end.
+        device_class=SensorDeviceClass.AREA,
         native_unit_of_measurement=UnitOfArea.SQUARE_METERS,
         state_class=SensorStateClass.TOTAL_INCREASING,
         icon="mdi:grass",
@@ -841,6 +847,11 @@ class NavimowZoneSurfaceSensor(_NavimowZoneEntity):
     zone-size estimate derived from the last complete pass. Design §6.
     """
 
+    # HARD-08: same rationale as `weekly_area` — `SensorDeviceClass.AREA`
+    # + m² gives HA the pair it needs to drive per-user unit conversion,
+    # consistent icon/formatting, and typed history graphs. `ceil`'d
+    # `native_value` stays m²; the precise float lives in attributes.
+    _attr_device_class = SensorDeviceClass.AREA
     _attr_native_unit_of_measurement = UnitOfArea.SQUARE_METERS
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_icon = "mdi:texture-box"
