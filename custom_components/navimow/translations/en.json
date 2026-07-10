@@ -104,6 +104,9 @@
           "interrupted": "Interrupted"
         }
       },
+      "last_run_zones": {
+        "name": "Last run zones"
+      },
       "zones": {
         "name": "Zones"
       }

@@ -149,6 +149,46 @@ def _current_run_start_dt(c: NavimowCoordinator) -> datetime | None:
     return datetime.fromtimestamp(epoch_ms / 1000, tz=UTC)
 
 
+def _last_run_zones_display(c: NavimowCoordinator) -> str | None:
+    """FEAT-09: joined operator-chosen names of the zones mowed in the
+    last **closed** session.
+
+    Walks `last_finished_run["zones"]` — the tracker's list of *segments*,
+    one entry per contiguous mow on the same boundary — resolves each
+    `boundary_id` via `_zone_raw_name` (HARD-15, the single source of
+    truth for `options[OPTIONS_KEY_ZONES][*]["name"]` reads), falls back
+    per boundary to `#<id>` when unmapped, and joins with ` → ` (Unicode
+    arrow, no i18n).
+
+    Segments are **not** deduped: an interleaved run reads honestly as
+    `Prunier → Figuier → Prunier`. Operator preference (review on #96) —
+    the tracker's segment model already carries that fact, hiding it in
+    the display would defeat the purpose of the sibling to
+    `_last_run_result.zones`.
+
+    Returns `None` when there is no closed run yet or when the segment
+    list is empty (BUG-06's `boundary=0` sentinel keeps zones from ever
+    being populated with a bogus id — that filter runs upstream in
+    `run_tracker._append_zone`, not here).
+    """
+    if c.last_finished_run is None:
+        return None
+    zones = c.last_finished_run.get("zones") or []
+    if not zones:
+        return None
+    entry = getattr(c, "config_entry", None)
+    parts: list[str] = []
+    for z in zones:
+        b = z.get("boundary_id")
+        if b is None:
+            continue
+        name = _zone_raw_name(entry, b) if entry is not None else None
+        parts.append(name if name else f"#{b}")
+    if not parts:
+        return None
+    return " → ".join(parts)
+
+
 @dataclass(frozen=True, kw_only=True)
 class NavimowSensorEntityDescription(SensorEntityDescription):
     """Describes Navimow sensor entity."""
@@ -163,6 +203,15 @@ class NavimowSensorEntityDescription(SensorEntityDescription):
     # scoped sensors (e.g. `current_zone`) leave this False so a stale
     # value never masks the "idle" reality.
     restore: bool = False
+    # FEAT-09: opt-in re-render on options-flow zone rename. When True the
+    # sensor connects to `SIGNAL_ZONE_NAMES_UPDATED_<entry_id>` in
+    # `async_added_to_hass` and calls `async_write_ha_state` on receipt,
+    # so a rename in the options flow refreshes the display without a
+    # fresh mow. Only useful when `value_fn` reads
+    # `config_entry.options[OPTIONS_KEY_ZONES]` (the `last_run_zones`
+    # sensor is the sole current consumer — mirrors the per-zone
+    # entities' `_refresh_name` wiring).
+    refresh_on_zone_rename: bool = False
 
 
 SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
@@ -351,6 +400,28 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
             if c.last_finished_run
             else None
         ),
+    ),
+    # FEAT-09 (#96) — `last_run_zones`: display-ready joined zone-name
+    # string for the last **closed** session. Fourth sibling in the
+    # `last_run_*` family (start / duration / result / zones), same
+    # subject and same refresh cadence. `value_fn` walks the tracker's
+    # segment list, so an interleaved run reads honestly as
+    # `Prunier → Figuier → Prunier` (no dedup, operator preference on
+    # #96). The unmapped fallback is `#<id>` per boundary — same short
+    # cosmetic choice as `_current_zone_display` (HARD-11 / HARD-15
+    # divergence with the per-zone entity title's `Zone #<id>`).
+    # `attrs_fn` is deliberately absent: the raw segment list already
+    # lives on `_last_run_result.zones`, doubling it here would
+    # duplicate recorder cost on a value that changes once per session.
+    # `refresh_on_zone_rename=True` re-renders the tile the moment the
+    # operator renames a boundary in the options flow — no wait for the
+    # next mow, no reload. See `NavimowSensor.async_added_to_hass`.
+    NavimowSensorEntityDescription(
+        key="last_run_zones",
+        translation_key="last_run_zones",
+        icon="mdi:texture-box",
+        value_fn=_last_run_zones_display,
+        refresh_on_zone_rename=True,
     ),
 )
 
@@ -545,8 +616,29 @@ class NavimowSensor(CoordinatorEntity[NavimowCoordinator], RestoreSensor):
         )
 
     async def async_added_to_hass(self) -> None:
-        """Seed the restore cache from the last stored value (HARD-02)."""
+        """Seed the restore cache from the last stored value (HARD-02)
+        and wire the FEAT-09 rename-refresh dispatcher when the
+        description opts in.
+        """
         await super().async_added_to_hass()
+        if self.entity_description.refresh_on_zone_rename:
+            # FEAT-09: re-render on options-flow zone rename. `value_fn`
+            # already re-reads options each call, so pushing
+            # `async_write_ha_state` is sufficient — no cache to bust.
+            entry = getattr(self.coordinator, "config_entry", None)
+            if entry is not None:
+
+                @callback
+                def _on_names_updated() -> None:
+                    self.async_write_ha_state()
+
+                self.async_on_remove(
+                    async_dispatcher_connect(
+                        self.hass,
+                        f"{SIGNAL_ZONE_NAMES_UPDATED}_{entry.entry_id}",
+                        _on_names_updated,
+                    )
+                )
         if not self.entity_description.restore:
             return
         last = await self.async_get_last_sensor_data()

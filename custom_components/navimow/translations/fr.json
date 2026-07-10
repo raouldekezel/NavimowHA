@@ -104,6 +104,9 @@
           "interrupted": "Interrompu"
         }
       },
+      "last_run_zones": {
+        "name": "Zones de la dernière tonte"
+      },
       "zones": {
         "name": "Zones"
       }
