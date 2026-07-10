@@ -27,10 +27,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from custom_components.navimow.const import (
-    OPTIONS_KEY_ZONES,
-    SIGNAL_ZONE_NAMES_UPDATED,
-)
+from custom_components.navimow.const import OPTIONS_KEY_ZONES, SIGNAL_ZONE_NAMES_UPDATED
 from custom_components.navimow.sensor import (
     SENSOR_DESCRIPTIONS,
     NavimowSensor,
@@ -38,7 +35,6 @@ from custom_components.navimow.sensor import (
     _last_run_start_dt,
     _last_run_zones_display,
 )
-
 
 # --------------------------------------------------------------------- #
 # Fixtures                                                              #
@@ -254,9 +250,9 @@ def test_other_last_run_descriptions_do_not_opt_into_rename_refresh() -> None:
     for key in ("last_run_started", "last_run_duration", "last_run_result"):
         d = _get_description(key)
         assert d is not None
-        assert d.refresh_on_zone_rename is False, (
-            f"{key} unexpectedly opts into rename refresh"
-        )
+        assert (
+            d.refresh_on_zone_rename is False
+        ), f"{key} unexpectedly opts into rename refresh"
 
 
 def test_refresh_on_zone_rename_defaults_off() -> None:
