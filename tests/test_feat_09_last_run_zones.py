@@ -185,6 +185,26 @@ def test_segment_with_none_boundary_id_is_skipped() -> None:
     assert _last_run_zones_display(coord) == "Prunier → Figuier"
 
 
+def test_segment_with_zero_boundary_id_is_skipped() -> None:
+    """BUG-06's `boundary=0` sentinel is filtered upstream in
+    `run_tracker._append_zone`, but the value_fn matches the codebase
+    idiom (`_current_zone_display`, per-zone entities) and skips `0`
+    too — a stray `0` would otherwise render `#0`, the exact artifact
+    BUG-06 killed. Belt-and-suspenders review nit on #99."""
+    coord = _make_coordinator(
+        last_finished_run={
+            "zones": [_seg(1), {"boundary_id": 0}, _seg(3)],
+        },
+        options={
+            OPTIONS_KEY_ZONES: {
+                "1": {"name": "Prunier"},
+                "3": {"name": "Figuier"},
+            }
+        },
+    )
+    assert _last_run_zones_display(coord) == "Prunier → Figuier"
+
+
 def test_no_config_entry_falls_back_all_the_way() -> None:
     """Defensive: if for some reason `coordinator.config_entry` is
     unset (test harness omission, or wiring order edge case), the

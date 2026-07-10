@@ -180,7 +180,12 @@ def _last_run_zones_display(c: NavimowCoordinator) -> str | None:
     parts: list[str] = []
     for z in zones:
         b = z.get("boundary_id")
-        if b is None:
+        # `if not b` matches the codebase idiom (`_current_zone_display`,
+        # per-zone entities): skips both `None` and the BUG-06 `0`
+        # sentinel. The tracker filters `boundary_id == 0` in
+        # `_append_zone` upstream, but a stray `0` here would otherwise
+        # render `#0` — the exact artifact BUG-06 killed.
+        if not b:
             continue
         name = _zone_raw_name(entry, b) if entry is not None else None
         parts.append(name if name else f"#{b}")
