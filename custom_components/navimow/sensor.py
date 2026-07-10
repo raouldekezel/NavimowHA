@@ -480,8 +480,21 @@ async def async_setup_entry(
         # lazily on `SIGNAL_ZONE_DISCOVERED` for boundaries that appear
         # at runtime.
         entities.append(NavimowZonesAggregateSensor(coordinator))
+        # FEAT-08: first-class total-surface aggregate — separate entity
+        # so a dashboard card can bind on `state = ceil(Σ size_estimate)`
+        # without pulling the value out of the count sensor's attribute.
+        # The count aggregate above keeps its own `total_area` attr for
+        # backward-compat.
+        entities.append(NavimowZonesTotalAreaSensor(coordinator))
         for boundary_id in coordinator.zone_registry.zones:
             entities.extend(_build_zone_trio(coordinator, config_entry, boundary_id))
+            # FEAT-08: additive per-zone surface entity (issue #88). Sits
+            # next to the trio so the display name reads "<zone> surface"
+            # once the operator renames the zone, and the shared
+            # `_NavimowZoneEntity` base wires the rename dispatcher.
+            entities.append(
+                NavimowZoneAreaSensor(coordinator, config_entry, boundary_id)
+            )
         _wire_zone_discovery(hass, config_entry, coordinator, async_add_entities)
         _wire_zone_forget(hass, config_entry, coordinator)
         _wire_options_update_listener(hass, config_entry)
@@ -524,7 +537,13 @@ def _wire_zone_discovery(
         if boundary_id in known:
             return
         known.add(boundary_id)
-        async_add_entities(_build_zone_trio(coordinator, config_entry, boundary_id))
+        added: list[SensorEntity] = list(
+            _build_zone_trio(coordinator, config_entry, boundary_id)
+        )
+        # FEAT-08: mirror the setup path — the runtime-discovered zone
+        # gets the same four sensors, not three.
+        added.append(NavimowZoneAreaSensor(coordinator, config_entry, boundary_id))
+        async_add_entities(added)
 
     @callback
     def _on_forget(boundary_id: int) -> None:
@@ -568,7 +587,10 @@ def _wire_zone_forget(
 
         ent_reg = er.async_get(hass)
         device_id = coordinator.device.id
-        for suffix in ("", "_duration", "_last_mowed"):
+        # FEAT-08: `_surface` joins the sweep so a forgotten zone drops
+        # all four entities in one shot (leaving `_surface` behind would
+        # linger as `unavailable` after the record is dropped).
+        for suffix in ("", "_duration", "_last_mowed", "_surface"):
             uid = f"{DOMAIN}_{device_id}_zone_{boundary_id}{suffix}"
             entity_id = ent_reg.async_get_entity_id("sensor", DOMAIN, uid)
             if entity_id:
@@ -961,6 +983,78 @@ class NavimowZoneLastMowedSensor(_NavimowZoneEntity):
         }
 
 
+class NavimowZoneAreaSensor(_NavimowZoneEntity):
+    """FEAT-08 — first-class zone surface from the last complete pass.
+
+    The existing ``NavimowZoneSurfaceSensor`` renders the *last mow's*
+    surface (honest under interruptions, but shrinks below the real zone
+    size when a firmware task straddles sessions and the tracker sees
+    only its incremental `sub` delta — the operator observed 96 m² for
+    a 228 m² zone on ``raoul.11``). This sensor exposes the same
+    quantity a dashboard actually wants for the ``Prunier: 228 m²``
+    tile: ``ceil(size_estimate_m2)`` from the last complete pass
+    (``cmp_max >= COMPLETE_PASS_CMP``), auto-corrected on the next
+    complete pass — the last-wins semantics of the registry (§4).
+
+    Design decisions (issue #88):
+
+    - **Not a rename** of ``NavimowZoneSurfaceSensor``: both are useful.
+      The last-mow surface answers "did we finish the zone?" for run
+      history; the estimate answers "how big is this zone?" for the
+      dashboard. Coexistence is deliberate.
+    - **State is `None` until the first complete pass** — no fake ``0``
+      fallback. HA renders ``unknown`` and the tile stays honest.
+    - **Reads the registry directly** — no new source, no new signal,
+      same update path as the sibling per-zone entities.
+    """
+
+    # HARD-08 alignment: `SensorDeviceClass.AREA` + m² for per-user
+    # unit conversion + typed history graphs. `ceil`'d int state
+    # (§6 D-size), precise float in the attributes.
+    _attr_device_class = SensorDeviceClass.AREA
+    _attr_native_unit_of_measurement = UnitOfArea.SQUARE_METERS
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:texture-box"
+    # `<zone name> surface` on the display. Follows the HARD-11 suffix
+    # convention (leading space, lowercase, French label — matches
+    # ` durée` / ` dernière tonte`).
+    _name_suffix = " surface"
+
+    def __init__(
+        self,
+        coordinator: NavimowCoordinator,
+        config_entry: ConfigEntry,
+        boundary_id: int,
+    ) -> None:
+        super().__init__(coordinator, config_entry, boundary_id)
+        self._attr_unique_id = (
+            f"{DOMAIN}_{coordinator.device.id}_zone_{boundary_id}_surface"
+        )
+
+    @property
+    def native_value(self) -> int | None:
+        rec = self._record
+        if rec is None or rec.size_estimate_m2 is None:
+            return None
+        return math.ceil(rec.size_estimate_m2)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        rec = self._record
+        if rec is None:
+            return None
+        stamp = rec.size_estimate_updated_ms
+        return {
+            **(super().extra_state_attributes or {}),
+            "size_estimate_precise": rec.size_estimate_m2,
+            "last_complete_pass_at": (
+                datetime.fromtimestamp(stamp / 1000, tz=UTC)
+                if stamp is not None
+                else None
+            ),
+        }
+
+
 class NavimowZonesAggregateSensor(CoordinatorEntity[NavimowCoordinator], SensorEntity):
     """Static aggregate over all zones.
 
@@ -1015,6 +1109,67 @@ class NavimowZonesAggregateSensor(CoordinatorEntity[NavimowCoordinator], SensorE
             "zone_ids": zone_ids,
             "total_area": total,
             "per_zone": per_zone,
+        }
+
+
+class NavimowZonesTotalAreaSensor(CoordinatorEntity[NavimowCoordinator], SensorEntity):
+    """FEAT-08 — first-class Σ zone surface, ceil'd.
+
+    Sibling to ``NavimowZonesAggregateSensor``: same registry, same
+    update path. The count aggregate answers "how many zones has the
+    robot discovered?"; this one answers "what's the mowed acreage?"
+    for the dashboard's headline number.
+
+    Design decisions (issue #88):
+
+    - **Not folded into the count aggregate** (which keeps its own
+      ``total_area`` attr for backward-compat). The count sensor rarely
+      changes; this one nudges on each complete pass and belongs on a
+      separate history graph.
+    - **``ceil`` state, precise not exposed** at the aggregate level.
+      Precise floats live on the per-zone ``_surface`` entities where
+      the granularity matters; the aggregate rounds up once at the sum
+      to avoid drift from N-zone floor'd summation.
+    - **Zones without a complete pass contribute 0** — same rule as the
+      count aggregate's ``total_area`` attribute, kept explicit here so
+      the state stays honest before all zones have been fully mowed.
+    """
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "zones_total_area"
+    _attr_device_class = SensorDeviceClass.AREA
+    _attr_native_unit_of_measurement = UnitOfArea.SQUARE_METERS
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:texture-box"
+
+    def __init__(self, coordinator: NavimowCoordinator) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{DOMAIN}_{coordinator.device.id}_zones_total_area"
+        self._attr_device_info = _device_info(coordinator)
+
+    @property
+    def native_value(self) -> int:
+        return math.ceil(
+            sum(
+                rec.size_estimate_m2
+                for rec in self.coordinator.zone_registry.zones.values()
+                if rec.size_estimate_m2 is not None
+            )
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        zones = self.coordinator.zone_registry.zones
+        return {
+            "zone_ids": sorted(zones.keys()),
+            "per_zone": {
+                bid: (
+                    math.ceil(rec.size_estimate_m2)
+                    if rec.size_estimate_m2 is not None
+                    else None
+                )
+                for bid, rec in zones.items()
+            },
         }
 
 

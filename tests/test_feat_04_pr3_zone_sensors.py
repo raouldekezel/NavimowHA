@@ -244,7 +244,11 @@ def test_wire_zone_discovery_dispatches_on_new_boundary() -> None:
     on_discovery(3)
     async_add_entities.assert_called_once()
     added = async_add_entities.call_args.args[0]
-    assert len(added) == 3  # surface + duration + last_mowed
+    # FEAT-08 (#88): the trio grew to a quartet — the runtime-discovered
+    # zone gets `last_surface` + `duration` + `last_mowed` + `surface`
+    # (the size-estimate entity). Detailed contracts in
+    # `test_feat_08_zone_surface_entities.py`.
+    assert len(added) == 4
 
 
 def test_wire_zone_discovery_dedups_known_boundary() -> None:

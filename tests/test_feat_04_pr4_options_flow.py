@@ -298,7 +298,10 @@ def test_wire_zone_forget_drops_registry_and_removes_entities() -> None:
 
     with patch("homeassistant.helpers.entity_registry.async_get") as ent_reg_get:
         ent_reg = MagicMock()
-        ent_reg.async_get_entity_id.side_effect = ["s1", "s2", "s3"]
+        # FEAT-08 (#88): the sweep now covers four entities per boundary
+        # — trio + `_surface`. Any lingering `unavailable` after forget
+        # would be operator-visible, hence the extra sweep target.
+        ent_reg.async_get_entity_id.side_effect = ["s1", "s2", "s3", "s4"]
         ent_reg_get.return_value = ent_reg
 
         on_forget(1)
@@ -307,8 +310,8 @@ def test_wire_zone_forget_drops_registry_and_removes_entities() -> None:
     assert 1 not in coord.zone_registry.zones
     # Boundary 3 untouched.
     assert 3 in coord.zone_registry.zones
-    # Three entities removed (surface, duration, last_mowed).
-    assert ent_reg.async_remove.call_count == 3
+    # Four entities removed: trio + FEAT-08 `_surface`.
+    assert ent_reg.async_remove.call_count == 4
 
 
 def test_wire_zone_forget_is_idempotent_on_unknown_boundary() -> None:

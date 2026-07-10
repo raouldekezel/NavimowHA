@@ -110,6 +110,9 @@
       },
       "zones": {
         "name": "Zones"
+      },
+      "zones_total_area": {
+        "name": "Zones — total area"
       }
     },
     "binary_sensor": {
