@@ -71,7 +71,7 @@ The ``time`` field on the 16:11:44 packet is the firmware epoch of generation (m
 
 ### Observation C — ``cmp`` is zone-persistent across sessions
 
-The Figuier zone was mowed to ~35 % on 2026-07-07 and interrupted (``sensor.razibus_zone_3 = 43`` m² of the ~123 m² zone). On the resume today, the first Figuier packet at 16:13:08 shows ``cmp = 4404`` (44.04 %), not 0.
+The Figuier zone was mowed to ~35 % by surface on 2026-07-07 and interrupted (``sensor.razibus_zone_3 = 43`` m² of the ~123 m² zone). On the resume today, the first Figuier packet at 16:13:08 shows ``cmp = 4404`` (44.04 %), not 0. Note that ``cmp``-progress isn't linearly the same as area-% — the firmware weighs path coverage, not raw mowed area, so 43 / 123 = 35 % by surface can correspond to 44 % by ``cmp``-progress. The point that matters here is the qualitative one: ``cmp`` did not reset to 0.
 
 The previous doc's line "reset at each zone change" is only true **within a single run**. Across sessions, the firmware credits prior progress into ``cmp``. To formalise:
 
@@ -96,7 +96,7 @@ The residual trade-off documented on the PR body (``mp = 99`` tasks whose ``cmp`
 
 ## Environment
 
-- Firmware: Segway Navimow i210 LiDAR Pro, serial ``3KAAW2606K1874``, region FRA.
+- Firmware: Segway Navimow i210 LiDAR Pro (``REDACTED-ROBOT-SERIAL``), region FRA.
 - Integration: ``raouldekezel/NavimowHA`` prerelease ``raoul.15`` on Home Assistant 2026.1.3 (Docker on intel-nuc).
 - DEBUG re-enabled at 15:59 CEST 2026-07-09 via ``configuration.yaml`` (persistent) + ``logger.set_level`` (immediate).
 - Storage tracker snapshot as of 12:52 CEST (after the mini-run close, before the manual Figuier task) captured under this issue's evidence trail.
