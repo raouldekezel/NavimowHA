@@ -6,6 +6,20 @@ Starting a mowing task from HA on a boundary whose previous task closed at `cmp 
 
 **Blast radius (widened on Session 2 close-out inspection)**: beyond the visible `current_zone_progress` symptom, the vestige packet also stamps the poisoned zone's `ZoneRecord.size_estimate_updated_ms` (FEAT-08) at the *vestige's* `time` field (85 ms before the `state → mowing` transition), and pollutes `zones[0].sub_entry` with `0.0`. On today's run those two side effects were masked by coincidence (Prunier legitimately reached 100 % during the real mow, and was the first-in-run zone so `sub_entry = 0.0` matched reality), but on a run where the operator interrupts before the poisoned boundary reaches `cmp = 10000`, or where the poisoned boundary is not the run's first zone, both `Store.last_cmp_max` and `sensor.<slug>_zone_<id>_surface` would be silently wrong at run close.
 
+## User-visible symptoms at run start
+
+Two dashboard gauges both snap to **100 %** on the coordinator tick immediately following the `docked → mowing` transition (218 ms after the state change on this trace):
+
+- `sensor.<slug>_current_run_progress` = **100** (from vestige `mp = 100`).
+- `sensor.<slug>_current_zone_progress` = **100.0** (from vestige `cmp = 10000`).
+
+They diverge on the 2nd `type-2` packet (56.4 s later, at 09:32:49 UTC):
+
+- `current_run_progress` **self-corrects to 0** (the code overwrites `last_mp` on every packet, non-monotonic — so the poisoned 100 is simply replaced by the fresh `mp = 0`). The gauge then climbs normally.
+- `current_zone_progress` **stays stuck at 100.0** for the full duration of the poisoned zone segment (~1 h 50 min in this run) because `cmp_max` is written with `max(...)`. Only released when a boundary transition creates a fresh `zones.append(...)` seed (11:21:08 UTC here, transition Prunier → Figuier, sensor drops to 1.44).
+
+The asymmetry between "overwrite" and "monotonic max" is what makes the bug half-hidden: the `mp` gauge looks buggy for one minute and then normal — easy to dismiss as a display glitch — while the `cmp` gauge stays visibly wrong for the entire zone. Both come from the same poisoned packet.
+
 ## Context
 
 - **Date**: 2026-07-19 (Europe/[REDACTED], UTC+02:00)
