@@ -39,7 +39,7 @@
       },
       "rename_zone": {
         "title": "Renommer une zone",
-        "description": "Renommer une zone : laisser le nom vide pour revenir à `Zone #<id>`.",
+        "description": "Renommer une zone : laisser le nom vide pour revenir à Zone #⟨id⟩.",
         "data": {
           "boundary_id": "Zone",
           "name": "Nom"
@@ -47,7 +47,7 @@
       },
       "forget_zone": {
         "title": "Oublier une zone",
-        "description": "Oublier une zone : retire ses trois capteurs. Si le robot tond à nouveau cette zone, elle sera redécouverte comme `Zone #<id>`.",
+        "description": "Oublier une zone : retire ses trois capteurs. Si le robot tond à nouveau cette zone, elle sera redécouverte comme Zone #⟨id⟩.",
         "data": {
           "boundary_id": "Zone",
           "confirm": "Confirmer la suppression"
