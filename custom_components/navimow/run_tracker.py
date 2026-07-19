@@ -244,25 +244,36 @@ MP_COMPLETION_THRESHOLD = 100
 # PAUSED_DOCKED as a recharge candidate.
 MP_PARTIAL_THRESHOLD = 99
 CMP_ZONE_COMPLETE_THRESHOLD = 10000
-
-# BUG-17 (2026-07-19, #105): tolerance for the `area_session` (`sub`)
-# check in the run-start vestige guard. The firmware occasionally
-# replays a task-end packet as the first `type-2` after a fresh
-# `state → mowing` transition, with `mp = 100 ∧ cmp = 10000 ∧
-# subtotalArea = 0.0`. A legitimate first packet of a fresh mow already
-# carries at least ~2.4 m² after one type-2 cadence (2.47 m² observed
-# on 2026-07-19), so a `sub` strictly below 0.5 m² at run-start is
-# far outside the accept envelope. Sunday-first-mow-of-the-week can
-# arrive with `sub ≈ 0.3` on the very first packet — the guard
-# separately requires `mp = 100` and `cmp ≥ 10000`, which no genuine
-# first packet ever carries.
-RUN_START_SUB_TOLERANCE = 0.5
 # Trade-off: on a multizone task where the robot finishes zone A
 # (cmp=10000) and returns to dock to recharge before starting zone B,
 # this rule closes as `completed` — the residual false positive. Not
 # observed in the corpus (2026-05-25 multizone ran without an inter-
 # zone recharge); noted here so a future report can reproduce it.
 # `session_area` and `zones[]` remain correct on either label.
+
+# BUG-17 (2026-07-19, #105): protocol facts about the firmware's late
+# task-end replay packet — distinct from the *policy* completion
+# thresholds above.
+#
+# `MP_TASK_END` is the wire value the firmware stamps on the vestige.
+# It coincides numerically with `MP_COMPLETION_THRESHOLD` today (both
+# 100), but they are conceptually independent: the completion
+# threshold is a tunable tracker policy that has already moved once
+# (99 → 100 in PR #91 / BUG-14) and is still under debate (#89's
+# battery-gate alternative). If it moves again the vestige guard must
+# not follow — a value of 99 as completion threshold would still see
+# a `mp = 100` vestige on the wire. Keeping the two constants
+# separate makes the coupling explicit and prevents silent drift.
+#
+# `RUN_START_SUB_TOLERANCE` is the tolerance for the `area_session`
+# (`sub`) check in the vestige signature. The vestige carries
+# `subtotalArea = 0.0`; a legitimate first packet of a fresh mow
+# already carries at least ~2.4 m² after one type-2 cadence (2.47 m²
+# observed on 2026-07-19). 0.5 m² sits below both and above the
+# vestige's literal zero, giving headroom for a firmware variant that
+# emits a residual float near zero.
+MP_TASK_END = 100
+RUN_START_SUB_TOLERANCE = 0.5
 
 # Seconds a PAUSED_DOCKED run must remain in DOCKED_NOT_CHARGING before
 # it is declared INTERRUPTED. 60 s ≈ 30 type-1 samples at the 2 s
@@ -420,9 +431,9 @@ class RunTracker:
         # `size_estimate_m2` collateral damage). Arming keyed on
         # `state` (not `current_run` nullity) so the window is dark
         # post-close — that variant is BUG-13 territory and out of
-        # scope here. See `_is_run_start_vestige` for the window and
+        # scope here. See `_gate_run_start_vestige` for the window and
         # signature rationale.
-        if self._is_run_start_vestige(parsed):
+        if self._gate_run_start_vestige(parsed):
             return events
 
         # BUG-10 (2026-07-05, #58): layer 2 is now observability. A `wk`
@@ -600,10 +611,16 @@ class RunTracker:
     # Guards + observability                                        #
     # ------------------------------------------------------------- #
 
-    def _is_run_start_vestige(self, parsed: dict[str, Any]) -> bool:
-        """BUG-17 (#105): recognise a late task-end vestige at run start.
+    def _gate_run_start_vestige(self, parsed: dict[str, Any]) -> bool:
+        """BUG-17 (#105): drop the late task-end vestige at run start.
 
-        Fires only inside the run-start arming window, keyed on
+        Name is a gate, not a predicate: on top of returning `True`
+        when the packet must be dropped, this method also emits an
+        observability DEBUG line on the suspicious-but-not-dropped
+        run-start shape (see the "observability" paragraph below). A
+        pure `_is_...` name would understate the side effect.
+
+        Drop fires only inside the run-start arming window, keyed on
         tracker **state** (not `current_run` nullity — post-close, the
         closed run stays referenced by `current_run` because BUG-16's
         guard reads `last_sub` from it in `STATE_COMPLETED`; a
@@ -650,10 +667,16 @@ class RunTracker:
         Also emits an observability DEBUG line for suspicious-but-
         -not-dropped shapes: `area_session` near zero inside the same
         arming window without the full `mp = 100 ∧ cmp = 10000`
-        match. This collects evidence for the untested `interrupted`
-        vestige shape (open question 1) at zero false-positive risk
-        — a genuine first packet already carries `sub ≥ ~2.4` after
-        one cadence.
+        match. Collects evidence for the untested `interrupted`
+        vestige shape (open question 1). This line does fire on some
+        genuine low-`sub` first packets — a fresh session post-reset
+        was observed at `sub = 0.39 m²` on 2026-05-25 and a
+        Sunday-first-mow at `sub ≈ 0.3` is plausible — so the DEBUG
+        stream carries a few false positives per week. Analysis
+        discriminates them via the logged `mp` / `cmp` (a genuine
+        low-`sub` start carries `mp = 0` and `cmp ≪ 10000`; an
+        `interrupted` vestige would carry the partial `cmp_max` from
+        the previous close). Accepted noise, not a defect.
         """
         if self.state == STATE_IDLE:
             armed = True
@@ -673,7 +696,7 @@ class RunTracker:
         sub = parsed.get("area_session")
 
         if (
-            mp == MP_COMPLETION_THRESHOLD
+            mp == MP_TASK_END
             and (cmp_ or 0) >= CMP_ZONE_COMPLETE_THRESHOLD
             and sub is not None
             and sub < RUN_START_SUB_TOLERANCE

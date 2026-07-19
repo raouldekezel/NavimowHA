@@ -33,6 +33,24 @@ Sunday-start firmware week), and neither is `action` (`= -1` appears
 on legitimate mid-run packets in the same trace).
 
 Raw diag: `docs/diag/2026-07-19_bug-17_cmp-max-late-task-end/`.
+
+Test naming vs current tracker (per #111 review). The two disjuncts
+map to the issue body's two orderings:
+
+- `test_inverted_order_...` → `STATE_IDLE` disjunct. This is what the
+  2026-07-19 wire trace *actually* hit in the current tracker: nothing
+  in `process_vehicle_state` opens a run, so `vs = 4` at t=128 ms did
+  not move the tracker out of `STATE_IDLE` before the vestige arrived
+  at t=213 ms. Names track the issue body's disjunct labelling, not
+  the wire ordering.
+- `test_observed_order_...` / `test_early_hold_...` → open-run-with-
+  -empty-`zones` disjunct. This state is transient in the current
+  tracker (only reachable inside `process_type2` between `_open_run`
+  and `_update_zone`, never observable to a caller), and has no
+  public setup path. The direct `tracker._open_run(...)` call is
+  therefore the only handle to test the disjunct — defensive coverage
+  for a future architecture where the coordinator, lawn-mower entity,
+  or a state observer would pre-open the run on `docked → mowing`.
 """
 
 from __future__ import annotations
