@@ -1,0 +1,27 @@
+# interval=event-driven+5min-samples tz=+00:00
+# HA sensor states polled from the recorder for Session 2 window
+# 2026-07-19T12:42:51Z (undock/resume) → 2026-07-19T14:00:56Z (dock/close).
+# Included: the last held values while paused_docked (pre-resume, 11:22:54Z → 12:44:26Z gap),
+# the first `type-2` on resume, ~5-minute samples of Figuier progression,
+# the fast-path completion trigger (`cmp = 10000`, `mp = 100`), and the close.
+timestamp	lawn_mower_state	zone_courante	progression_tonte	progression_zone	etat_de_la_tonte	note
+12:42:00	docked	Figuier	65	1.44	paused	held from Session 1 interrupt
+12:42:51	mowing	Figuier	65	1.44	running	state→mowing (undock)
+12:44:26	mowing	Figuier	65	2.22	running	first type-2 of Session 2 (action=8, cmp=222, sub=235.65 — no vestige)
+12:47:06	mowing	Figuier	68	8.01	running	sample
+12:52:16	mowing	Figuier	72	20.03	running	sample
+12:57:56	mowing	Figuier	75	30.05	running	sample
+13:03:26	mowing	Figuier	78	36.16	running	sample
+13:08:56	mowing	Figuier	80	42.02	running	sample
+13:14:25	mowing	Figuier	82	51.31	running	sample
+13:19:26	mowing	Figuier	85	59.23	running	sample
+13:24:43	mowing	Figuier	88	67.20	running	sample
+13:29:52	mowing	Figuier	91	74.02	running	sample
+13:35:06	mowing	Figuier	93	82.07	running	sample
+13:41:04	mowing	Figuier	95	87.03	running	sample
+13:47:26	mowing	Figuier	97	91.00	running	sample
+13:52:55	mowing	Figuier	98	96.03	running	sample
+13:56:00	mowing	Figuier	99	98.06	running	last mp step before 100 (cmp=9806)
+14:00:01	mowing	Figuier	100	100.0	running	Figuier reaches cmp=10000, mp=100, fast-path completion armed
+14:00:04	returning	unknown	unknown	unknown	returning	_maybe_complete_run fires; run enters COMPLETED
+14:00:56	docked	unknown	unknown	unknown	idle	dock; run closed; ingest_run writes ZoneRecord updates

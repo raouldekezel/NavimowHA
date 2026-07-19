@@ -1,0 +1,32 @@
+# interval=event-driven tz=+00:00
+# Entities polled from HA history API for the window
+# 2026-07-19T09:30:00Z (pre-start) → 2026-07-19T10:05:00Z (mow running).
+# `progression_tonte` = sensor.razibus_progression_de_la_tonte  (== current_run_progress = last_mp)
+# `progression_zone`  = sensor.razibus_progression_de_la_zone   (== current_zone_progress = zones[-1].cmp_max / 100)
+# `zone_courante`     = sensor.razibus_zone_courante            (boundary label)
+# `lawn_mower_state`  = lawn_mower.navimow_i210_lidar_pro       (activity)
+timestamp	lawn_mower_state	zone_courante	progression_tonte	progression_zone
+09:30:00	docked	unknown	unknown	unknown
+09:31:53	mowing	Prunier	100	100.0
+09:32:49			0	100.0
+09:33:39			1	100.0
+09:35:29			2	100.0
+09:36:39			3	100.0
+09:37:19			4	100.0
+09:38:49			5	100.0
+09:39:59			6	100.0
+09:41:39			7	100.0
+09:43:19			8	100.0
+09:44:29			9	100.0
+09:45:59			10	100.0
+09:47:09			11	100.0
+09:49:09			12	100.0
+09:50:09			13	100.0
+09:52:19			14	100.0
+09:53:08			15	100.0
+09:56:14			16	100.0
+09:57:36			17	100.0
+10:01:07			18	100.0
+10:02:19			19	100.0
+10:04:09			20	100.0
+10:04:57			21	100.0
