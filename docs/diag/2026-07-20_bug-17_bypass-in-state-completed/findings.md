@@ -337,8 +337,10 @@ All timestamps local (CEST, UTC+02:00). Raw payloads in
 
 - `01_vestige_and_first_run.mqtt.log` — HA log between 11:21:50 and 11:25:35
   (start-mow command, `vs = 4` transition, vestige packet, first
-  four genuine `type-2` packets). PII redacted (device ID retained as
-  it is not sensitive; MQTT credentials elided by HA at the source).
+  four genuine `type-2` packets). PII redacted: robot serial and
+  MQTT client id scrubbed throughout (`REDACTED-ROBOT-SERIAL`,
+  `web_REDACTED-MQTT-CLIENT-ID`); MQTT credentials elided by HA at
+  the source.
 - `02_run_close.mqtt.log` — the `run_finished` event at 11:34:54.
 - `03_store_after_event.json` — full `/config/.storage/navimow.REDACTED-ROBOT-SERIAL.run_tracker`
   Store contents after the event: `history[]` holds **14 entries
