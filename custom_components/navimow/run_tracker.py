@@ -423,16 +423,19 @@ class RunTracker:
         # RUNNING` the firmware sometimes replays the *previous* task's
         # closing packet as the very first `type-2` on the fresh mow —
         # signature `mp = 100 ∧ cmp = 10000 ∧ subtotalArea = 0`. Left
-        # untouched it poisons `zones[0].cmp_max` (monotonic max —
+        # untouched in the IDLE case the vestige is what `_open_run`
+        # reads: `start_time`, `sub₀`, `mow_start_type` are all
+        # anchored on the vestige's fields; `_update_zone` then seeds
+        # `zones[0].cmp_max` at 10000 (monotonic max —
         # sensor.<slug>_current_zone_progress sticks at 100 % for the
-        # whole zone), flashes `last_mp` at 100, and stamps
-        # `zones[0].first_time`/`sub_entry` at the vestige packet's
-        # time and `0.0` (FEAT-08 `last_complete_pass_at` and
-        # `size_estimate_m2` collateral damage). Arming keyed on
-        # `state` (not `current_run` nullity) so the window is dark
-        # post-close — that variant is BUG-13 territory and out of
-        # scope here. See `_gate_run_start_vestige` for the window and
-        # signature rationale.
+        # whole zone), stamps `first_time` / `sub_entry` at the
+        # vestige's `time` and `0.0` (FEAT-08 `last_complete_pass_at`
+        # and `size_estimate_m2` collateral), and `last_mp` flashes
+        # at 100. Post-BUG-06 sentinel the exposure is narrower
+        # (sentinel already anchored the run, only `_update_zone` and
+        # `last_mp` are at risk) but still real. See
+        # `_gate_run_start_vestige` for the window and signature
+        # rationale.
         if self._gate_run_start_vestige(parsed):
             return events
 
@@ -620,28 +623,50 @@ class RunTracker:
         run-start shape (see the "observability" paragraph below). A
         pure `_is_...` name would understate the side effect.
 
-        Drop fires only inside the run-start arming window, keyed on
-        tracker **state** (not `current_run` nullity — post-close, the
-        closed run stays referenced by `current_run` because BUG-16's
-        guard reads `last_sub` from it in `STATE_COMPLETED`; a
-        nullity-keyed window would silently mis-fire post-close). Two
-        disjuncts, one per packet/transition ordering:
+        Semantics: **armed until the first zone-carrying `type-2` is
+        accepted**. `zones == []` is the exact predicate for the
+        asset being protected — the not-yet-seeded first-zone entry
+        — not a proxy for packet acceptance. Two disjuncts:
 
-        - `STATE_IDLE` — vestige precedes the `state → mowing`
-          transition (inverted order, unobserved but possible; guard
-          prevents any run-open contamination).
-        - Run is open (`STATE_RUNNING` or `STATE_PAUSED_DOCKED`) with
-          `zones == []` — state observer already opened the run but no
-          `type-2` has been accepted yet. `STATE_PAUSED_DOCKED` covers
-          the early-hold case where the robot docks between the
-          `_open_run` and the first packet (edge, reachable via a fast
-          state observer). Observed order on 2026-07-19: the state
-          observer opened the run 85 ms before the vestige arrived.
+        - `STATE_IDLE` — the observed 2026-07-19 order. Nothing in
+          `process_vehicle_state` opens a run in the current tracker,
+          so at the moment the vestige arrives on the wire the
+          tracker is still `IDLE`; without this guard, the ungated
+          `STATE_IDLE` branch of `process_type2` would call
+          `_open_run(vestige)`, anchoring `start_time`, `sub₀`, and
+          `mow_start_type` on the vestige's fields, then
+          `_update_zone` would seed `zones[0].cmp_max` at 10000.
+        - Run is open (`STATE_RUNNING` or `STATE_PAUSED_DOCKED`)
+          with `zones == []` — the **BUG-06 sentinel** order. The
+          firmware emits an all-zero session-init `type-2`
+          (`boundary = 0 ∧ mp = 0 ∧ cmp = 0 ∧ action = -1`) at run
+          start, with a real boundary landing ~60 s later (2026-05-25
+          and 2026-07-03 corpus). That sentinel is accepted by
+          `process_type2` (accumulators updated, `state → RUNNING`,
+          `run_started` emitted), but `_update_zone` rejects
+          `boundary = 0` — so `zones` stays empty until the real
+          boundary arrives. A vestige delivered at the second packet
+          position (before the real boundary) must still be dropped;
+          this is the disjunct's real production justification.
+          `STATE_PAUSED_DOCKED` covers the sentinel-then-dock variant
+          (robot docks between the sentinel and the first real
+          packet).
 
         `STATE_COMPLETED` / `STATE_INTERRUPTED` are deliberately dark
         — the post-close zero-`sub` vestige variant is BUG-13's
         territory (#86), instrumented via #92's observability hook,
         out of scope here.
+
+        Keying on state (not on `current_run` nullity) matters
+        post-close: the closed run stays referenced by `current_run`
+        because BUG-16's guard reads `last_sub` from it in
+        `STATE_COMPLETED`; a nullity-keyed window would silently
+        mis-fire post-close.
+
+        Rejected alternative D (Sol review, #105): an IDLE-only
+        window, or a `has_accepted_type2` flag on the open run.
+        Both go dark after the BUG-06 sentinel and reopen the
+        pathology on the sentinel-first ordering.
 
         One packet drop suppresses five documented symptoms at once:
         the `current_run_progress` flash, the sticky
