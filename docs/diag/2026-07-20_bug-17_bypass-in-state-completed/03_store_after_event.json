@@ -1,0 +1,331 @@
+{
+  "version": 1,
+  "minor_version": 1,
+  "key": "navimow.REDACTED-ROBOT-SERIAL.run_tracker",
+  "data": {
+    "tracker": {
+      "version": 1,
+      "state": "interrupted",
+      "vehicle_state": 1,
+      "current_run": {
+        "start_time": 1784539314431,
+        "mow_start_type": 1,
+        "wk0": 357.63,
+        "sub0": 0.0,
+        "last_time": 1784539525768,
+        "last_sub": 9.96,
+        "last_wk": 367.55,
+        "last_mp": 2,
+        "zones": [
+          {
+            "boundary_id": 1,
+            "first_time": 1784539314431,
+            "last_time": 1784539525768,
+            "cmp_max": 10000,
+            "sub_entry": 0.0,
+            "sub_exit": 9.96
+          }
+        ]
+      },
+      "last_accepted_wk": 367.55,
+      "last_accepted_time_ms": 1784539525768,
+      "drops": {
+        "pending_reset_holds": 1
+      },
+      "counters": {
+        "wk_regressions_observed": 2,
+        "invariant_deviations_observed": 1
+      }
+    },
+    "cursors": {
+      "type1": 1784540005399,
+      "type2": 1784539525768
+    },
+    "history": [
+      {
+        "result": "interrupted",
+        "start_time": 1783150918218,
+        "end_time": 1783153798237,
+        "duration_ms": 2880019,
+        "mow_start_type": 0,
+        "zones": [
+          {
+            "boundary_id": 1,
+            "first_time": 1783150918218,
+            "last_time": 1783153798237,
+            "cmp_max": 10000,
+            "sub_entry": 135.85,
+            "sub_exit": 231.67
+          }
+        ]
+      },
+      {
+        "result": "completed",
+        "start_time": 1783150918218,
+        "end_time": 1783170683934,
+        "duration_ms": 19765716,
+        "mow_start_type": 0,
+        "zones": [
+          {
+            "boundary_id": 1,
+            "first_time": 1783150918218,
+            "last_time": 1783153798237,
+            "cmp_max": 10000,
+            "sub_entry": 135.85,
+            "sub_exit": 231.67
+          },
+          {
+            "boundary_id": 3,
+            "first_time": 1783167454899,
+            "last_time": 1783170683934,
+            "cmp_max": 10000,
+            "sub_entry": 233.03,
+            "sub_exit": 356.2
+          }
+        ]
+      },
+      {
+        "result": "completed",
+        "start_time": 1783323047630,
+        "end_time": 1783327212688,
+        "duration_ms": 4165058,
+        "session_area": 120.17,
+        "mow_start_type": 0,
+        "zones": [
+          {
+            "boundary_id": 3,
+            "first_time": 1783323107651,
+            "last_time": 1783327212688,
+            "cmp_max": 10000,
+            "sub_entry": 1.99,
+            "sub_exit": 120.17
+          }
+        ]
+      },
+      {
+        "result": "completed",
+        "start_time": 1783409475862,
+        "end_time": 1783421480613,
+        "duration_ms": 12004751,
+        "session_area": 232.76,
+        "mow_start_type": 0,
+        "zones": [
+          {
+            "boundary_id": 1,
+            "first_time": 1783409525895,
+            "last_time": 1783421480613,
+            "cmp_max": 10000,
+            "sub_entry": 2.86,
+            "sub_exit": 232.76
+          }
+        ]
+      },
+      {
+        "result": "completed",
+        "start_time": 1783435483420,
+        "end_time": 1783435483420,
+        "duration_ms": 0,
+        "session_area": 0.0,
+        "mow_start_type": 1,
+        "zones": [
+          {
+            "boundary_id": 1,
+            "first_time": 1783435483420,
+            "last_time": 1783435483420,
+            "cmp_max": 10000,
+            "sub_entry": 0.0,
+            "sub_exit": 0.0
+          }
+        ]
+      },
+      {
+        "result": "interrupted",
+        "start_time": 1783435549297,
+        "end_time": 1783435599294,
+        "duration_ms": 49997,
+        "session_area": 3.4700000000000006,
+        "mow_start_type": 1,
+        "zones": [
+          {
+            "boundary_id": 3,
+            "first_time": 1783435549297,
+            "last_time": 1783435599294,
+            "cmp_max": 409,
+            "sub_entry": 1.68,
+            "sub_exit": 5.15
+          }
+        ]
+      },
+      {
+        "result": "interrupted",
+        "start_time": 1783435819321,
+        "end_time": 1783435857361,
+        "duration_ms": 38040,
+        "session_area": 2.8500000000000005,
+        "mow_start_type": 1,
+        "zones": [
+          {
+            "boundary_id": 3,
+            "first_time": 1783435819321,
+            "last_time": 1783435857361,
+            "cmp_max": 748,
+            "sub_entry": 6.56,
+            "sub_exit": 9.41
+          }
+        ]
+      },
+      {
+        "result": "interrupted",
+        "start_time": 1783437415133,
+        "end_time": 1783439296377,
+        "duration_ms": 1881244,
+        "session_area": 43.0,
+        "mow_start_type": 1,
+        "zones": [
+          {
+            "boundary_id": 3,
+            "first_time": 1783437415133,
+            "last_time": 1783439296377,
+            "cmp_max": 4313,
+            "sub_entry": 10.83,
+            "sub_exit": 53.83
+          }
+        ]
+      },
+      {
+        "result": "completed",
+        "start_time": 1783562997065,
+        "end_time": 1783589010065,
+        "duration_ms": 26013000,
+        "session_area": 230.2,
+        "mow_start_type": 0,
+        "zones": [
+          {
+            "boundary_id": 1,
+            "first_time": 1783582330062,
+            "last_time": 1783589010065,
+            "cmp_max": 9901,
+            "sub_entry": 2.89,
+            "sub_exit": 230.2
+          }
+        ]
+      },
+      {
+        "result": "completed",
+        "start_time": 1783594306436,
+        "end_time": 1783594306436,
+        "duration_ms": 0,
+        "session_area": 0.0,
+        "mow_start_type": 0,
+        "zones": [
+          {
+            "boundary_id": 1,
+            "first_time": 1783594306436,
+            "last_time": 1783594306436,
+            "cmp_max": 10000,
+            "sub_entry": 231.77,
+            "sub_exit": 231.77
+          }
+        ]
+      },
+      {
+        "result": "interrupted",
+        "start_time": 1783606388536,
+        "end_time": 1783606699541,
+        "duration_ms": 311005,
+        "session_area": 8.629999999999995,
+        "mow_start_type": 1,
+        "zones": [
+          {
+            "boundary_id": 3,
+            "first_time": 1783606388536,
+            "last_time": 1783606699541,
+            "cmp_max": 5103,
+            "sub_entry": 286.87,
+            "sub_exit": 295.5
+          }
+        ]
+      },
+      {
+        "result": "completed",
+        "start_time": 1783755173222,
+        "end_time": 1783757357266,
+        "duration_ms": 2184044,
+        "session_area": 57.61,
+        "mow_start_type": 0,
+        "zones": [
+          {
+            "boundary_id": 3,
+            "first_time": 1783755227219,
+            "last_time": 1783757357266,
+            "cmp_max": 10000,
+            "sub_entry": 66.41,
+            "sub_exit": 122.87
+          }
+        ]
+      },
+      {
+        "result": "completed",
+        "start_time": 1784453512965,
+        "end_time": 1784469600929,
+        "duration_ms": 16087964,
+        "session_area": 357.78,
+        "mow_start_type": 1,
+        "zones": [
+          {
+            "boundary_id": 1,
+            "first_time": 1784453512965,
+            "last_time": 1784459999385,
+            "cmp_max": 10000,
+            "sub_entry": 0.0,
+            "sub_exit": 232.89
+          },
+          {
+            "boundary_id": 3,
+            "first_time": 1784460068383,
+            "last_time": 1784469600929,
+            "cmp_max": 10000,
+            "sub_entry": 234.66,
+            "sub_exit": 357.78
+          }
+        ]
+      },
+      {
+        "result": "interrupted",
+        "start_time": 1784539314431,
+        "end_time": 1784539525768,
+        "duration_ms": 211337,
+        "session_area": 9.96,
+        "mow_start_type": 1,
+        "zones": [
+          {
+            "boundary_id": 1,
+            "first_time": 1784539314431,
+            "last_time": 1784539525768,
+            "cmp_max": 10000,
+            "sub_entry": 0.0,
+            "sub_exit": 9.96
+          }
+        ]
+      }
+    ],
+    "last_finished_run": {
+      "result": "interrupted",
+      "start_time": 1784539314431,
+      "end_time": 1784539525768,
+      "duration_ms": 211337,
+      "session_area": 9.96,
+      "mow_start_type": 1,
+      "zones": [
+        {
+          "boundary_id": 1,
+          "first_time": 1784539314431,
+          "last_time": 1784539525768,
+          "cmp_max": 10000,
+          "sub_entry": 0.0,
+          "sub_exit": 9.96
+        }
+      ]
+    }
+  }
+}
