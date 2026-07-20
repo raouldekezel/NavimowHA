@@ -88,7 +88,9 @@ def _pkt(
         "currentMowBoundary": boundary,
         "mowingPercentage": mp,
         "currentMowProgress": cmp,
-        "mowingWeekArea": str(wk if wk is not None else (sub if sub is not None else 0.0)),
+        "mowingWeekArea": str(
+            wk if wk is not None else (sub if sub is not None else 0.0)
+        ),
         "action": action,
         "time": t,
     }
@@ -104,8 +106,15 @@ def _sentinel(*, sub: float = 0.1, wk: float | None = None, t: int) -> dict:
     `zones == []` — the exact arming state of the guard's second
     disjunct.
     """
-    return _pkt(mp=0, sub=sub, cmp=0, wk=wk if wk is not None else sub,
-                boundary=0, action=-1, t=t)
+    return _pkt(
+        mp=0,
+        sub=sub,
+        cmp=0,
+        wk=wk if wk is not None else sub,
+        boundary=0,
+        action=-1,
+        t=t,
+    )
 
 
 class _FakeClock:
@@ -138,9 +147,7 @@ def test_idle_order_vestige_dropped_state_stays_idle(caplog) -> None:
     assert tracker.state == STATE_IDLE
     assert tracker.current_run is None
 
-    with caplog.at_level(
-        logging.DEBUG, logger="custom_components.navimow.run_tracker"
-    ):
+    with caplog.at_level(logging.DEBUG, logger="custom_components.navimow.run_tracker"):
         events = _process(
             tracker,
             _pkt(
@@ -241,9 +248,7 @@ def test_sentinel_order_vestige_dropped_run_stays_seedless(caplog) -> None:
     assert tracker.current_run["last_sub"] == 0.1
     assert tracker.current_run["last_wk"] == 0.1
 
-    with caplog.at_level(
-        logging.DEBUG, logger="custom_components.navimow.run_tracker"
-    ):
+    with caplog.at_level(logging.DEBUG, logger="custom_components.navimow.run_tracker"):
         events = _process(
             tracker,
             _pkt(
@@ -290,9 +295,7 @@ def test_sentinel_then_early_dock_paused_docked_vestige_dropped(caplog) -> None:
     assert tracker.state == STATE_PAUSED_DOCKED
     assert tracker.current_run["zones"] == []
 
-    with caplog.at_level(
-        logging.DEBUG, logger="custom_components.navimow.run_tracker"
-    ):
+    with caplog.at_level(logging.DEBUG, logger="custom_components.navimow.run_tracker"):
         events = _process(
             tracker,
             _pkt(
@@ -348,9 +351,7 @@ def test_sentinel_then_real_boundary_closes_window(caplog) -> None:
     # closed, guard inert. Clear caplog first: the sentinel legitimately
     # emitted a suspicious-shape DEBUG at t=1_000 (accepted noise).
     caplog.clear()
-    with caplog.at_level(
-        logging.DEBUG, logger="custom_components.navimow.run_tracker"
-    ):
+    with caplog.at_level(logging.DEBUG, logger="custom_components.navimow.run_tracker"):
         _process(
             tracker,
             _pkt(
@@ -376,8 +377,7 @@ def test_sentinel_then_real_boundary_closes_window(caplog) -> None:
     suspicious = [
         r.getMessage()
         for r in caplog.records
-        if r.levelno == logging.DEBUG
-        and "run-start suspicious shape" in r.getMessage()
+        if r.levelno == logging.DEBUG and "run-start suspicious shape" in r.getMessage()
     ]
     assert suspicious == []
 
@@ -398,9 +398,7 @@ def test_sentinel_from_idle_accepted_with_suspicious_debug(caplog) -> None:
     post-reset).
     """
     tracker = RunTracker()
-    with caplog.at_level(
-        logging.DEBUG, logger="custom_components.navimow.run_tracker"
-    ):
+    with caplog.at_level(logging.DEBUG, logger="custom_components.navimow.run_tracker"):
         events = _process(tracker, _sentinel(sub=0.1, t=1_000))
     # Sentinel accepted — run_started fired, state moved to RUNNING.
     started = [e for e in events if e.kind == EVENT_RUN_STARTED]
@@ -418,8 +416,7 @@ def test_sentinel_from_idle_accepted_with_suspicious_debug(caplog) -> None:
     suspicious = [
         r.getMessage()
         for r in caplog.records
-        if r.levelno == logging.DEBUG
-        and "run-start suspicious shape" in r.getMessage()
+        if r.levelno == logging.DEBUG and "run-start suspicious shape" in r.getMessage()
     ]
     assert len(suspicious) == 1, suspicious
 
@@ -448,7 +445,9 @@ def test_post_close_vestige_shape_not_caught_by_this_guard() -> None:
     # current_run still referenced.
     _process(tracker, _pkt(mp=0, cmp=100, sub=2.47, wk=2.42, boundary=1, t=1_000))
     _process(tracker, _pkt(mp=50, cmp=5000, sub=100.0, wk=100.0, boundary=1, t=2_000))
-    _process(tracker, _pkt(mp=100, cmp=10000, sub=232.89, wk=232.89, boundary=1, t=3_000))
+    _process(
+        tracker, _pkt(mp=100, cmp=10000, sub=232.89, wk=232.89, boundary=1, t=3_000)
+    )
     tracker.process_vehicle_state(VS_DOCKED_CHARGING)
     assert tracker.state == STATE_COMPLETED
     assert tracker.current_run is not None
@@ -621,7 +620,9 @@ def test_session_2_resume_packet_not_gated() -> None:
     )
     zones = tracker.current_run["zones"]
     assert any(z["boundary_id"] == 3 and z["cmp_max"] == 222 for z in zones)
-    assert [e for e in events if e.kind in (EVENT_RUN_STARTED, EVENT_RUN_FINISHED)] == []
+    assert [
+        e for e in events if e.kind in (EVENT_RUN_STARTED, EVENT_RUN_FINISHED)
+    ] == []
 
 
 # --------------------------------------------------------------------- #
@@ -637,9 +638,7 @@ def test_suspicious_partial_shape_accepted_with_debug(caplog) -> None:
     analysis.
     """
     tracker = RunTracker()
-    with caplog.at_level(
-        logging.DEBUG, logger="custom_components.navimow.run_tracker"
-    ):
+    with caplog.at_level(logging.DEBUG, logger="custom_components.navimow.run_tracker"):
         events = _process(
             tracker,
             _pkt(
@@ -660,8 +659,7 @@ def test_suspicious_partial_shape_accepted_with_debug(caplog) -> None:
     suspicious = [
         r.getMessage()
         for r in caplog.records
-        if r.levelno == logging.DEBUG
-        and "run-start suspicious shape" in r.getMessage()
+        if r.levelno == logging.DEBUG and "run-start suspicious shape" in r.getMessage()
     ]
     assert len(suspicious) == 1, suspicious
     rejects = [
