@@ -38,12 +38,19 @@ zone-carrying `type-2` is accepted. Two disjuncts:
   ~60 s later) must still be dropped. Includes the
   sentinel-then-dock `STATE_PAUSED_DOCKED` variant.
 
-Signature: `mp = MP_TASK_END ∧ cmp ≥ 10000 ∧ area_session < 0.5`.
-`wk`, `action`, `boundary` are logged but not gated. `area_session`
-is checked explicitly for `None` so an incomplete packet never
-matches the drop signature (fail-open).
+Signature (post-BUG-19 step 2, #114): the ceiling alone — `mp =
+MP_TASK_END ∧ cmp ≥ 10000`. `sub`, `wk`, `action`, `boundary` are
+logged but not gated. `sub` was dropped from the signature because
+it only distinguished the two vestige sub-shapes (zeroed vs frozen
+at the previous close), both of which are the same phantom; gating
+`area_session < 0.5` caught BUG-17 (zero-`sub`) but missed BUG-16
+(frozen-`sub`, #92), now absorbed by the ceiling signature. Fail-open
+on `None` rests on `mp`/`cmp`: a missing `mp` fails `== MP_TASK_END`
+and a missing `cmp` collapses to `0` via `(cmp or 0)`, so an
+incomplete packet never matches the drop signature.
 
-Raw diag: `docs/diag/2026-07-19_bug-17_cmp-max-late-task-end/`.
+Raw diag: `docs/diag/2026-07-19_bug-17_cmp-max-late-task-end/` and
+`docs/diag/2026-07-20_bug-17_bypass-in-state-completed/`.
 """
 
 from __future__ import annotations
@@ -633,6 +640,49 @@ def test_2026_07_20_replay_end_to_end() -> None:
 
 
 # --------------------------------------------------------------------- #
+# 4b. Frozen-`sub` vestige (BUG-16 #92 shape) — absorbed by the ceiling #
+# --------------------------------------------------------------------- #
+
+
+def test_idle_frozen_sub_vestige_dropped(caplog) -> None:
+    """BUG-16 (#92)'s frozen-`sub` shape, now absorbed by BUG-19
+    step 2. The firmware's other task-end vestige carries the
+    *previous close's* `sub` (frozen, large) instead of a zeroed
+    accumulator — Store idx 9 on 2026-07-09 held `mp = 100, cmp =
+    10000, sub = 231.77` arriving from `STATE_IDLE`. raoul.22's
+    `sub < 0.5` clause let it through (231.77 ≥ 0.5); the ceiling-only
+    signature drops it, because `sub` is no longer tested. This is the
+    single behavioural gain of step 2 — the same guard that catches
+    the zero-`sub` shape now catches the frozen-`sub` sibling.
+    """
+    tracker = RunTracker()
+    assert tracker.state == STATE_IDLE
+    assert tracker.current_run is None
+    with caplog.at_level(logging.DEBUG, logger="custom_components.navimow.run_tracker"):
+        events = _process(
+            tracker,
+            _pkt(
+                mp=100,
+                cmp=CMP_ZONE_COMPLETE_THRESHOLD,
+                sub=231.77,
+                wk=231.77,
+                boundary=1,
+                action=-1,
+                t=1_000,
+            ),
+        )
+    assert [e for e in events if e.kind == EVENT_RUN_STARTED] == []
+    assert tracker.state == STATE_IDLE
+    assert tracker.current_run is None
+    dbgs = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.DEBUG and "run-start vestige" in r.getMessage()
+    ]
+    assert len(dbgs) == 1, dbgs
+
+
+# --------------------------------------------------------------------- #
 # 5. Sunday first mow — tolerances alone must never trigger the drop    #
 # --------------------------------------------------------------------- #
 
@@ -659,22 +709,60 @@ def test_sunday_first_mow_low_sub_but_low_mp_accepted() -> None:
 
 
 # --------------------------------------------------------------------- #
-# 6. Incomplete packet (area_session is None) never matches drop        #
+# 6. Missing `sub` no longer shields the ceiling vestige (BUG-19 step 2) #
 # --------------------------------------------------------------------- #
 
 
-def test_incomplete_packet_missing_sub_accepted_not_dropped() -> None:
-    """`area_session is None` (parser fallback on a sparse firmware
-    variant) inside the arming window: the guard must fail-open. The
-    explicit `is not None` check in the condition means a missing
-    accumulator never defaults toward the incriminating zero.
+def test_incomplete_packet_missing_sub_still_dropped_by_ceiling(caplog) -> None:
+    """Post-BUG-19 step 2 the drop signature is the ceiling alone
+    (`mp = 100 ∧ cmp = 10000`); `sub` is not gated. A packet whose
+    `area_session` is absent (parser fallback on a sparse firmware
+    variant) but which still carries the ceiling is a vestige — a run
+    cannot *open* at `cmp = 10000` — so it is dropped, not accepted.
+
+    Pre-step-2 the `sub is not None` clause let this through; that
+    behaviour inverts by design, exactly as the post-close case
+    inverted at step 1. Fail-open now rests on `mp`/`cmp` (see
+    `test_low_cmp_fails_open_when_sub_missing`), not on `sub`.
+    """
+    tracker = RunTracker()
+    with caplog.at_level(logging.DEBUG, logger="custom_components.navimow.run_tracker"):
+        events = _process(
+            tracker,
+            _pkt(
+                mp=100,
+                cmp=CMP_ZONE_COMPLETE_THRESHOLD,
+                sub=None,
+                wk=0.0,
+                boundary=1,
+                action=-1,
+                t=1_000,
+            ),
+        )
+    assert [e for e in events if e.kind == EVENT_RUN_STARTED] == []
+    assert tracker.state == STATE_IDLE
+    assert tracker.current_run is None
+    dbgs = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.DEBUG and "run-start vestige" in r.getMessage()
+    ]
+    assert len(dbgs) == 1, dbgs
+
+
+def test_low_cmp_fails_open_when_sub_missing() -> None:
+    """The complement, isolating the `cmp` gate: same missing `sub`,
+    but `cmp = 200` is *below* the ceiling, so the signature fails and
+    the packet is accepted (opens the run from IDLE). Confirms that
+    dropping the `sub` clause did not degrade the guard into a blanket
+    `mp = 100` reject — `cmp` still carries the drop decision.
     """
     tracker = RunTracker()
     events = _process(
         tracker,
         _pkt(
             mp=100,
-            cmp=CMP_ZONE_COMPLETE_THRESHOLD,
+            cmp=200,
             sub=None,
             wk=0.0,
             boundary=1,
@@ -887,12 +975,13 @@ def test_interrupted_run_after_dropped_vestige_reports_real_cmp_max() -> None:
 
 
 def test_tolerance_constant_pinned() -> None:
-    """Pin the tolerance constant. 0.5 m² sits between the vestige's
-    literal 0.0 and the smallest observed genuine first-packet `sub`
-    (2.47 m² on 2026-07-19; 0.39 m² on 2026-05-25 for a fresh session
-    post-reset). Drifting upward risks catching a genuine packet;
-    drifting downward risks missing a vestige on a firmware variant
-    that emits a residual float near zero.
+    """Pin the tolerance constant. Post-BUG-19 step 2 it no longer
+    gates the *drop* (the ceiling signature `mp = 100 ∧ cmp = 10000`
+    does) — it now only bounds the observability "suspicious shape"
+    DEBUG line. 0.5 m² still sits between a literal 0.0 and the
+    smallest observed genuine first-packet `sub` (2.47 m² on
+    2026-07-19; 0.39 m² on 2026-05-25 for a fresh session post-reset),
+    keeping that DEBUG stream's false-positive rate low.
     """
     assert RUN_START_SUB_TOLERANCE == 0.5
 
