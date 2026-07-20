@@ -14,8 +14,10 @@ fire and the tracker opened the fresh run anchored on the vestige's fields
 as in raoul.19.
 
 Root cause of the bypass: at the moment the vestige arrived, the tracker
-was in **`STATE_INTERRUPTED`/`STATE_COMPLETED` restored from Store**, not
-`STATE_IDLE`. The BUG-17 guard's arming window is
+was in **`STATE_COMPLETED` restored from Store** (inferred from the
+2026-07-19 close's `result = "completed"` in `history[-2]`; the
+alternative `STATE_INTERRUPTED` would need a differently-shaped
+prior close), not `STATE_IDLE`. The BUG-17 guard's arming window is
 deliberately dark in post-close states (per #105 fifth-edit body: "the
 post-close zero-`sub` vestige variant is BUG-13 territory (#86),
 instrumented via #92's observability hook, out of scope here"). The packet
@@ -37,12 +39,24 @@ in the deployed source (issue #92 is still OPEN; no PR has landed for
 BUG-16 / BUG-13 instrumentation). The event went silent.
 
 **Blast radius on today's session** (per `03_store_after_event.json` and
-`02_run_close.mqtt.log`): run closed as `interrupted`, `session_area = 9.96 m²`
-(vs the real ~7-9 m² actually mowed), `zones[0].cmp_max = 10000` written to
-`history[]` for boundary 1, `Store.last_cmp_max` overstated (persisted
-alongside the previous already-poisoned `2026-07-19` Prunier record). The
-FEAT-08 `sensor.<slug>_zone_1_surface.last_complete_pass_at` will be
-stamped at the vestige's `time` again on the next ingest for that boundary.
+`02_run_close.mqtt.log`): run closed as `interrupted`, `session_area = 9.96 m²`,
+`zones[0].cmp_max = 10000` written to `history[]` for boundary 1,
+`Store.last_cmp_max` overstated (persisted alongside the previous
+already-poisoned `2026-07-19` Prunier record). The FEAT-08
+`sensor.<slug>_zone_1_surface.last_complete_pass_at` will be stamped
+at the vestige's `time` again on the next ingest for that boundary.
+
+*(Note on `session_area = 9.96` — this is the firmware's honest count
+of what today's real task actually mowed. The vestige's `sub₀ = 0.0`
+happens to coincide with the true task origin here, so
+`last_sub - sub₀ = 9.96 - 0.0 = 9.96` is accurate on this specific
+day. Under a guard-fixed opening, `sub₀` would be anchored on the
+first real packet's `sub = 2.53` — reporting **7.43 m²**, a slight
+undercount. Both readings are variants of "not the ~9-9.5 m² the
+firmware genuinely mowed"; the current 9.96 is over by one
+inter-packet interval, the fixed 7.43 would be under by the same
+amount. Neither is the pathology's main damage — that's
+`zones[0].cmp_max = 10000`.)*
 
 ## Question for triage
 
@@ -79,13 +93,20 @@ Is this occurrence:
 - **DEBUG on**: `custom_components.navimow: debug`, `mower_sdk: debug`
   (unchanged from raoul.19 diag).
 - **Pre-run tracker state**: restored from
-  `/config/.storage/navimow.3KAAW2606K1874.run_tracker` at coordinator
+  `/config/.storage/navimow.REDACTED-ROBOT-SERIAL.run_tracker` at coordinator
   setup. The previous run (2026-07-19, closed as `completed`,
   `zones = [Prunier cmp_max=10000, Figuier cmp_max=10000]`,
   `session_area = 357.78 m²`) sits at `history[-2]` in the Store — see
-  `03_store_after_event.json`. That prior close left `state ∈
-  {STATE_COMPLETED, STATE_INTERRUPTED}` and `current_run.last_sub = 357.78`
-  in the Store, which `restore()` re-hydrated on this restart.
+  `03_store_after_event.json`. Because that close was labelled
+  `completed`, the restored `state` was inferably
+  **`STATE_COMPLETED`** (the alternative `STATE_INTERRUPTED` would
+  have required the last run to have closed under the sustained-timer
+  path with `mp < 100`, which is not this history entry's shape).
+  The post-event dump's `state = "interrupted"` (today's own close)
+  mirrors *this session's* result, not the pre-run state. Diag
+  protocol lesson for next time: capture `.storage/navimow.*.run_tracker`
+  **before** invoking the mow, not only after — the pre-event
+  snapshot is what pins the restored state without inference.
 - **Store restore mechanism**: `coordinator.py:183`
   `self.run_tracker.restore(tracker_snap)` called from
   `_async_restore_store` at coordinator init. See also `snapshot()` at
@@ -106,10 +127,10 @@ All timestamps local (CEST, UTC+02:00). Raw payloads in
 | 11:20:38.120  | `homeassistant.components.lawn_mower` setup — navimow entities coming online.                                                                             |
 | 11:21:01.768  | `homeassistant.bootstrap: Home Assistant initialized in 37.02s`.                                                                                          |
 | 11:21:05.280  | Post-init tick — coordinator `_async_restore_store()` completed by this point; tracker state restored from Store (details in `03_...json`).               |
-| 11:21:52.882  | Operator invokes `lawn_mower.start_mowing` on the HA entity (`Started mowing for device 3KAAW2606K1874`).                                                 |
+| 11:21:52.882  | Operator invokes `lawn_mower.start_mowing` on the HA entity (`Started mowing for device REDACTED-ROBOT-SERIAL`).                                                 |
 | 11:21:54.223  | First `type-1` after start on `/location`: `vehicleState = 4` (mowing).                                                                                   |
 | 11:21:54.244  | `/state` topic reports `state = isRunning, battery = 100`.                                                                                                |
-| 11:21:54.382  | **Vestige `type-2` on `/location`**: `action = -1, boundary = 1, cmp = 10000, mp = 100, sub = "0.0", wk = "357.63", time = 1784539314431, mowStartType = 1`. Same shape as raoul.19 2026-07-19 vestige, mid-week (Sunday-week convention: 2026-07-20 is Monday, day 2 of the firmware week — `wk = 357.63` reflects the live week counter). |
+| 11:21:54.382  | **Vestige `type-2` on `/location`**: `action = -1, boundary = 1, cmp = 10000, mp = 100, sub = "0.0", wk = "357.63", time = 1784539314431, mowStartType = 1`. Same shape as raoul.19 2026-07-19 vestige, mid-week (Sunday-week convention: 2026-07-20 is Monday, day 2 of the firmware week — `wk = 357.63` reflects the live week counter). Firmware `time` field decodes to `09:21:54.431Z`, i.e. **49 ms *after* the log delivery timestamp** — a sign flip from the 2026-07-19 diag, where the vestige's `time` field decoded to 248 ms *before* delivery. No claim depends on the direction; noted here so a future reader doesn't try to read meaning into the sign. |
 | 11:21:54.382  | `run_tracker event: kind=run_started payload={'start_time': 1784539314431, 'mow_start_type': 1}` — the fresh run's `start_time` and `mow_start_type` are anchored on the **vestige's** fields. Same coordinator tick as packet arrival. |
 | 11:22:50.383  | Second `type-2`: `action = 8, boundary = 1, cmp = 104, mp = 0, sub = "2.53", wk = "360.12"` — the real first packet of the fresh Prunier task, 56.0 s after the vestige (comparable to the 56.4 s gap in the raoul.19 diag). `cmp_max` stays at 10000 via `max(10000, 104)`. |
 | 11:23:40.828  | 3rd `type-2`: `cmp = 213, mp = 1, sub = 5.15`.                                                                                                            |
@@ -199,11 +220,82 @@ All timestamps local (CEST, UTC+02:00). Raw payloads in
   `state != IDLE`. For an operator whose rhythm is one mow every 2–3
   days with HA left running (or restarted for updates), the tracker
   will be in a `STATE_COMPLETED` / `STATE_INTERRUPTED` state at every
-  next-mow start — never `STATE_IDLE`. The 2026-07-19 raoul.19 diag
-  had `STATE_IDLE` only because that mow followed a 10-day pause with
-  presumably a Store wipe (memory backup rebuild or manual delete —
-  operator to confirm on #105 back-reference); routine operation
-  will hit the post-close path.
+  next-mow start — never `STATE_IDLE`.
+- **Archaeology of the persisted-state mechanism.** `git log`
+  (`custom_components/navimow/{run_tracker,coordinator}.py`,
+  pickaxe on `snap.get("state"` / `_async_restore_store`) shows:
+  - `restore()` (with `self.state = snap.get("state", STATE_IDLE)`
+    and `self.current_run = snap.get("current_run")`) landed on
+    2026-07-03 in FEAT-05 b (commit `125ac86`, PR #49).
+  - `_async_restore_store()` calling `run_tracker.restore(tracker_snap)`
+    on coordinator init landed on 2026-07-04 in FEAT-05 c
+    (commit `571b8eb`, PR #50).
+  - `SNAPSHOT_VERSION` has been `1` since day one; no bump ever
+    triggered a mismatch-discard path.
+
+  So the mechanism has been live continuously since **2026-07-04** —
+  16 days before today's event, and **15 days before** the raoul.19
+  2026-07-19 diag. The `history[]` in `03_store_after_event.json`
+  confirms this operationally: 14 entries spanning 2026-07-04 12:31Z
+  → 2026-07-20 09:25Z, with no gap that would hint at a Store wipe.
+- **Consequence for the raoul.19 diag narrative.** The raoul.19
+  findings' claim that "the tracker had been `IDLE` for 10 days" and
+  `current_run = None` at pre-experiment time is architecturally
+  inconsistent with the mechanism above: with `restore()` live since
+  2026-07-04 and no version bump, a `STATE_COMPLETED` snapshot from
+  the 2026-07-09 close should have re-hydrated on any HA restart in
+  the intervening 10 days, leaving `state = COMPLETED`, not `IDLE`.
+  Possible explanations (none captured in the raoul.19 diag): manual
+  `.storage/navimow.*.run_tracker` delete, `restore()` returning
+  `False` on a version mismatch, or `history` growing while `state`
+  was clobbered by an early-2026-07 reset. **Not resolvable from
+  today's evidence alone** — filed as a follow-up on #105 if the
+  triage owner needs the answer.
+- **Historical evidence in the dump — BUG-13 and BUG-16 signatures
+  visible pre-today.** Two rows of `history[]` in
+  `03_store_after_event.json` are worth surfacing on their own,
+  independently of today's event:
+  - **Row 5** (index 4, 1-indexed 5) — `start_time = 2026-07-07T14:44:43Z`,
+    `duration_ms = 0`, `result = completed`, `session_area = 0.0`,
+    `zones = [{boundary_id: 1, sub_entry: 0.0, sub_exit: 0.0,
+    cmp_max: 10000}]`, `mow_start_type = 1`. This is the **classic
+    BUG-13 (#86) 0-second zero-`sub` phantom**, now in persisted
+    form: open+close in the same frame, with zeros on both zone
+    accumulators and `cmp_max = 10000` — the exact chain #86
+    hypothesises, corroborated by a real Store dump.
+  - **Row 10** (index 9, 1-indexed 10) — `start_time = 2026-07-09T10:51:46Z`,
+    `duration_ms = 0`, `result = completed`, `session_area = 0.0`,
+    `zones = [{boundary_id: 1, sub_entry: 231.77, sub_exit: 231.77,
+    cmp_max: 10000}]`, `mow_start_type = 0`. Same 0-second phantom
+    shape as row 5, but with **BUG-16's (#92) frozen-`sub` signature
+    (231.77)** rather than zeros — this is the sibling artifact,
+    persisted at the moment the raoul.19 diag's operator memo
+    documented the 2026-07-09 mini-run's close.
+
+  Both rows are dormant history entries with no direct impact on
+  today's diagnosis; surfacing them here so the dump is on the
+  record for #86 and #92.
+- **Row 11 vs #92's predicted phantom shape.** Row 11
+  (index 10, 1-indexed 11) — `start_time = 2026-07-09T14:13:08Z`,
+  `duration_ms = 311_000`, `result = interrupted`,
+  `session_area = 8.63`,
+  `zones = [{boundary_id: 3, sub_entry: 286.87, sub_exit: 295.5,
+  cmp_max: 5103}]`, `mow_start_type = 1`. #92's Fifth-edit body
+  predicts a run opened at 2026-07-09T14:11:44Z with
+  `zones = [{boundary_id: 1}, {boundary_id: 3}]` on the same
+  session-continuation path. The persisted history records
+  something narrower: only zone 3, opened 84 seconds later,
+  interrupted 5 min later. #92's guard is right either way (the
+  16:11:44 packet demonstrably arrived on the wire per the
+  2026-07-09 diag), but its "net effect" narrative should be
+  reconciled with this dump before the fix PR is designed.
+- **Sharpens, not weakens, the "dominant path" claim.** Given the
+  mechanism has been live since 2026-07-04, **every next-mow
+  post-close since then has been on the vulnerable code path**.
+  raoul.19's `STATE_IDLE` opening was the anomaly, not the norm —
+  and BUG-17's guard was designed to protect the anomaly. Routine
+  operation, then and now, hits the post-close reset branch that
+  this diag documents.
 
 ## Open questions
 
@@ -248,11 +340,14 @@ All timestamps local (CEST, UTC+02:00). Raw payloads in
   four genuine `type-2` packets). PII redacted (device ID retained as
   it is not sensitive; MQTT credentials elided by HA at the source).
 - `02_run_close.mqtt.log` — the `run_finished` event at 11:34:54.
-- `03_store_after_event.json` — full `/config/.storage/navimow.3KAAW2606K1874.run_tracker`
-  Store contents after the event, showing the two-entry `history[]`
-  (2026-07-19 completed multi-zone run + 2026-07-20 interrupted
-  vestige-anchored run) and the final tracker state
-  (`state = interrupted`, `vehicle_state = 1`).
+- `03_store_after_event.json` — full `/config/.storage/navimow.REDACTED-ROBOT-SERIAL.run_tracker`
+  Store contents after the event: `history[]` holds **14 entries
+  spanning 2026-07-04T12:31Z → 2026-07-20T09:25Z** (rows 1–13
+  pre-existing at HA start; row 14 is today's poisoned run), and the
+  final tracker state (`state = interrupted`, `vehicle_state = 1`).
+  See the "Historical evidence in the dump" finding below for two
+  rows worth calling out (BUG-13 and BUG-16 signatures pre-visible
+  in this dump).
 - `findings.md` — this file.
 
 ## Refs
