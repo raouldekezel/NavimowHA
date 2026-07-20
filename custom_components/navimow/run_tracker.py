@@ -251,6 +251,30 @@ CMP_ZONE_COMPLETE_THRESHOLD = 10000
 # zone recharge); noted here so a future report can reproduce it.
 # `session_area` and `zones[]` remain correct on either label.
 
+# BUG-17 (2026-07-19, #105): protocol facts about the firmware's late
+# task-end replay packet — distinct from the *policy* completion
+# thresholds above.
+#
+# `MP_TASK_END` is the wire value the firmware stamps on the vestige.
+# It coincides numerically with `MP_COMPLETION_THRESHOLD` today (both
+# 100), but they are conceptually independent: the completion
+# threshold is a tunable tracker policy that has already moved once
+# (99 → 100 in PR #91 / BUG-14) and is still under debate (#89's
+# battery-gate alternative). If it moves again the vestige guard must
+# not follow — a value of 99 as completion threshold would still see
+# a `mp = 100` vestige on the wire. Keeping the two constants
+# separate makes the coupling explicit and prevents silent drift.
+#
+# `RUN_START_SUB_TOLERANCE` is the tolerance for the `area_session`
+# (`sub`) check in the vestige signature. The vestige carries
+# `subtotalArea = 0.0`; a legitimate first packet of a fresh mow
+# already carries at least ~2.4 m² after one type-2 cadence (2.47 m²
+# observed on 2026-07-19). 0.5 m² sits below both and above the
+# vestige's literal zero, giving headroom for a firmware variant that
+# emits a residual float near zero.
+MP_TASK_END = 100
+RUN_START_SUB_TOLERANCE = 0.5
+
 # Seconds a PAUSED_DOCKED run must remain in DOCKED_NOT_CHARGING before
 # it is declared INTERRUPTED. 60 s ≈ 30 type-1 samples at the 2 s
 # cadence — ample debounce for dock-contact transients while keeping
@@ -393,6 +417,27 @@ class RunTracker:
         `location.parse_location_type_2`.
         """
         events: list[Event] = []
+
+        # BUG-17 (2026-07-19, #105): drop a run-start "task-end vestige"
+        # packet before any state transition or write. On `IDLE →
+        # RUNNING` the firmware sometimes replays the *previous* task's
+        # closing packet as the very first `type-2` on the fresh mow —
+        # signature `mp = 100 ∧ cmp = 10000 ∧ subtotalArea = 0`. Left
+        # untouched in the IDLE case the vestige is what `_open_run`
+        # reads: `start_time`, `sub₀`, `mow_start_type` are all
+        # anchored on the vestige's fields; `_update_zone` then seeds
+        # `zones[0].cmp_max` at 10000 (monotonic max —
+        # sensor.<slug>_current_zone_progress sticks at 100 % for the
+        # whole zone), stamps `first_time` / `sub_entry` at the
+        # vestige's `time` and `0.0` (FEAT-08 `last_complete_pass_at`
+        # and `size_estimate_m2` collateral), and `last_mp` flashes
+        # at 100. Post-BUG-06 sentinel the exposure is narrower
+        # (sentinel already anchored the run, only `_update_zone` and
+        # `last_mp` are at risk) but still real. See
+        # `_gate_run_start_vestige` for the window and signature
+        # rationale.
+        if self._gate_run_start_vestige(parsed):
+            return events
 
         # BUG-10 (2026-07-05, #58): layer 2 is now observability. A `wk`
         # regression is logged at DEBUG and counted, but the packet
@@ -568,6 +613,145 @@ class RunTracker:
     # ------------------------------------------------------------- #
     # Guards + observability                                        #
     # ------------------------------------------------------------- #
+
+    def _gate_run_start_vestige(self, parsed: dict[str, Any]) -> bool:
+        """BUG-17 (#105): drop the late task-end vestige at run start.
+
+        Name is a gate, not a predicate: on top of returning `True`
+        when the packet must be dropped, this method also emits an
+        observability DEBUG line on the suspicious-but-not-dropped
+        run-start shape (see the "observability" paragraph below). A
+        pure `_is_...` name would understate the side effect.
+
+        Semantics: **armed until the first zone-carrying `type-2` is
+        accepted**. `zones == []` is the exact predicate for the
+        asset being protected — the not-yet-seeded first-zone entry
+        — not a proxy for packet acceptance. Two disjuncts:
+
+        - `STATE_IDLE` — the observed 2026-07-19 order. Nothing in
+          `process_vehicle_state` opens a run in the current tracker,
+          so at the moment the vestige arrives on the wire the
+          tracker is still `IDLE`; without this guard, the ungated
+          `STATE_IDLE` branch of `process_type2` would call
+          `_open_run(vestige)`, anchoring `start_time`, `sub₀`, and
+          `mow_start_type` on the vestige's fields, then
+          `_update_zone` would seed `zones[0].cmp_max` at 10000.
+        - Run is open (`STATE_RUNNING` or `STATE_PAUSED_DOCKED`)
+          with `zones == []` — the **BUG-06 sentinel** order. The
+          firmware emits an all-zero session-init `type-2`
+          (`boundary = 0 ∧ mp = 0 ∧ cmp = 0 ∧ action = -1`) at run
+          start, with a real boundary landing ~60 s later (2026-05-25
+          and 2026-07-03 corpus). That sentinel is accepted by
+          `process_type2` (accumulators updated, `state → RUNNING`,
+          `run_started` emitted), but `_update_zone` rejects
+          `boundary = 0` — so `zones` stays empty until the real
+          boundary arrives. A vestige delivered at the second packet
+          position (before the real boundary) must still be dropped;
+          this is the disjunct's real production justification.
+          `STATE_PAUSED_DOCKED` covers the sentinel-then-dock variant
+          (robot docks between the sentinel and the first real
+          packet).
+
+        `STATE_COMPLETED` / `STATE_INTERRUPTED` are deliberately dark
+        — the post-close zero-`sub` vestige variant is BUG-13's
+        territory (#86), instrumented via #92's observability hook,
+        out of scope here.
+
+        Keying on state (not on `current_run` nullity) matters
+        post-close: the closed run stays referenced by `current_run`
+        because BUG-16's guard reads `last_sub` from it in
+        `STATE_COMPLETED`; a nullity-keyed window would silently
+        mis-fire post-close.
+
+        Rejected alternative D (Sol review, #105): an IDLE-only
+        window, or a `has_accepted_type2` flag on the open run.
+        Both go dark after the BUG-06 sentinel and reopen the
+        pathology on the sentinel-first ordering.
+
+        One packet drop suppresses five documented symptoms at once:
+        the `current_run_progress` flash, the sticky
+        `current_zone_progress`, the poisoned `first_time` (FEAT-08
+        `last_complete_pass_at`), the poisoned `sub_entry = 0.0`
+        (`size_estimate_m2` in the multi-zone-latent scenario), and
+        the over-stated `Store.last_cmp_max` on interrupted runs —
+        plus the BUG-14 fast-path interaction (`mp = 99 ∧ cmp_max =
+        10000` on a poisoned zone).
+
+        The rejection signature is intentionally narrow: `mp = 100 ∧
+        cmp ≥ 10000 ∧ area_session < RUN_START_SUB_TOLERANCE`. `wk`
+        and `action` are logged but not gated on: the observed `wk =
+        0.0` was a calendar artifact of the Sunday-start firmware
+        week (2026-07-19 was a Sunday, day one of the week) — a
+        mid-week vestige would carry `wk > 0`; `action = -1` appears
+        on legitimate mid-run packets and its cross-firmware
+        stability is not established. `area_session` is checked
+        explicitly for `None` — treating a missing accumulator as
+        zero would default an incomplete packet toward the drop, the
+        opposite of the fail-open policy.
+
+        Also emits an observability DEBUG line for suspicious-but-
+        -not-dropped shapes: `area_session` near zero inside the same
+        arming window without the full `mp = 100 ∧ cmp = 10000`
+        match. Collects evidence for the untested `interrupted`
+        vestige shape (open question 1). This line does fire on some
+        genuine low-`sub` first packets — a fresh session post-reset
+        was observed at `sub = 0.39 m²` on 2026-05-25 and a
+        Sunday-first-mow at `sub ≈ 0.3` is plausible — so the DEBUG
+        stream carries a few false positives per week. Analysis
+        discriminates them via the logged `mp` / `cmp` (a genuine
+        low-`sub` start carries `mp = 0` and `cmp ≪ 10000`; an
+        `interrupted` vestige would carry the partial `cmp_max` from
+        the previous close). Accepted noise, not a defect.
+        """
+        if self.state == STATE_IDLE:
+            armed = True
+        elif (
+            self.state in (STATE_RUNNING, STATE_PAUSED_DOCKED)
+            and self.current_run is not None
+            and not self.current_run.get("zones")
+        ):
+            armed = True
+        else:
+            armed = False
+        if not armed:
+            return False
+
+        mp = parsed.get("mowing_percentage")
+        cmp_ = parsed.get("current_mow_progress")
+        sub = parsed.get("area_session")
+
+        if (
+            mp == MP_TASK_END
+            and (cmp_ or 0) >= CMP_ZONE_COMPLETE_THRESHOLD
+            and sub is not None
+            and sub < RUN_START_SUB_TOLERANCE
+        ):
+            _LOGGER.debug(
+                "run_tracker: type-2 rejected — run-start vestige "
+                "(mp=%s cmp=%s sub=%s wk=%s action=%s boundary=%s time=%s)",
+                mp,
+                cmp_,
+                sub,
+                parsed.get("area_week"),
+                parsed.get("action"),
+                parsed.get("boundary"),
+                parsed.get("time"),
+            )
+            return True
+
+        if sub is not None and sub < RUN_START_SUB_TOLERANCE:
+            _LOGGER.debug(
+                "run_tracker: run-start suspicious shape, not dropped "
+                "(mp=%s cmp=%s sub=%s wk=%s action=%s boundary=%s time=%s)",
+                mp,
+                cmp_,
+                sub,
+                parsed.get("area_week"),
+                parsed.get("action"),
+                parsed.get("boundary"),
+                parsed.get("time"),
+            )
+        return False
 
     def _observe_wk_regression(self, parsed: dict[str, Any]) -> None:
         """Count and log wk regressions without dropping the packet.
