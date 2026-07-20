@@ -418,24 +418,30 @@ class RunTracker:
         """
         events: list[Event] = []
 
-        # BUG-17 (2026-07-19, #105): drop a run-start "task-end vestige"
-        # packet before any state transition or write. On `IDLE →
-        # RUNNING` the firmware sometimes replays the *previous* task's
-        # closing packet as the very first `type-2` on the fresh mow —
-        # signature `mp = 100 ∧ cmp = 10000 ∧ subtotalArea = 0`. Left
-        # untouched in the IDLE case the vestige is what `_open_run`
-        # reads: `start_time`, `sub₀`, `mow_start_type` are all
-        # anchored on the vestige's fields; `_update_zone` then seeds
-        # `zones[0].cmp_max` at 10000 (monotonic max —
-        # sensor.<slug>_current_zone_progress sticks at 100 % for the
-        # whole zone), stamps `first_time` / `sub_entry` at the
-        # vestige's `time` and `0.0` (FEAT-08 `last_complete_pass_at`
-        # and `size_estimate_m2` collateral), and `last_mp` flashes
-        # at 100. Post-BUG-06 sentinel the exposure is narrower
-        # (sentinel already anchored the run, only `_update_zone` and
-        # `last_mp` are at risk) but still real. See
-        # `_gate_run_start_vestige` for the window and signature
-        # rationale.
+        # BUG-17 (2026-07-19, #105) + BUG-19 (2026-07-20, #114): drop
+        # the run-start "task-end vestige" packet before any state
+        # transition or write. On task-start the firmware sometimes
+        # replays the *previous* task's closing packet as the very
+        # first `type-2` on the fresh mow — signature `mp = 100 ∧
+        # cmp = 10000 ∧ subtotalArea = 0`. Left untouched:
+        # - From `STATE_IDLE`: vestige is what `_open_run` reads;
+        #   `start_time`, `sub₀`, `mow_start_type` all anchored on it;
+        #   `_update_zone` seeds `zones[0].cmp_max = 10000` (monotonic
+        #   max — sensor.<slug>_current_zone_progress sticks at 100 %
+        #   for the whole zone).
+        # - From post-close (`STATE_COMPLETED` / `STATE_INTERRUPTED`,
+        #   the operator's dominant path since Store persistence
+        #   landed FEAT-05c 2026-07-04): vestige takes the `is_reset`
+        #   branch (0.0 < prev `last_sub`) → `_open_run(vestige)` ⇒
+        #   same anchoring collateral, same `zones[0]` poisoning.
+        # - From BUG-06 sentinel-then-vestige (open run, `zones ==
+        #   []`): sentinel already anchored the run, only
+        #   `_update_zone` and `last_mp` are at risk — still real.
+        #
+        # BUG-19 widened the arming window from an enumeration of
+        # safe states to "armed unless we're mid-mow with a real
+        # zone already seeded" — the enumeration missed post-close.
+        # See `_gate_run_start_vestige` for the full rationale.
         if self._gate_run_start_vestige(parsed):
             return events
 
@@ -615,18 +621,29 @@ class RunTracker:
     # ------------------------------------------------------------- #
 
     def _gate_run_start_vestige(self, parsed: dict[str, Any]) -> bool:
-        """BUG-17 (#105): drop the late task-end vestige at run start.
+        """BUG-17 (#105) + BUG-19 (#114): drop the late task-end vestige.
 
         Name is a gate, not a predicate: on top of returning `True`
         when the packet must be dropped, this method also emits an
         observability DEBUG line on the suspicious-but-not-dropped
-        run-start shape (see the "observability" paragraph below). A
-        pure `_is_...` name would understate the side effect.
+        shape (see the "observability" paragraph below). A pure
+        `_is_...` name would understate the side effect.
 
-        Semantics: **armed until the first zone-carrying `type-2` is
-        accepted**. `zones == []` is the exact predicate for the
-        asset being protected — the not-yet-seeded first-zone entry
-        — not a proxy for packet acceptance. Two disjuncts:
+        Semantics (BUG-19 widening, 2026-07-20): **armed by default;
+        dark only in one specific state — an open run whose first
+        zone is already honestly seeded**. The asset the guard
+        protects is the *next* run's `zones[0]` seed plus the
+        `_open_run` anchor (`start_time`, `sub₀`, `mow_start_type`);
+        that asset is at risk in every state except "mowing with a
+        real zone in flight". Naming the single dark state is safer
+        than enumerating the armed ones — the raoul.22 enumeration
+        (IDLE ∪ "open run with zones == []") missed post-close, which
+        turned out to be the operator's dominant real-world entry
+        state (Store restore rehydrates `STATE_COMPLETED` /
+        `STATE_INTERRUPTED` after any prior close; every next mow
+        starts from that entry, not from IDLE).
+
+        Concretely the guard is armed in:
 
         - `STATE_IDLE` — the observed 2026-07-19 order. Nothing in
           `process_vehicle_state` opens a run in the current tracker,
@@ -636,8 +653,8 @@ class RunTracker:
           `_open_run(vestige)`, anchoring `start_time`, `sub₀`, and
           `mow_start_type` on the vestige's fields, then
           `_update_zone` would seed `zones[0].cmp_max` at 10000.
-        - Run is open (`STATE_RUNNING` or `STATE_PAUSED_DOCKED`)
-          with `zones == []` — the **BUG-06 sentinel** order. The
+        - Open run (`STATE_RUNNING` / `STATE_PAUSED_DOCKED`) with
+          `zones == []` — the **BUG-06 sentinel** order. The
           firmware emits an all-zero session-init `type-2`
           (`boundary = 0 ∧ mp = 0 ∧ cmp = 0 ∧ action = -1`) at run
           start, with a real boundary landing ~60 s later (2026-05-25
@@ -646,22 +663,28 @@ class RunTracker:
           `run_started` emitted), but `_update_zone` rejects
           `boundary = 0` — so `zones` stays empty until the real
           boundary arrives. A vestige delivered at the second packet
-          position (before the real boundary) must still be dropped;
-          this is the disjunct's real production justification.
-          `STATE_PAUSED_DOCKED` covers the sentinel-then-dock variant
-          (robot docks between the sentinel and the first real
-          packet).
+          position (before the real boundary) must still be dropped.
+          `STATE_PAUSED_DOCKED` covers the sentinel-then-dock variant.
+        - **Post-close** (`STATE_COMPLETED` / `STATE_INTERRUPTED`) —
+          the operator's dominant path (BUG-19, 2026-07-20 wire
+          trace). The closed run stays referenced by `current_run`
+          with non-empty `zones` from the completed session, but the
+          state check filters it out of the dark predicate: the
+          `zones` filled here belong to the *previous* run, not to a
+          new one being seeded. Absent the guard, the vestige takes
+          the `is_reset` branch (0.0 < prev `last_sub`, below
+          `RESET_SUB_CEILING`) → `_open_run(vestige)` anchors the
+          fresh run entirely on the vestige. With the guard, the
+          packet is dropped before that machinery ever runs.
 
-        `STATE_COMPLETED` / `STATE_INTERRUPTED` are deliberately dark
-        — the post-close zero-`sub` vestige variant is BUG-13's
-        territory (#86), instrumented via #92's observability hook,
-        out of scope here.
+        Dark only in:
 
-        Keying on state (not on `current_run` nullity) matters
-        post-close: the closed run stays referenced by `current_run`
-        because BUG-16's guard reads `last_sub` from it in
-        `STATE_COMPLETED`; a nullity-keyed window would silently
-        mis-fire post-close.
+        - Open run with a real zone in flight. The nullity subtlety
+          survives the inversion: post-close, `current_run`
+          references the *closed* run with non-empty `zones` — which
+          is precisely why the dark predicate requires
+          `state ∈ {RUNNING, PAUSED_DOCKED}` **and** seeded zones
+          together, not either alone.
 
         Rejected alternative D (Sol review, #105): an IDLE-only
         window, or a `has_accepted_type2` flag on the open run.
@@ -675,44 +698,67 @@ class RunTracker:
         (`size_estimate_m2` in the multi-zone-latent scenario), and
         the over-stated `Store.last_cmp_max` on interrupted runs —
         plus the BUG-14 fast-path interaction (`mp = 99 ∧ cmp_max =
-        10000` on a poisoned zone).
+        10000` on a poisoned zone). Post-BUG-19, the same suppression
+        set applies to the post-close entry state, where the
+        underlying reset-branch chain (BUG-13's steps 2–5) previously
+        opened a phantom run.
 
-        The rejection signature is intentionally narrow: `mp = 100 ∧
-        cmp ≥ 10000 ∧ area_session < RUN_START_SUB_TOLERANCE`. `wk`
-        and `action` are logged but not gated on: the observed `wk =
-        0.0` was a calendar artifact of the Sunday-start firmware
-        week (2026-07-19 was a Sunday, day one of the week) — a
-        mid-week vestige would carry `wk > 0`; `action = -1` appears
-        on legitimate mid-run packets and its cross-firmware
+        The rejection signature is intentionally narrow: `mp =
+        MP_TASK_END ∧ cmp ≥ CMP_ZONE_COMPLETE_THRESHOLD ∧
+        area_session < RUN_START_SUB_TOLERANCE`. `wk` and `action`
+        are logged but not gated on: the observed `wk = 0.0` in
+        raoul.19 was a calendar artifact of the Sunday-start
+        firmware week — a mid-week vestige carries `wk > 0`
+        (`wk = 357.63` on 2026-07-20 confirms), `action = -1`
+        appears on legitimate mid-run packets and its cross-firmware
         stability is not established. `area_session` is checked
         explicitly for `None` — treating a missing accumulator as
         zero would default an incomplete packet toward the drop, the
         opposite of the fail-open policy.
 
         Also emits an observability DEBUG line for suspicious-but-
-        -not-dropped shapes: `area_session` near zero inside the same
-        arming window without the full `mp = 100 ∧ cmp = 10000`
-        match. Collects evidence for the untested `interrupted`
-        vestige shape (open question 1). This line does fire on some
-        genuine low-`sub` first packets — a fresh session post-reset
-        was observed at `sub = 0.39 m²` on 2026-05-25 and a
-        Sunday-first-mow at `sub ≈ 0.3` is plausible — so the DEBUG
-        stream carries a few false positives per week. Analysis
-        discriminates them via the logged `mp` / `cmp` (a genuine
-        low-`sub` start carries `mp = 0` and `cmp ≪ 10000`; an
-        `interrupted` vestige would carry the partial `cmp_max` from
-        the previous close). Accepted noise, not a defect.
+        -not-dropped shapes: `area_session` near zero inside the
+        armed window without the full `mp = MP_TASK_END ∧ cmp =
+        CMP_ZONE_COMPLETE_THRESHOLD` match. Collects evidence for
+        the untested `interrupted` vestige shape (open question 1).
+        This line does fire on some genuine low-`sub` first packets
+        — a fresh session post-reset was observed at `sub = 0.39 m²`
+        on 2026-05-25 and a Sunday-first-mow at `sub ≈ 0.3` is
+        plausible — so the DEBUG stream carries a few false
+        positives per week. Analysis discriminates them via the
+        logged `mp` / `cmp` (a genuine low-`sub` start carries
+        `mp = 0` and `cmp ≪ 10000`; an `interrupted` vestige would
+        carry the partial `cmp_max` from the previous close).
+        Accepted noise, not a defect.
+
+        Note: #92 (BUG-16)'s "observability hook" referenced in the
+        #105 fifth-edit body is **future work** — the widened arming
+        window here supersedes the hook's purpose for the zero-`sub`
+        shape (a drop DEBUG beats an observe DEBUG). BUG-16's
+        frozen-`sub` variant is orthogonal and will ship with its
+        own PR.
         """
-        if self.state == STATE_IDLE:
-            armed = True
-        elif (
+        # BUG-19 (#114): arming inverted. The asset the guard protects
+        # is the *next* run's `zones[0]` seed (plus `_open_run` anchor);
+        # that asset is at risk in every state except "open run whose
+        # first zone is already honestly seeded". Name that single dark
+        # state; be armed everywhere else. The prior raoul.22
+        # enumeration ({IDLE} ∪ {open run, zones == []}) missed the
+        # post-close states where `_open_run` fires via the `is_reset`
+        # branch — the operator's dominant real-world path.
+        #
+        # The nullity subtlety survives inverted: post-close, the closed
+        # run stays referenced with non-empty `zones`, which is exactly
+        # why the dark predicate requires `state ∈ {RUNNING,
+        # PAUSED_DOCKED}` *and* seeded zones together. Post-close
+        # (`state ∈ {COMPLETED, INTERRUPTED}`) fails the state check,
+        # so `mowing_with_zone` is False, so the guard is armed.
+        mowing_with_zone = (
             self.state in (STATE_RUNNING, STATE_PAUSED_DOCKED)
             and self.current_run is not None
-            and not self.current_run.get("zones")
-        ):
-            armed = True
-        else:
-            armed = False
+            and bool(self.current_run.get("zones"))
+        )
+        armed = not mowing_with_zone
         if not armed:
             return False
 
