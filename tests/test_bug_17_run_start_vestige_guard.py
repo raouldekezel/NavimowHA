@@ -422,27 +422,28 @@ def test_sentinel_from_idle_accepted_with_suspicious_debug(caplog) -> None:
 
 
 # --------------------------------------------------------------------- #
-# 4. Window boundary — post-close zero-sub packet not caught here       #
+# 4. Post-close vestige — DROPPED post-BUG-19 (widened arming window)   #
 # --------------------------------------------------------------------- #
 
 
-def test_post_close_vestige_shape_not_caught_by_this_guard() -> None:
-    """The arming window keys on tracker state: `current_run` remains
-    referenced post-close (BUG-16's guard reads `last_sub` from it in
-    `STATE_COMPLETED`). A vestige-shape packet in `STATE_COMPLETED`
-    is BUG-13 territory (#86) — the zero-`sub` variant — and must
-    flow through to the post-close branches unchanged. This test
-    pins that the BUG-17 guard is intentionally dark post-close.
+def test_post_close_vestige_dropped_state_completed(caplog) -> None:
+    """BUG-19 (#114) — the operator's dominant real-world case.
+    Vestige arrives with the tracker in `STATE_COMPLETED` restored
+    from a previous mow's close (Store rehydration on HA restart).
+    Pre-BUG-19 the guard was dark here and the packet flowed to the
+    post-close `is_reset` branch → `_open_run(vestige)` (this test
+    file previously pinned that inverted behaviour).
 
-    Observable: the packet reaches the post-close `is_reset` branch
-    (0 < last_sub → reset; 0 < RESET_SUB_CEILING → immediate re-open),
-    so a fresh `run_started` fires and the tracker moves back to
-    `STATE_RUNNING` — precisely the BUG-13 pathology, kept out of
-    scope of BUG-17 by decision.
+    Post-BUG-19 the arming predicate flips: dark only when
+    `state ∈ {RUNNING, PAUSED_DOCKED} ∧ zones != []`. `STATE_COMPLETED`
+    fails that state check → armed → signature matches → dropped.
+    No `run_started` event, tracker state unchanged, cursors
+    untouched.
     """
     tracker = RunTracker()
     # Complete a genuine mow so the tracker enters STATE_COMPLETED with
-    # current_run still referenced.
+    # current_run still referenced (mimics the Store-restored state on
+    # the operator's 2026-07-20 event).
     _process(tracker, _pkt(mp=0, cmp=100, sub=2.47, wk=2.42, boundary=1, t=1_000))
     _process(tracker, _pkt(mp=50, cmp=5000, sub=100.0, wk=100.0, boundary=1, t=2_000))
     _process(
@@ -450,31 +451,185 @@ def test_post_close_vestige_shape_not_caught_by_this_guard() -> None:
     )
     tracker.process_vehicle_state(VS_DOCKED_CHARGING)
     assert tracker.state == STATE_COMPLETED
-    assert tracker.current_run is not None
-    assert tracker.current_run.get("last_sub") == 232.89
+    prev_last_sub = tracker.current_run.get("last_sub")
+    prev_last_mp = tracker.current_run.get("last_mp")
+    prev_zones_len = len(tracker.current_run["zones"])
 
-    # Move the robot back off the dock — otherwise BUG-14's fast-path
-    # re-fires on the fresh post-reset run and re-closes it (mp=100
-    # ∧ vs∈{1,2,3}). That interaction is real but orthogonal to what
-    # this test pins: the BUG-17 guard's inertness post-close.
-    tracker.process_vehicle_state(VS_MOWING)
+    with caplog.at_level(logging.DEBUG, logger="custom_components.navimow.run_tracker"):
+        events = _process(
+            tracker,
+            _pkt(
+                mp=100,
+                cmp=CMP_ZONE_COMPLETE_THRESHOLD,
+                sub=0.0,
+                wk=0.0,
+                boundary=1,
+                action=-1,
+                t=4_000,
+            ),
+        )
+    # Guard fired: no run_started, no state transition, no mutation
+    # of the closed run's cursors.
+    assert [e for e in events if e.kind == EVENT_RUN_STARTED] == []
+    assert tracker.state == STATE_COMPLETED
+    assert tracker.current_run.get("last_sub") == prev_last_sub
+    assert tracker.current_run.get("last_mp") == prev_last_mp
+    assert len(tracker.current_run["zones"]) == prev_zones_len
 
+    dbgs = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.DEBUG and "run-start vestige" in r.getMessage()
+    ]
+    assert len(dbgs) == 1, dbgs
+
+
+def test_post_close_vestige_dropped_state_interrupted(caplog) -> None:
+    """The sister case: `STATE_INTERRUPTED` (last mow closed by the
+    sustained-timer path, not the fast-path). BUG-19's arming
+    predicate treats both post-close states the same — dark only on
+    mowing-with-real-zone.
+    """
+    from custom_components.navimow.run_tracker import (
+        INTERRUPT_SUSTAIN_SECONDS,
+        STATE_INTERRUPTED,
+    )
+
+    clock = _FakeClock()
+    tracker = RunTracker(clock=clock)
+    # Run a partial mow then let the sustained-timer close it as
+    # `interrupted` (mp never reaches completion threshold).
+    _process(tracker, _pkt(mp=0, cmp=100, sub=2.47, wk=2.42, boundary=1, t=1_000))
+    _process(tracker, _pkt(mp=30, cmp=3000, sub=50.0, wk=50.0, boundary=1, t=2_000))
+    tracker.process_vehicle_state(VS_DOCKED_IDLE)
+    clock.advance(INTERRUPT_SUSTAIN_SECONDS + 1)
+    tracker.tick()
+    assert tracker.state == STATE_INTERRUPTED
+
+    with caplog.at_level(logging.DEBUG, logger="custom_components.navimow.run_tracker"):
+        events = _process(
+            tracker,
+            _pkt(
+                mp=100,
+                cmp=CMP_ZONE_COMPLETE_THRESHOLD,
+                sub=0.0,
+                wk=0.0,
+                boundary=1,
+                action=-1,
+                t=4_000,
+            ),
+        )
+    assert [e for e in events if e.kind == EVENT_RUN_STARTED] == []
+    assert tracker.state == STATE_INTERRUPTED
+    dbgs = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.DEBUG and "run-start vestige" in r.getMessage()
+    ]
+    assert len(dbgs) == 1, dbgs
+
+
+def test_post_close_genuine_remow_start_accepted() -> None:
+    """The critical no-false-positive case: from `STATE_COMPLETED`,
+    a **genuine** fresh mow's first real packet (`mp = 0, cmp small,
+    sub small`) must be accepted. The arming window is wide here
+    (BUG-19), but the drop signature is not — `mp = 0` fails the
+    `mp == MP_TASK_END` clause, so the packet flows through to the
+    post-close `is_reset` branch as intended, opening a fresh run
+    normally.
+
+    This is the packet that would land ~60 s after the (now-dropped)
+    vestige on the real 2026-07-20 replay.
+    """
+    tracker = RunTracker()
+    _process(tracker, _pkt(mp=0, cmp=100, sub=2.47, wk=2.42, boundary=1, t=1_000))
+    _process(tracker, _pkt(mp=50, cmp=5000, sub=100.0, wk=100.0, boundary=1, t=2_000))
+    _process(
+        tracker, _pkt(mp=100, cmp=10000, sub=232.89, wk=232.89, boundary=1, t=3_000)
+    )
+    tracker.process_vehicle_state(VS_DOCKED_CHARGING)
+    assert tracker.state == STATE_COMPLETED
+
+    # Fresh mow starts: genuine first real packet.
     events = _process(
+        tracker,
+        _pkt(mp=0, cmp=104, sub=2.53, wk=360.12, boundary=1, action=8, t=4_000),
+    )
+    started = [e for e in events if e.kind == EVENT_RUN_STARTED]
+    assert len(started) == 1
+    assert tracker.state == STATE_RUNNING
+    # sub₀ anchored on the real packet, not on any vestige.
+    assert tracker.current_run["sub0"] == 2.53
+    assert tracker.current_run["last_mp"] == 0
+    zones = tracker.current_run["zones"]
+    assert len(zones) == 1
+    assert zones[0]["cmp_max"] == 104
+
+
+def test_2026_07_20_replay_end_to_end() -> None:
+    """Deterministic replay of the 2026-07-20 wire trace end-to-end.
+
+    Preconditions: tracker restored to `STATE_COMPLETED` from a prior
+    close (2026-07-19 completed multi-zone). Vestige arrives on the
+    wire immediately after `vs = 4`. Genuine first real packet
+    arrives ~56 s later.
+
+    Pre-BUG-19 outcome (raoul.22): vestige poisons `_open_run`,
+    `zones[0].cmp_max = 10000` seeded, gauge stuck at 100 %.
+    Post-BUG-19 outcome (this test): vestige dropped, real packet
+    opens the run cleanly with `zones[0].cmp_max = 104` and gauge
+    starts at 1.04 %.
+    """
+    tracker = RunTracker()
+    # Reconstitute a prior 2026-07-19 close.
+    _process(tracker, _pkt(mp=0, cmp=100, sub=2.47, wk=2.42, boundary=1, t=1_000))
+    _process(
+        tracker, _pkt(mp=100, cmp=10000, sub=232.89, wk=232.89, boundary=1, t=2_000)
+    )
+    tracker.process_vehicle_state(VS_DOCKED_CHARGING)
+    assert tracker.state == STATE_COMPLETED
+
+    # 11:21:54.382 — vestige (real wire fields from the diag).
+    tracker.process_vehicle_state(VS_MOWING)
+    vestige_events = _process(
         tracker,
         _pkt(
             mp=100,
             cmp=CMP_ZONE_COMPLETE_THRESHOLD,
             sub=0.0,
-            wk=0.0,
+            wk=357.63,
             boundary=1,
             action=-1,
-            t=4_000,
+            t=1_784_539_314_431,
         ),
     )
-    started = [e for e in events if e.kind == EVENT_RUN_STARTED]
+    assert [e for e in vestige_events if e.kind == EVENT_RUN_STARTED] == []
+    assert tracker.state == STATE_COMPLETED  # vestige rejected, state unchanged
+
+    # 11:22:50.383 — genuine first real packet (56 s later on the wire).
+    real_events = _process(
+        tracker,
+        _pkt(
+            mp=0,
+            cmp=104,
+            sub=2.53,
+            wk=360.12,
+            boundary=1,
+            action=8,
+            t=1_784_539_370_461,
+        ),
+    )
+    started = [e for e in real_events if e.kind == EVENT_RUN_STARTED]
     assert len(started) == 1
-    assert tracker.state == STATE_RUNNING
-    assert tracker.current_run["sub0"] == 0.0
+    r = tracker.current_run
+    assert r["start_time"] == 1_784_539_370_461  # real packet, not vestige
+    assert r["sub0"] == 2.53
+    assert r["last_mp"] == 0
+    zones = r["zones"]
+    assert len(zones) == 1
+    # The critical assertion: cmp_max reflects the real cmp, not 10000.
+    assert zones[0]["cmp_max"] == 104
+    assert zones[0]["sub_entry"] == 2.53
 
 
 # --------------------------------------------------------------------- #
