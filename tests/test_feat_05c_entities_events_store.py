@@ -157,6 +157,31 @@ def test_run_progress_held_during_paused_docked() -> None:
 
 def test_run_progress_drops_to_none_on_completed() -> None:
     coord = _make_coordinator()
+    # Open the run legitimately with a first real packet whose `cmp`
+    # climbs from low — this seeds zones[0]. A lone `mp = 100 ∧
+    # cmp = 10000` packet from IDLE is now a task-end vestige and is
+    # dropped by the run-start guard (BUG-19 step 2): a run cannot
+    # *open* at the cmp ceiling.
+    _feed_type2(
+        coord,
+        {
+            "type": 2,
+            "currentMowBoundary": 1,
+            "currentMowProgress": 100,
+            "mowingPercentage": 0,
+            "subtotalArea": "2.0",
+            "mowingWeekArea": "2.0",
+            "time": 1_000_000_000_000,
+        },
+    )
+    # Guard-load-bearing: the run must be OPEN with a seeded zone BEFORE
+    # the ceiling packet below — otherwise that packet lands in the armed
+    # (unseeded) window and is dropped as a task-end vestige (BUG-19).
+    # Do not collapse these two feeds back into one ceiling packet.
+    assert coord.run_tracker.state == STATE_RUNNING
+    assert coord.run_tracker.current_run["zones"]
+    # Genuine completion packet — zones are seeded now, so the guard is
+    # inert (dark window) and the ceiling packet is accepted.
     _feed_type2(
         coord,
         {
@@ -166,7 +191,7 @@ def test_run_progress_drops_to_none_on_completed() -> None:
             "mowingPercentage": 100,
             "subtotalArea": "200.0",
             "mowingWeekArea": "200.0",
-            "time": 1_000_000_000_000,
+            "time": 1_000_000_060_000,
         },
     )
     # BUG-09: mp=100 alone doesn't close — need a dock arrival too.

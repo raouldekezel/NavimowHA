@@ -418,12 +418,15 @@ class RunTracker:
         """
         events: list[Event] = []
 
-        # BUG-17 (2026-07-19, #105) + BUG-19 (2026-07-20, #114): drop
-        # the run-start "task-end vestige" packet before any state
-        # transition or write. On task-start the firmware sometimes
-        # replays the *previous* task's closing packet as the very
-        # first `type-2` on the fresh mow — signature `mp = 100 ∧
-        # cmp = 10000 ∧ subtotalArea = 0`. Left untouched:
+        # BUG-17 (2026-07-19, #105) + BUG-19 (2026-07-20/21, #114):
+        # drop the run-start "task-end vestige" packet before any
+        # state transition or write. On task-start the firmware
+        # sometimes replays the *previous* task's closing packet as
+        # the very first `type-2` on the fresh mow — the ceiling
+        # signature `mp = 100 ∧ cmp = 10000` (its `subtotalArea` is
+        # zeroed in the BUG-17/BUG-19 shape, frozen at the previous
+        # close in the BUG-16 shape — `sub` never discriminates, so
+        # the guard no longer tests it). Left untouched:
         # - From `STATE_IDLE`: vestige is what `_open_run` reads;
         #   `start_time`, `sub₀`, `mow_start_type` all anchored on it;
         #   `_update_zone` seeds `zones[0].cmp_max = 10000` (monotonic
@@ -438,9 +441,12 @@ class RunTracker:
         #   []`): sentinel already anchored the run, only
         #   `_update_zone` and `last_mp` are at risk — still real.
         #
-        # BUG-19 widened the arming window from an enumeration of
-        # safe states to "armed unless we're mid-mow with a real
+        # BUG-19 step 1 widened the arming window from an enumeration
+        # of safe states to "armed unless we're mid-mow with a real
         # zone already seeded" — the enumeration missed post-close.
+        # Step 2 simplified the drop signature to the ceiling alone
+        # (`mp = 100 ∧ cmp = 10000`, no `sub` term), which absorbs
+        # BUG-16's (#92) frozen-`sub` variant into the same guard.
         # See `_gate_run_start_vestige` for the full rationale.
         if self._gate_run_start_vestige(parsed):
             return events
@@ -703,18 +709,33 @@ class RunTracker:
         underlying reset-branch chain (BUG-13's steps 2–5) previously
         opened a phantom run.
 
-        The rejection signature is intentionally narrow: `mp =
-        MP_TASK_END ∧ cmp ≥ CMP_ZONE_COMPLETE_THRESHOLD ∧
-        area_session < RUN_START_SUB_TOLERANCE`. `wk` and `action`
-        are logged but not gated on: the observed `wk = 0.0` in
-        raoul.19 was a calendar artifact of the Sunday-start
-        firmware week — a mid-week vestige carries `wk > 0`
-        (`wk = 357.63` on 2026-07-20 confirms), `action = -1`
-        appears on legitimate mid-run packets and its cross-firmware
-        stability is not established. `area_session` is checked
-        explicitly for `None` — treating a missing accumulator as
-        zero would default an incomplete packet toward the drop, the
-        opposite of the fail-open policy.
+        The rejection signature is the ceiling alone: `mp =
+        MP_TASK_END ∧ cmp ≥ CMP_ZONE_COMPLETE_THRESHOLD`. `sub` is
+        deliberately *not* gated (BUG-19 step 2): it never carried
+        the drop decision — it only distinguished the two vestige
+        sub-shapes (zeroed vs frozen-at-the-previous-close), and both
+        are the same phantom. Testing `area_session < 0.5` is
+        precisely why raoul.22 caught the zero-`sub` shape (BUG-17)
+        yet missed the frozen-`sub` shape (BUG-16, #92); dropping the
+        `sub` clause folds #92 into this one guard. Safety is
+        categorical, not empirical: a run cannot *open* at `cmp =
+        10000` — that is a finished-boundary state; a genuine start
+        shows `cmp` climbing from low (`cmp = 104` on the 2026-07-20
+        first real packet). `mp` may re-base high on a resumed task
+        (SPIKE-02: `mp = 65`), but `cmp` on the active boundary always
+        starts low, so the conjunction `mp = 100 ∧ cmp = 10000` has no
+        legitimate opening packet. Combined with the dark window (a
+        seeded run mid-mow — where genuine completion packets live),
+        no honest packet is rejected. `wk` and `action` are logged but
+        not gated on: the observed `wk = 0.0` in raoul.19 was a
+        calendar artifact of the Sunday-start firmware week — a
+        mid-week vestige carries `wk > 0` (`wk = 357.63` on 2026-07-20
+        confirms), `action = -1` appears on legitimate mid-run packets
+        and its cross-firmware stability is not established. Fail-open
+        on `None` survives the simplification: a missing `mp` fails
+        `== MP_TASK_END` and a missing `cmp` collapses to `0` via
+        `(cmp or 0)`, so an incomplete packet never matches the drop
+        signature.
 
         Also emits an observability DEBUG line for suspicious-but-
         -not-dropped shapes: `area_session` near zero inside the
@@ -732,11 +753,10 @@ class RunTracker:
         Accepted noise, not a defect.
 
         Note: #92 (BUG-16)'s "observability hook" referenced in the
-        #105 fifth-edit body is **future work** — the widened arming
-        window here supersedes the hook's purpose for the zero-`sub`
-        shape (a drop DEBUG beats an observe DEBUG). BUG-16's
-        frozen-`sub` variant is orthogonal and will ship with its
-        own PR.
+        #105 fifth-edit body is retired, not deferred — the ceiling
+        signature *drops* the frozen-`sub` shape rather than merely
+        observing it (a drop DEBUG beats an observe DEBUG), so #92 is
+        absorbed by this guard rather than shipping separately.
         """
         # BUG-19 (#114): arming inverted. The asset the guard protects
         # is the *next* run's `zones[0]` seed (plus `_open_run` anchor);
@@ -766,12 +786,7 @@ class RunTracker:
         cmp_ = parsed.get("current_mow_progress")
         sub = parsed.get("area_session")
 
-        if (
-            mp == MP_TASK_END
-            and (cmp_ or 0) >= CMP_ZONE_COMPLETE_THRESHOLD
-            and sub is not None
-            and sub < RUN_START_SUB_TOLERANCE
-        ):
+        if mp == MP_TASK_END and (cmp_ or 0) >= CMP_ZONE_COMPLETE_THRESHOLD:
             _LOGGER.debug(
                 "run_tracker: type-2 rejected — run-start vestige "
                 "(mp=%s cmp=%s sub=%s wk=%s action=%s boundary=%s time=%s)",
