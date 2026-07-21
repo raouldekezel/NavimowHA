@@ -133,7 +133,14 @@ def test_2026_07_04_full_day_yields_exactly_two_sessions() -> None:
     # any afternoon packet with mp ≥ 99, collapsing the new session.
     from custom_components.navimow.run_tracker import VS_MOWING
 
-    tracker.process_vehicle_state(VS_MOWING)
+    # HARD-18 (#117): the RUN press (vs 2→4) opens a provisional run and
+    # fires run_started here — a run is a user session and starts at
+    # activation, anchored on the press time. The afternoon type-2s then
+    # seed that run (continuation), rather than opening it themselves.
+    afternoon_open = tracker.process_vehicle_state(
+        VS_MOWING, time_ms=_AFTERNOON_START_MS
+    )
+    assert [e.kind for e in afternoon_open] == [EVENT_RUN_STARTED]
 
     # -- Afternoon session (manual RUN, zone #3) --------------------- #
     # Fresh accepted type-2 with strict progress (sub 121.17 > 118)
@@ -164,9 +171,13 @@ def test_2026_07_04_full_day_yields_exactly_two_sessions() -> None:
             },
         ],
     )
-    assert [e.kind for e in afternoon_events] == [EVENT_RUN_STARTED]
-    # start_time of the new session is the AFTERNOON packet's time —
-    # not the morning's start_time (this is the Problem A fix).
+    # HARD-18 (#117): the type-2s seed the already-open provisional run —
+    # no second run_started (it fired at the vs=4 press above).
+    assert afternoon_events == []
+    # start_time of the new session is the afternoon *activation* time
+    # (the press), retained through seeding — not the morning's
+    # start_time (Problem A fix; HARD-18 now anchors it at activation
+    # instead of at the first afternoon packet, which here coincide).
     assert tracker.current_run["start_time"] == _AFTERNOON_START_MS
     assert tracker.current_run["sub0"] == 121.17
     # mp=65 is task-scoped — non-zero session start is normal per the
@@ -280,11 +291,15 @@ def test_close_plus_new_session_writes_two_history_rows_not_one() -> None:
 
     coord = _make_coordinator_with_history()
 
-    def _feed_vs(vs: int) -> None:
+    def _feed_vs(vs: int, time_ms: int | None = None) -> None:
         # Mimic `_handle_location_position`'s vs-change branch —
         # forward tracker events through the same dispatcher the
-        # coordinator uses.
-        coord._forward_run_events(coord.run_tracker.process_vehicle_state(vs))
+        # coordinator uses. HARD-18 (#117): the branch now passes the
+        # type-1 `time` so a provisional run anchors its `start_time` on
+        # the activation edge.
+        coord._forward_run_events(
+            coord.run_tracker.process_vehicle_state(vs, time_ms=time_ms)
+        )
 
     # Morning session — open, then dock to trigger BUG-09 close.
     coord.handle_location_item(
@@ -301,11 +316,14 @@ def test_close_plus_new_session_writes_two_history_rows_not_one() -> None:
     assert len(coord.history) == 1
     morning_start = coord.history[0]["start_time"]
 
-    # Robot leaves the dock (RUN pressed) — vs 2 → 4.
-    _feed_vs(VS_MOWING)
+    # Robot leaves the dock (RUN pressed) — vs 2 → 4. HARD-18 (#117):
+    # this opens the afternoon session provisionally, anchored on the
+    # press time; the first afternoon packet seeds it.
+    _feed_vs(VS_MOWING, _AFTERNOON_START_MS)
 
-    # Afternoon RUN — first packet opens a new session (FEAT-06);
-    # sub₀ anchored on it. mp=65 alone doesn't fire completion.
+    # Afternoon RUN — first packet seeds the provisional session (FEAT-06
+    # session_area still anchored on it); sub₀ anchored on it. mp=65
+    # alone doesn't fire completion.
     coord.handle_location_item(
         {
             "type": 2,
@@ -727,7 +745,13 @@ def test_feat_06_fixture_drift_yields_complete_second_session_no_warn(
     assert tracker.state == STATE_COMPLETED
     assert tracker.current_run["wk0"] == 945.0
 
-    tracker.process_vehicle_state(VS_MOWING)
+    # HARD-18 (#117): the RUN press opens the afternoon session
+    # provisionally and fires run_started here; the afternoon packets
+    # seed it.
+    afternoon_open = tracker.process_vehicle_state(
+        VS_MOWING, time_ms=_AFTERNOON_START_MS
+    )
+    assert [e.kind for e in afternoon_open] == [EVENT_RUN_STARTED]
     caplog.clear()
 
     # Afternoon packets — `wk` shifted +2 m² so the closed-run anchor
@@ -764,21 +788,27 @@ def test_feat_06_fixture_drift_yields_complete_second_session_no_warn(
 
     # Session opens (pre-HARD-06 the first packet would have been
     # silently dropped by layer 3 and no session would ever have
-    # started).
-    assert [e.kind for e in afternoon_events] == [EVENT_RUN_STARTED]
+    # started). HARD-18 (#117): the run opened at the vs=4 press, so the
+    # afternoon packets seed it (continuation — no second run_started).
+    assert afternoon_events == []
     # Session closes with the correct `session_area` = 244.34 − 121.17.
     assert [e.kind for e in afternoon_close] == [EVENT_RUN_FINISHED]
     assert abs(afternoon_close[0].payload["session_area"] - 123.17) < 1e-9
 
-    # Exactly one deviation observation — the first strict-progress
-    # afternoon packet, measured against the closed-run wk₀ = 945.
-    # The second afternoon packet sits under the freshly re-anchored
-    # session wk₀ = 947 and is within tolerance, so the streak resets.
-    assert tracker.counters["invariant_deviations_observed"] == 1
-    # Streak stayed well below the WARN threshold — 5 consecutive
-    # deviations against a dead anchor are structurally impossible on
-    # the post-close path.
-    assert 1 < INVARIANT_DEVIATION_STREAK_TO_WARN
+    # HARD-18 (#117): ZERO deviation observations now. The old post-close
+    # path measured the first afternoon packet against the *closed* run's
+    # wk₀ = 945 (the 2 m² drift, counted once). With the eager start the
+    # run is already open (provisional, wk₀ = None) when that packet
+    # arrives, so `_observe_invariant_deviation` short-circuits on the
+    # unseeded anchor; `_update_wk0_anchor` then anchors the session's own
+    # wk₀ = 947 from that same packet, and the second packet is within
+    # tolerance. The cross-boundary "drift" is structurally re-anchored,
+    # not observed — a strictly cleaner outcome. The primary property
+    # this test locks (second session opens, correct area, NO WARN, never
+    # blocked) is unchanged.
+    assert tracker.counters["invariant_deviations_observed"] == 0
+    # Streak never armed — no deviation was observed on this path.
+    assert 0 < INVARIANT_DEVIATION_STREAK_TO_WARN
     assert tracker._invariant_deviation_streak == 0
 
     # No WARN emitted.

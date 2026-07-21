@@ -69,8 +69,19 @@ No calendar assumption survives contact with evidence: nothing here
 encodes what week (ISO Monday, Sunday, etc.) the firmware follows.
 
 State machine (converged, authoritative per the brief; BUG-09 revised;
-FEAT-06 revised — session-scoped runs):
+FEAT-06 revised — session-scoped runs; HARD-18 revised — eager start):
 
+    {IDLE, COMPLETED, INTERRUPTED} ─vs=4─▶ RUNNING(provisional)
+        [run_started]   (HARD-18 / #117 — a run is a user session and
+        starts at activation; `start_time` = the type-1 `time`, ~1.5 s
+        after the press. All baseline anchors are None until seeded.)
+    RUNNING(provisional) ─first accepted type-2─▶ RUNNING (seeded)
+        (sub₀ / mow_start_type / wk₀ / zone from the packet; start_time
+        keeps the activation anchor; no second run_started)
+    RUNNING(provisional) ─vs ∈ DOCKED_STATES sustained 60 s─▶
+        INTERRUPTED [run_finished]   (aborted start — a pressed run that
+        wandered and was sent home; minimal entry: session_area=None,
+        zones=[], real wander duration. Any dock, charging included.)
     IDLE ─fresh type-2─▶ RUNNING [run_started]
     RUNNING ─vs ∈ {1,2,3,6}─▶ PAUSED_DOCKED
     PAUSED_DOCKED ─fresh type-2, strict progress─▶ RUNNING   (resume,
@@ -84,6 +95,20 @@ FEAT-06 revised — session-scoped runs):
     COMPLETED/INTERRUPTED ─fresh type-2 with strict progress─▶
         open NEW run [run_started] (FEAT-06 / #54)
     COMPLETED/INTERRUPTED ─fresh reset (sub < ceiling)─▶ open new run
+
+HARD-18 (2026-07-21, #117): finishing the FEAT-06 session migration.
+`process_vehicle_state` opens a **provisional** run on the vs=4
+activation edge so the tracker state (and `sensor.*_etat_de_la_tonte`)
+reflects the press within ~1.5 s instead of ~3 min — the delay until
+the firmware's first mowing-task type-2. A run's `start_time` is the
+activation `time` (the operator's "the run starts when I press run"),
+carried from the vs=4 type-1 and NOT overwritten when the first type-2
+seeds the run. The provisional run holds no honest mowing data
+(`last_mp is None` ⇒ never `completed`; `zones == []` ⇒ the BUG-17/19
+vestige gate stays armed for the whole start window). If it docks
+before any type-2 seeds it, the sustained-dock timer commits a minimal
+`interrupted` history entry (an aborted start is a session too — the
+duration includes the real dock-exit / navigation wander).
 
 BUG-09 (2026-07-04): the completion criterion is
 `mp ≥ MP_COMPLETION_THRESHOLD` ∧ `vs ∈ {1, 2, 3}` (docked idle /
@@ -396,6 +421,13 @@ class RunTracker:
         self.counters: dict[str, int] = {
             "wk_regressions_observed": 0,
             "invariant_deviations_observed": 0,
+            # HARD-18 (#117): strict-progress rejections on the terminal-
+            # state path (no preceding vs=4) — previously a silent
+            # `return`. `aborted_starts_committed` counts provisional runs
+            # closed by the sustained-dock abort (a pressed run that
+            # wandered and was sent home without ever mowing).
+            "strict_progress_rejections": 0,
+            "aborted_starts_committed": 0,
         }
         # Consecutive observation streaks feeding the throttled WARNINGs
         # in `_observe_wk_regression` / `_observe_invariant_deviation`.
@@ -409,6 +441,18 @@ class RunTracker:
     # ------------------------------------------------------------- #
     # Public API                                                    #
     # ------------------------------------------------------------- #
+
+    @property
+    def is_provisional(self) -> bool:
+        """HARD-18 (#117): True while the current run is a *provisional*
+        session — opened at the vs=4 activation edge and not yet seeded
+        by a type-2. The state sensor renders this window as "starting";
+        the seeding block in `process_type2` flips it off. Exposed as a
+        property so the sensor platform never reaches into `current_run`.
+        """
+        return bool(
+            self.current_run is not None and self.current_run.get("provisional")
+        )
 
     def process_type2(self, parsed: dict[str, Any]) -> list[Event]:
         """Feed a type-2 payload (already through the layer-1 guard).
@@ -517,7 +561,24 @@ class RunTracker:
                 # packets (identical `sub` / `mp` with only `time`
                 # fresher) — otherwise a stream tail would spawn phantom
                 # sessions after every close (B1 on #49 generalised).
+                #
+                # HARD-18 (#117): this is the terminal-state path reached
+                # only *without* a preceding vs=4 (the docked post-close
+                # scenario). It stays untouched by the eager-start window,
+                # but its refusal is no longer silent — count and DEBUG-
+                # log it so the audits stop being blind to whether the
+                # strict-progress filter ever fires in production.
                 if not self._has_strict_progress(parsed):
+                    self.counters["strict_progress_rejections"] += 1
+                    _LOGGER.debug(
+                        "run_tracker: type-2 rejected by strict progress "
+                        "(sub=%s last_sub=%s mp=%s last_mp=%s time=%s)",
+                        incoming_sub,
+                        self.current_run.get("last_sub") if self.current_run else None,
+                        incoming_mp,
+                        self.current_run.get("last_mp") if self.current_run else None,
+                        parsed.get("time"),
+                    )
                     return events
                 # HARD-06 (#62): observe the invariant against the
                 # CLOSED run's `wk₀` BEFORE `_open_run` re-anchors,
@@ -530,6 +591,37 @@ class RunTracker:
                 self._observe_invariant_deviation(parsed)
                 self._open_run(parsed)
                 events.append(self._event_run_started())
+
+        # HARD-18 (#117): seed a provisional run from its first accepted
+        # type-2. The run was opened at the vs=4 activation edge with all
+        # baseline anchors `None` (see `_open_provisional_run`); this is
+        # the first packet carrying honest task data. `start_time` is
+        # deliberately NOT touched — it keeps the activation anchor (the
+        # run starts when the operator pressed run). `wk₀` is set below by
+        # `_update_wk0_anchor`, `last_*` by `_update_accumulators`, the
+        # zone seed by `_update_zone`. Flipping `provisional` off here is
+        # what makes this block a one-shot: the next packet finds a
+        # non-provisional run. The DEBUG line logs the full shape of every
+        # start-window first packet — the passive #105-Q1 evidence
+        # collector (below-ceiling replay shapes). A BUG-06 all-zero
+        # sentinel seeds `sub0 = 0.0`, exactly as `_open_run(sentinel)`
+        # would from IDLE (parity kept, not a regression).
+        if self.current_run is not None and self.current_run.get("provisional"):
+            r = self.current_run
+            r["sub0"] = parsed.get("area_session")
+            r["mow_start_type"] = parsed.get("mow_start_type")
+            r["provisional"] = False
+            _LOGGER.debug(
+                "run_tracker: start-window first type-2 "
+                "(mp=%s cmp=%s sub=%s wk=%s action=%s boundary=%s time=%s)",
+                parsed.get("mowing_percentage"),
+                parsed.get("current_mow_progress"),
+                parsed.get("area_session"),
+                parsed.get("area_week"),
+                parsed.get("action"),
+                parsed.get("boundary"),
+                parsed.get("time"),
+            )
 
         # Bookkeeping on acceptance. `_update_wk0_anchor` handles the
         # "first packet with data" case; keeping the mutation out of
@@ -556,14 +648,28 @@ class RunTracker:
 
         return events
 
-    def process_vehicle_state(self, vs: int) -> list[Event]:
+    def process_vehicle_state(
+        self, vs: int, *, time_ms: int | None = None
+    ) -> list[Event]:
         """React to a `vehicleState` change (type-1 packet).
 
-        Only entries into `DOCKED_STATES` from `RUNNING` move the machine
-        (`RUNNING → PAUSED_DOCKED`). Resume is driven by a fresh type-2
-        in `process_type2`, not by a vs=4/5 signal — type-1 briefly
-        showing `vs=4` during a dock-poke must not falsely "resume" the
-        run.
+        HARD-18 (#117): a run is a **user session** and starts at
+        activation. On the `{IDLE, COMPLETED, INTERRUPTED} → vs=4`
+        transition the tracker opens a **provisional** run immediately,
+        so `state` (and the state sensor) reflects the press ~1.5 s later
+        instead of ~3 min later — the delay until the firmware's first
+        mowing-task type-2 lands. `time_ms` is the type-1 packet's `time`,
+        which becomes the run's `start_time`; the coordinator passes it
+        from `parsed.get("time")`. The keyword-only default keeps every
+        existing caller (and test) valid.
+
+        Otherwise: entries into `DOCKED_STATES` from `RUNNING` move a
+        live run into `PAUSED_DOCKED`. Resume of a *seeded* run is driven
+        by a fresh type-2 in `process_type2`, not by a vs=4/5 signal —
+        type-1 briefly showing `vs=4` during a dock-poke must not falsely
+        "resume" a real run. A *provisional* run, having no mowing data
+        to hold for, treats any sustained dock as an aborted start (see
+        `tick` and `_close_run`).
         """
         events: list[Event] = []
 
@@ -572,20 +678,68 @@ class RunTracker:
 
         self.vehicle_state = vs
 
+        # HARD-18: eager session start. Once `state == RUNNING` this
+        # condition is structurally false, so a repeated vs=4 or a
+        # 4→5→4 wobble cannot re-open (dedupe is free, no flag needed).
+        if vs == VS_MOWING and self.state in (
+            STATE_IDLE,
+            STATE_COMPLETED,
+            STATE_INTERRUPTED,
+        ):
+            self._open_provisional_run(time_ms)
+            events.append(self._event_run_started())
+            return events
+
+        provisional = self.is_provisional
+
         if self.state == STATE_RUNNING:
             if vs in DOCKED_STATES:
-                self.state = STATE_PAUSED_DOCKED
-                self._start_interrupt_timer_if_applicable(vs)
+                # HARD-18 abort arming: a provisional run has no mowing
+                # data to hold for, so *any* dock entry (including vs=2
+                # charging and vs=6) starts the close countdown. The
+                # wander end is stamped here on the RUNNING→PAUSED_DOCKED
+                # edge and then frozen — a later charge↔idle flip an hour
+                # after the abort must not inflate the duration.
+                if provisional:
+                    if time_ms is not None:
+                        self.current_run["last_time"] = time_ms
+                    self.state = STATE_PAUSED_DOCKED
+                    self._arm_interrupt_timer()
+                else:
+                    self.state = STATE_PAUSED_DOCKED
+                    self._start_interrupt_timer_if_applicable(vs)
+            elif provisional and time_ms is not None:
+                # Still off-dock and provisional (vs=4 navigation, or a
+                # vs=5 transit on an aborting start): keep the wander
+                # duration live so an eventual abort reports real time.
+                self.current_run["last_time"] = time_ms
         elif self.state == STATE_PAUSED_DOCKED:
-            # Charging / explicit pause reset the timer; docked-and-not-
-            # -charging arms it.
-            self._start_interrupt_timer_if_applicable(vs)
+            if provisional:
+                if vs in DOCKED_STATES:
+                    # Still docked — keep the abort countdown armed
+                    # regardless of charging; do NOT refresh `last_time`
+                    # (frozen at the dock-entry edge above).
+                    self._arm_interrupt_timer()
+                else:
+                    # Left the dock again before the debounce fired — the
+                    # provisional window re-opens off-dock; a real type-2
+                    # (resume + seed) or a sustained re-dock (abort) will
+                    # resolve it. Disarm and keep the wander duration live.
+                    self.state = STATE_RUNNING
+                    self._interrupt_timer_started_at = None
+                    if time_ms is not None:
+                        self.current_run["last_time"] = time_ms
+            else:
+                # Charging / explicit pause reset the timer; docked-and-
+                # not-charging arms it.
+                self._start_interrupt_timer_if_applicable(vs)
 
         # BUG-09: the run may already have reached the mp threshold
         # before the robot arrived at the dock — process_type2 alone
         # can't fire the close in that ordering because no further
         # type-2 packet is guaranteed after dock arrival. Firing here
-        # closes the run as soon as `vs` enters {1, 2, 3}.
+        # closes the run as soon as `vs` enters {1, 2, 3}. A provisional
+        # run cannot complete here (`last_mp is None`).
         completion = self._maybe_complete_run()
         if completion is not None:
             events.append(completion)
@@ -611,14 +765,24 @@ class RunTracker:
         events: list[Event] = []
         now = self._clock() if now is None else now
 
-        if (
-            self.state == STATE_PAUSED_DOCKED
-            and self.vehicle_state in DOCKED_NOT_CHARGING
-        ):
-            if self._interrupt_timer_started_at is None:
-                self._interrupt_timer_started_at = now
-            elif (now - self._interrupt_timer_started_at) >= INTERRUPT_SUSTAIN_SECONDS:
-                events.append(self._close_run())
+        if self.state == STATE_PAUSED_DOCKED:
+            # HARD-18 (#117): a *provisional* run (aborted start) fires on
+            # ANY sustained dock — charging included — because there is no
+            # mowing data to hold for. A *seeded* run keeps the original
+            # semantics: only DOCKED_NOT_CHARGING arms, so a mid-run
+            # recharge (vs=2) never times out.
+            docked = (
+                self.vehicle_state in DOCKED_STATES
+                if self.is_provisional
+                else self.vehicle_state in DOCKED_NOT_CHARGING
+            )
+            if docked:
+                if self._interrupt_timer_started_at is None:
+                    self._interrupt_timer_started_at = now
+                elif (
+                    now - self._interrupt_timer_started_at
+                ) >= INTERRUPT_SUSTAIN_SECONDS:
+                    events.append(self._close_run())
 
         return events
 
@@ -682,6 +846,16 @@ class RunTracker:
           `RESET_SUB_CEILING`) → `_open_run(vestige)` anchors the
           fresh run entirely on the vestige. With the guard, the
           packet is dropped before that machinery ever runs.
+        - **Provisional start window** (`STATE_RUNNING` with
+          `zones == []`, HARD-18 / #117) — the run opened on the vs=4
+          activation edge has an empty zone list until its first type-2
+          seeds it, so `mowing_with_zone` is False and the guard stays
+          armed for the whole window. A ceiling vestige delivered as the
+          first start-window packet is dropped here; the next honest
+          packet seeds the run. This is why the eager transition opens a
+          run with `zones == []` rather than flipping to a state that
+          references the previous run's seeded zones — the latter would
+          satisfy the dark predicate and reopen the vestige hole.
 
         Dark only in:
 
@@ -1110,6 +1284,56 @@ class RunTracker:
         self.state = STATE_RUNNING
         self._interrupt_timer_started_at = None
 
+    def _open_provisional_run(self, time_ms: int | None) -> None:
+        """HARD-18 (#117): open a provisional run at the vs=4 activation
+        edge, before any type-2 has carried mowing data.
+
+        A run is a user session and starts when the operator presses run.
+        The firmware's first mowing-task type-2 lands ~3 min later (dock
+        exit + navigation), so anchoring the run on it left every
+        run-scoped sensor showing the previous close's values for that
+        whole gap. This opens the run immediately with `start_time =`
+        the type-1 activation `time`; the first accepted type-2 later
+        seeds the baseline anchors (`sub0`, `mow_start_type`, `wk0`, the
+        zone) and flips `provisional` off — `start_time` keeps the
+        activation anchor.
+
+        Every accumulator anchor is `None` (no honest mowing data yet).
+        Consequences relied on downstream:
+
+        - `_maybe_complete_run` cannot fire (`_is_completed` short-
+          circuits on `last_mp is None`), so a provisional run never
+          closes as `completed`.
+        - `_close_run` on an aborted start yields the arbitrated minimal
+          interrupted entry (`session_area = None`, `zones = []`,
+          `mow_start_type = None`, real wander `duration_ms`).
+        - `zones == []` keeps the BUG-17/19 vestige gate armed for the
+          whole window (its dark predicate needs seeded zones).
+
+        The explicit `"provisional": True` key rides through
+        `snapshot()`/`restore()` via the existing `current_run` deepcopy
+        — no snapshot-shape change, no `SNAPSHOT_VERSION` bump. Clearing
+        `_pending_reset` here is deliberate: a fresh activation
+        invalidates any pre-close reset candidate stashed in the previous
+        run's epoch, which must not confirm against this window's seeding
+        packet.
+        """
+        self.current_run = {
+            "start_time": time_ms,
+            "mow_start_type": None,
+            "wk0": None,
+            "sub0": None,
+            "last_time": time_ms,
+            "last_sub": None,
+            "last_wk": None,
+            "last_mp": None,
+            "zones": [],
+            "provisional": True,
+        }
+        self.state = STATE_RUNNING
+        self._interrupt_timer_started_at = None
+        self._pending_reset = None
+
     def _close_run(self) -> Event:
         """Close the currently open run. The result label is centralised
         here (BUG-09) so every close path — the fast BUG-09 completion
@@ -1126,6 +1350,17 @@ class RunTracker:
         """
         assert self.current_run is not None, "close_run without an open run"
         r = self.current_run
+        if r.get("provisional"):
+            # HARD-18 (#117): a provisional run reaching a close was an
+            # aborted start — pressed, wandered, sent home without ever
+            # producing an accepted type-2 (a seeding packet flips
+            # `provisional` off, so only never-seeded runs are here).
+            # Count it; the payload below is already the arbitrated
+            # minimal history entry (`result = interrupted` because
+            # `_is_completed()` is False on `last_mp is None`, `zones =
+            # []`, `session_area = None`, `mow_start_type = None`, real
+            # wander `duration_ms` from the type-1 `last_time`).
+            self.counters["aborted_starts_committed"] += 1
         start = r.get("start_time")
         end = r.get("last_time")
         duration_ms: int | None = None
@@ -1281,6 +1516,18 @@ class RunTracker:
             # without a countdown.
             self._interrupt_timer_started_at = None
 
+    def _arm_interrupt_timer(self) -> None:
+        """HARD-18 (#117): arm the interruption countdown unconditionally
+        (charging included). Used only on the provisional-abort path — a
+        pressed run that returned to the dock has no mowing data to hold
+        for, so even a vs=2 charging dock must eventually commit the
+        aborted-start entry. Idempotent: it never resets an already-armed
+        timer, so a charge↔idle flip during the debounce keeps the
+        countdown running.
+        """
+        if self._interrupt_timer_started_at is None:
+            self._interrupt_timer_started_at = self._clock()
+
     # ------------------------------------------------------------- #
     # Persistence                                                   #
     # ------------------------------------------------------------- #
@@ -1335,6 +1582,11 @@ class RunTracker:
             "invariant_deviations_observed": counters.get(
                 "invariant_deviations_observed", 0
             ),
+            # HARD-18 (#117): absent-key default 0, same tolerant pattern
+            # as the two above (a snapshot written before this build simply
+            # starts these counters from 0 — cosmetic at worst).
+            "strict_progress_rejections": counters.get("strict_progress_rejections", 0),
+            "aborted_starts_committed": counters.get("aborted_starts_committed", 0),
         }
         self.drops = {
             "pending_reset_holds": drops.get("pending_reset_holds", 0),

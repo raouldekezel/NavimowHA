@@ -361,8 +361,13 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # FEAT-05 (b): forward the vs change to the tracker so it can
             # move an open run into PAUSED_DOCKED / arm the sustained-60 s
             # interruption timer.
+            # HARD-18 (#117): also pass the type-1 `time` so the tracker
+            # can anchor a provisional run's `start_time` on the vs=4
+            # activation edge (and stamp the wander end on dock entry).
             self._forward_run_events(
-                self.run_tracker.process_vehicle_state(vehicle_state)
+                self.run_tracker.process_vehicle_state(
+                    vehicle_state, time_ms=parsed.get("time")
+                )
             )
             self.async_set_updated_data(self._build_data())
 

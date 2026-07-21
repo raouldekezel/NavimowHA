@@ -108,6 +108,15 @@ def _run_state_display(c: NavimowCoordinator) -> str:
     """Map tracker (state, vehicle_state) to the display enum."""
     ts = c.run_tracker.state
     if ts == STATE_RUNNING:
+        # HARD-18 (#117): the provisional start window (a run opened on
+        # the vs=4 activation edge, not yet seeded by a type-2) renders
+        # as `starting` — the robot is exiting the dock / navigating to
+        # the boundary, not yet mowing. Takes precedence over the
+        # vs-derived running/returning split for the whole window, so the
+        # state reflects the press ~1.5 s later instead of holding the
+        # previous close's label for ~3 min.
+        if c.run_tracker.is_provisional:
+            return "starting"
         # `returning` = run open AND vs=5 (docked in MAP-01). vs=4
         # (mowing) is the ordinary open-run state and stays as
         # `running`. Fable brief mentions vs ∈ {4, 5} but vs=4 is the
@@ -357,8 +366,9 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
             else None
         ),
     ),
-    # `current_run_state`: enum idle/running/paused/returning. Renamed
-    # from `run_state` per FEAT-08 (#88 naming). `returning` heuristic
+    # `current_run_state`: enum idle/starting/running/paused/returning.
+    # Renamed from `run_state` per FEAT-08 (#88 naming). `starting` is the
+    # HARD-18 (#117) provisional start window; `returning` heuristic
     # documented in `_run_state_display`. `options` must match every
     # value the display fn can return — HA's enum-checks block
     # short-circuits when `options is None` (no error raised), so
@@ -368,7 +378,7 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
         key="current_run_state",
         translation_key="current_run_state",
         device_class=SensorDeviceClass.ENUM,
-        options=["idle", "running", "paused", "returning"],
+        options=["idle", "starting", "running", "paused", "returning"],
         icon="mdi:state-machine",
         value_fn=_run_state_display,
     ),

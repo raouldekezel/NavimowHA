@@ -789,6 +789,10 @@ def test_snapshot_restore_round_trip() -> None:
     assert restored.counters == {
         "wk_regressions_observed": 0,
         "invariant_deviations_observed": 0,
+        # HARD-18 (#117): two additional observability counters,
+        # defaulted to 0 by `restore()` when absent from the snapshot.
+        "strict_progress_rejections": 0,
+        "aborted_starts_committed": 0,
     }
     # Feed a fresh continuation packet — invariant still holds against
     # the restored wk₀.
@@ -1588,8 +1592,15 @@ def test_benign_paths_do_not_consult_invariant_deviation() -> None:
     assert tracker.state == STATE_COMPLETED
     assert tracker.counters["invariant_deviations_observed"] == 0
 
-    # Robot leaves the dock so a new run can open on a fresh reset.
-    tracker.process_vehicle_state(VS_MOWING)
+    # Robot leaves the dock (RUN pressed). HARD-18 (#117): vs=4 from a
+    # terminal state opens a provisional run and fires run_started here,
+    # before any type-2.
+    open_events = tracker.process_vehicle_state(VS_MOWING)
+    assert [e.kind for e in open_events] == [EVENT_RUN_STARTED]
+    # The first type-2 seeds the provisional run (continuation — no
+    # second run_started). The invariant observer short-circuits on the
+    # still-unseeded wk₀, so it is not consulted on this benign start
+    # path (the property this test locks).
     events = _feed(
         tracker,
         [
@@ -1604,7 +1615,7 @@ def test_benign_paths_do_not_consult_invariant_deviation() -> None:
             }
         ],
     )
-    assert [e.kind for e in events] == [EVENT_RUN_STARTED]
+    assert events == []
     assert tracker.counters["invariant_deviations_observed"] == 0
 
 

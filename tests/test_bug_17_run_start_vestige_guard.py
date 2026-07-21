@@ -583,9 +583,15 @@ def test_2026_07_20_replay_end_to_end() -> None:
 
     Pre-BUG-19 outcome (raoul.22): vestige poisons `_open_run`,
     `zones[0].cmp_max = 10000` seeded, gauge stuck at 100 %.
-    Post-BUG-19 outcome (this test): vestige dropped, real packet
-    opens the run cleanly with `zones[0].cmp_max = 104` and gauge
-    starts at 1.04 %.
+    Post-BUG-19 outcome: vestige dropped, real packet opens the run
+    cleanly with `zones[0].cmp_max = 104` and gauge starts at 1.04 %.
+
+    HARD-18 (#117) revision: the RUN press (vs=4) now opens the run
+    *provisionally* before the vestige arrives, so the vestige is dropped
+    inside the armed start window (zones == []) and the real packet
+    *seeds* that provisional run with `cmp_max = 104` — the critical
+    no-poisoning property is unchanged; only run_started timing (at the
+    press) and `start_time` (the activation edge) move.
     """
     tracker = RunTracker()
     # Reconstitute a prior 2026-07-19 close.
@@ -596,8 +602,15 @@ def test_2026_07_20_replay_end_to_end() -> None:
     tracker.process_vehicle_state(VS_DOCKED_CHARGING)
     assert tracker.state == STATE_COMPLETED
 
+    # 11:21:5x — RUN pressed (vs 2→4). HARD-18 (#117): this opens the run
+    # provisionally and fires run_started at the activation edge; the
+    # vestige gate stays armed for the whole window (zones == []).
+    press_t = 1_784_539_313_000  # just before the vestige on the wire
+    start_events = tracker.process_vehicle_state(VS_MOWING, time_ms=press_t)
+    assert [e.kind for e in start_events] == [EVENT_RUN_STARTED]
+    assert tracker.is_provisional is True
+
     # 11:21:54.382 — vestige (real wire fields from the diag).
-    tracker.process_vehicle_state(VS_MOWING)
     vestige_events = _process(
         tracker,
         _pkt(
@@ -610,8 +623,12 @@ def test_2026_07_20_replay_end_to_end() -> None:
             t=1_784_539_314_431,
         ),
     )
-    assert [e for e in vestige_events if e.kind == EVENT_RUN_STARTED] == []
-    assert tracker.state == STATE_COMPLETED  # vestige rejected, state unchanged
+    # The critical BUG-17/19 property survives HARD-18: the vestige is
+    # dropped inside the provisional window (armed on zones == []), no
+    # zone is seeded, the run stays provisional — no cmp_max poisoning.
+    assert vestige_events == []
+    assert tracker.is_provisional is True
+    assert tracker.current_run["zones"] == []
 
     # 11:22:50.383 — genuine first real packet (56 s later on the wire).
     real_events = _process(
@@ -626,10 +643,14 @@ def test_2026_07_20_replay_end_to_end() -> None:
             t=1_784_539_370_461,
         ),
     )
-    started = [e for e in real_events if e.kind == EVENT_RUN_STARTED]
-    assert len(started) == 1
+    # Seeds the provisional run (continuation — no second run_started).
+    assert real_events == []
     r = tracker.current_run
-    assert r["start_time"] == 1_784_539_370_461  # real packet, not vestige
+    assert tracker.is_provisional is False
+    # HARD-18: start_time is the activation edge (the press), not the
+    # vestige and not the real packet — the point being it is NOT the
+    # poisoned vestige time.
+    assert r["start_time"] == press_t
     assert r["sub0"] == 2.53
     assert r["last_mp"] == 0
     zones = r["zones"]

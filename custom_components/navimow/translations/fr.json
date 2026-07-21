@@ -83,6 +83,7 @@
         "name": "État de la tonte en cours",
         "state": {
           "idle": "Au repos",
+          "starting": "Démarrage",
           "running": "En cours",
           "paused": "En pause",
           "returning": "Retour"
