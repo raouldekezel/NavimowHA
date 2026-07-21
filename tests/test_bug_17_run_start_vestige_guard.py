@@ -682,6 +682,53 @@ def test_idle_frozen_sub_vestige_dropped(caplog) -> None:
     assert len(dbgs) == 1, dbgs
 
 
+def test_post_close_frozen_sub_vestige_dropped(caplog) -> None:
+    """Grid completion (review nit): frozen-`sub` shape (BUG-16) ×
+    **post-close restored** state (BUG-19). The arming axis (post-close)
+    and the signature axis (frozen `sub` no longer shields) are each
+    covered alone — `test_post_close_vestige_dropped_state_completed`
+    (zero-`sub` × post-close) and `test_idle_frozen_sub_vestige_dropped`
+    (frozen-`sub` × IDLE). This pins the one cell where both combine: a
+    frozen-`sub` vestige (`sub` = the previous close's `sub`, large)
+    arriving in `STATE_COMPLETED`. Armed (post-close) ∧ ceiling matches
+    → dropped, closed run untouched.
+    """
+    tracker = RunTracker()
+    _process(tracker, _pkt(mp=0, cmp=100, sub=2.47, wk=2.42, boundary=1, t=1_000))
+    _process(tracker, _pkt(mp=50, cmp=5000, sub=100.0, wk=100.0, boundary=1, t=2_000))
+    _process(
+        tracker, _pkt(mp=100, cmp=10000, sub=232.89, wk=232.89, boundary=1, t=3_000)
+    )
+    tracker.process_vehicle_state(VS_DOCKED_CHARGING)
+    assert tracker.state == STATE_COMPLETED
+    prev_last_sub = tracker.current_run.get("last_sub")
+    prev_zones_len = len(tracker.current_run["zones"])
+
+    with caplog.at_level(logging.DEBUG, logger="custom_components.navimow.run_tracker"):
+        events = _process(
+            tracker,
+            _pkt(
+                mp=100,
+                cmp=CMP_ZONE_COMPLETE_THRESHOLD,
+                sub=232.89,  # frozen at the previous close, not zeroed
+                wk=357.63,
+                boundary=1,
+                action=-1,
+                t=4_000,
+            ),
+        )
+    assert [e for e in events if e.kind == EVENT_RUN_STARTED] == []
+    assert tracker.state == STATE_COMPLETED
+    assert tracker.current_run.get("last_sub") == prev_last_sub
+    assert len(tracker.current_run["zones"]) == prev_zones_len
+    dbgs = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.DEBUG and "run-start vestige" in r.getMessage()
+    ]
+    assert len(dbgs) == 1, dbgs
+
+
 # --------------------------------------------------------------------- #
 # 5. Sunday first mow — tolerances alone must never trigger the drop    #
 # --------------------------------------------------------------------- #

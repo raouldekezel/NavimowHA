@@ -174,6 +174,12 @@ def test_run_progress_drops_to_none_on_completed() -> None:
             "time": 1_000_000_000_000,
         },
     )
+    # Guard-load-bearing: the run must be OPEN with a seeded zone BEFORE
+    # the ceiling packet below — otherwise that packet lands in the armed
+    # (unseeded) window and is dropped as a task-end vestige (BUG-19).
+    # Do not collapse these two feeds back into one ceiling packet.
+    assert coord.run_tracker.state == STATE_RUNNING
+    assert coord.run_tracker.current_run["zones"]
     # Genuine completion packet — zones are seeded now, so the guard is
     # inert (dark window) and the ceiling packet is accepted.
     _feed_type2(
