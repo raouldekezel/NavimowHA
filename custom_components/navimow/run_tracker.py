@@ -1632,21 +1632,20 @@ class RunTracker:
         its first type-2 seeds it — restored faithfully so the next
         ``_close_run`` reports ``session_area = None`` rather than
         fabricating a value from the firmware task-scoped accumulator.
-        (The same tolerance covered the pre-FEAT-06 migration, now dead —
-        HARD-21 #123 item 3.)
         """
         if snap.get("version") != SNAPSHOT_VERSION:
             return False
         state = snap.get("state", STATE_IDLE)
-        # MIGRATION(raoul.27): SPIKE-03 outcome B (#115/#122) removed the
-        # terminal resting states; snapshots written ≤ raoul.26 may still
-        # carry them. Dead-vocabulary translation — never raise. Retire only
-        # after a post-upgrade Store save is VERIFIED ON DISK (state ∈
-        # current vocabulary; saves fire on heartbeat/close, never at rest)
-        # — HARD-21 policy (#123).
-        if state in ("completed", "interrupted"):
-            state = STATE_IDLE
-        elif state not in (STATE_IDLE, STATE_RUNNING, STATE_PAUSED_DOCKED):
+        # Robustness (NOT a migration): a malformed / unknown state of any
+        # vintage maps to IDLE with one WARN, never raising. The trigger is
+        # "an out-of-vocabulary string", not "a specific extinct on-disk
+        # shape", so this stays — per the HARD-21 (#123) classification
+        # rule. The HARD-20 raoul.27 dead-vocabulary shim (`"completed"` /
+        # `"interrupted"` → IDLE) was retired here once the on-disk state
+        # was verified re-persisted in the current vocabulary (2026-07-23,
+        # `state = "idle"`); a legacy string now falls through to this same
+        # catch-all — WARN + IDLE, still never raises.
+        if state not in (STATE_IDLE, STATE_RUNNING, STATE_PAUSED_DOCKED):
             _LOGGER.warning(
                 "run_tracker restore: unknown state %r — mapping to idle", state
             )
@@ -1658,18 +1657,16 @@ class RunTracker:
         self._last_accepted_time_ms = snap.get("last_accepted_time_ms")
         drops = snap.get("drops") or {}
         counters = snap.get("counters") or {}
-        # HARD-14: pre-BUG-10 / pre-HARD-06 migrations retired. Snapshots
-        # written on those builds have long since been re-persisted in
-        # the current shape; the two observability counters simply
-        # default to 0 when absent (cosmetic reset at worst).
+        # Robustness (NOT a migration — HARD-21 #123 item 4): an absent
+        # counter / drop key defaults to 0 so a partial or hand-edited
+        # snapshot never raises on read. The trigger is "a key isn't
+        # present", of any vintage — not "an extinct shape on disk" — so
+        # this tolerant read stays regardless of the migration sweep.
         self.counters = {
             "wk_regressions_observed": counters.get("wk_regressions_observed", 0),
             "invariant_deviations_observed": counters.get(
                 "invariant_deviations_observed", 0
             ),
-            # HARD-18 (#117): absent-key default 0, same tolerant pattern
-            # as the two above (a snapshot written before this build simply
-            # starts these counters from 0 — cosmetic at worst).
             "strict_progress_rejections": counters.get("strict_progress_rejections", 0),
             "aborted_starts_committed": counters.get("aborted_starts_committed", 0),
         }

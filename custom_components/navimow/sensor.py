@@ -343,8 +343,7 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
     # to session scope — the number honestly reflects the task the
     # firmware is executing.
     # FEAT-08 (#88 naming): renamed `run_progress` → `current_run_progress`
-    # to align with the `current` / `last` axis. Migration lives in
-    # `__init__.py::_async_migrate_unique_ids`.
+    # to align with the `current` / `last` axis.
     NavimowSensorEntityDescription(
         key="current_run_progress",
         translation_key="current_run_progress",

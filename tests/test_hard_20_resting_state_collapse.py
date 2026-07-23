@@ -265,13 +265,28 @@ def _legacy_snapshot(state: str) -> dict:
     }
 
 
-@pytest.mark.parametrize("legacy", ["completed", "interrupted"])
-def test_restore_migrates_legacy_terminal_state_to_idle(legacy: str) -> None:
+# HARD-21 (#123): the HARD-20 raoul.27 dead-vocabulary shim
+# (`"completed"`/`"interrupted"` → IDLE) is retired now the on-disk state
+# is re-persisted in the current vocabulary (verified 2026-07-23,
+# `state="idle"`). A legacy terminal string now falls through the
+# robustness catch-all (unknown → IDLE + one WARN), never raising — these
+# pins confirm the removal did not break reading a raoul.26-vintage Store.
+@pytest.mark.parametrize(
+    "legacy", ["completed", "interrupted", "some_removed_future_state"]
+)
+def test_restore_out_of_vocabulary_state_maps_to_idle_with_warn(
+    legacy: str, caplog: pytest.LogCaptureFixture
+) -> None:
     tracker = RunTracker()
-    assert tracker.restore(_legacy_snapshot(legacy)) is True
+    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        assert tracker.restore(_legacy_snapshot(legacy)) is True
 
-    # The dead vocabulary maps to IDLE...
+    # Out-of-vocabulary → IDLE + one WARN, never raises...
     assert tracker.state == STATE_IDLE
+    assert any(
+        "unknown state" in r.getMessage() and r.levelno == logging.WARNING
+        for r in caplog.records
+    )
     # ...the seeded reference, counters and drops survive byte-intact...
     assert tracker.current_run["last_sub"] == 200.0
     assert tracker.current_run["zones"][0]["boundary_id"] == 1
@@ -281,7 +296,7 @@ def test_restore_migrates_legacy_terminal_state_to_idle(legacy: str) -> None:
     # ...and a re-snapshot writes the current vocabulary only.
     assert tracker.snapshot()["state"] == STATE_IDLE
 
-    # The migrated reference still keys the post-close gate: an echo
+    # The restored reference still keys the post-close gate: an echo
     # (sub == last_sub, no strict progress) is conservatively rejected.
     base = tracker.counters["strict_progress_rejections"]
     echo = _feed_t2(
@@ -289,18 +304,3 @@ def test_restore_migrates_legacy_terminal_state_to_idle(legacy: str) -> None:
     )
     assert echo == []
     assert tracker.counters["strict_progress_rejections"] == base + 1
-
-
-def test_restore_unknown_state_maps_to_idle_with_warn(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    tracker = RunTracker()
-    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
-        assert tracker.restore(_legacy_snapshot("some_removed_future_state")) is True
-    # Never raises; unknown → IDLE + one WARN; reference still intact.
-    assert tracker.state == STATE_IDLE
-    assert tracker.current_run["last_sub"] == 200.0
-    assert any(
-        "unknown state" in r.getMessage() and r.levelno == logging.WARNING
-        for r in caplog.records
-    )
