@@ -32,9 +32,7 @@ from custom_components.navimow.run_tracker import (
     INTERRUPT_SUSTAIN_SECONDS,
     RESULT_INTERRUPTED,
     SNAPSHOT_VERSION,
-    STATE_COMPLETED,
     STATE_IDLE,
-    STATE_INTERRUPTED,
     STATE_PAUSED_DOCKED,
     STATE_RUNNING,
     VS_DOCKED_CHARGING,
@@ -134,8 +132,11 @@ def _restore_terminal(
         "drops": {"pending_reset_holds": 0},
         "counters": {},
     }
+    # HARD-20 (#122): legacy terminal state strings migrate to IDLE on
+    # restore; the seeded reference (current_run) survives and keys the
+    # post-close gating exactly as before.
     assert tracker.restore(snap) is True
-    assert tracker.state == state
+    assert tracker.state == STATE_IDLE
 
 
 # --------------------------------------------------------------------- #
@@ -143,8 +144,12 @@ def _restore_terminal(
 # --------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("origin", [STATE_IDLE, STATE_COMPLETED, STATE_INTERRUPTED])
+@pytest.mark.parametrize("origin", [STATE_IDLE, "completed", "interrupted"])
 def test_vs4_opens_provisional_run_from_any_origin(origin: str) -> None:
+    # HARD-20 (#122): the three resting origins collapsed to IDLE. Fresh
+    # IDLE (no reference) and the two legacy terminal snapshots (migrated
+    # to IDLE + a seeded reference on restore) must all open a provisional
+    # run identically — SPIKE-03 #115's equivalence, now structural.
     tracker = RunTracker()
     if origin == STATE_IDLE:
         assert tracker.state == STATE_IDLE
@@ -239,7 +244,7 @@ def test_aborted_start_commits_minimal_interrupted_entry(dock_vs: int) -> None:
     assert payload["zones"] == []
     assert payload["session_area"] is None
     assert payload["mow_start_type"] is None
-    assert tracker.state == STATE_INTERRUPTED
+    assert tracker.state == STATE_IDLE
     assert tracker.counters["aborted_starts_committed"] == 1
 
 
@@ -423,7 +428,7 @@ def test_terminal_strict_progress_rejection_counted_and_logged(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     tracker = RunTracker()
-    _restore_terminal(tracker, STATE_COMPLETED, last_sub=200.0, last_mp=50)
+    _restore_terminal(tracker, "completed", last_sub=200.0, last_mp=50)
 
     with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
         # Echo of the close (sub == last_sub, not a vestige: mp≠100) —
@@ -433,7 +438,7 @@ def test_terminal_strict_progress_rejection_counted_and_logged(
         )
 
     assert ev == []
-    assert tracker.state == STATE_COMPLETED  # unchanged, no new run
+    assert tracker.state == STATE_IDLE  # unchanged, no new run
     assert tracker.counters["strict_progress_rejections"] == 1
     assert any("rejected by strict progress" in r.message for r in caplog.records)
 

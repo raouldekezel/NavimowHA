@@ -29,9 +29,7 @@ from custom_components.navimow.const import (
 )
 from custom_components.navimow.location import parse_location_type_2
 from custom_components.navimow.run_tracker import (
-    STATE_COMPLETED,
     STATE_IDLE,
-    STATE_INTERRUPTED,
     STATE_PAUSED_DOCKED,
     STATE_RUNNING,
     VS_DOCKED_CHARGING,
@@ -196,7 +194,7 @@ def test_run_progress_drops_to_none_on_completed() -> None:
     )
     # BUG-09: mp=100 alone doesn't close — need a dock arrival too.
     _feed_vs(coord, VS_DOCKED_CHARGING)
-    assert coord.run_tracker.state == STATE_COMPLETED
+    assert coord.run_tracker.state == STATE_IDLE
     assert _desc("current_run_progress").value_fn(coord) is None
     assert _desc("current_zone_progress").value_fn(coord) is None
 
@@ -441,7 +439,7 @@ def test_new_session_after_close_fires_run_started_not_reopened() -> None:
         },
     )
     _feed_vs(coord, VS_DOCKED_CHARGING)
-    assert coord.run_tracker.state == STATE_COMPLETED
+    assert coord.run_tracker.state == STATE_IDLE
     coord.hass.bus.async_fire.reset_mock()
 
     _feed_type2(

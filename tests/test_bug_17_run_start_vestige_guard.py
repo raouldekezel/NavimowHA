@@ -65,7 +65,6 @@ from custom_components.navimow.run_tracker import (
     INTERRUPT_SUSTAIN_SECONDS,
     MP_TASK_END,
     RUN_START_SUB_TOLERANCE,
-    STATE_COMPLETED,
     STATE_IDLE,
     STATE_PAUSED_DOCKED,
     STATE_RUNNING,
@@ -435,20 +434,20 @@ def test_sentinel_from_idle_accepted_with_suspicious_debug(caplog) -> None:
 
 def test_post_close_vestige_dropped_state_completed(caplog) -> None:
     """BUG-19 (#114) — the operator's dominant real-world case.
-    Vestige arrives with the tracker in `STATE_COMPLETED` restored
+    Vestige arrives with the tracker at rest (IDLE, HARD-20) with a completed-run reference restored
     from a previous mow's close (Store rehydration on HA restart).
     Pre-BUG-19 the guard was dark here and the packet flowed to the
     post-close `is_reset` branch → `_open_run(vestige)` (this test
     file previously pinned that inverted behaviour).
 
     Post-BUG-19 the arming predicate flips: dark only when
-    `state ∈ {RUNNING, PAUSED_DOCKED} ∧ zones != []`. `STATE_COMPLETED`
+    `state ∈ {RUNNING, PAUSED_DOCKED} ∧ zones != []`. A resting IDLE
     fails that state check → armed → signature matches → dropped.
     No `run_started` event, tracker state unchanged, cursors
     untouched.
     """
     tracker = RunTracker()
-    # Complete a genuine mow so the tracker enters STATE_COMPLETED with
+    # Complete a genuine mow so the tracker comes to rest (IDLE) with
     # current_run still referenced (mimics the Store-restored state on
     # the operator's 2026-07-20 event).
     _process(tracker, _pkt(mp=0, cmp=100, sub=2.47, wk=2.42, boundary=1, t=1_000))
@@ -457,7 +456,7 @@ def test_post_close_vestige_dropped_state_completed(caplog) -> None:
         tracker, _pkt(mp=100, cmp=10000, sub=232.89, wk=232.89, boundary=1, t=3_000)
     )
     tracker.process_vehicle_state(VS_DOCKED_CHARGING)
-    assert tracker.state == STATE_COMPLETED
+    assert tracker.state == STATE_IDLE
     prev_last_sub = tracker.current_run.get("last_sub")
     prev_last_mp = tracker.current_run.get("last_mp")
     prev_zones_len = len(tracker.current_run["zones"])
@@ -478,7 +477,7 @@ def test_post_close_vestige_dropped_state_completed(caplog) -> None:
     # Guard fired: no run_started, no state transition, no mutation
     # of the closed run's cursors.
     assert [e for e in events if e.kind == EVENT_RUN_STARTED] == []
-    assert tracker.state == STATE_COMPLETED
+    assert tracker.state == STATE_IDLE
     assert tracker.current_run.get("last_sub") == prev_last_sub
     assert tracker.current_run.get("last_mp") == prev_last_mp
     assert len(tracker.current_run["zones"]) == prev_zones_len
@@ -492,15 +491,12 @@ def test_post_close_vestige_dropped_state_completed(caplog) -> None:
 
 
 def test_post_close_vestige_dropped_state_interrupted(caplog) -> None:
-    """The sister case: `STATE_INTERRUPTED` (last mow closed by the
+    """The sister case: a resting IDLE whose last mow closed interrupted (by the
     sustained-timer path, not the fast-path). BUG-19's arming
     predicate treats both post-close states the same — dark only on
     mowing-with-real-zone.
     """
-    from custom_components.navimow.run_tracker import (
-        INTERRUPT_SUSTAIN_SECONDS,
-        STATE_INTERRUPTED,
-    )
+    from custom_components.navimow.run_tracker import INTERRUPT_SUSTAIN_SECONDS
 
     clock = _FakeClock()
     tracker = RunTracker(clock=clock)
@@ -511,7 +507,7 @@ def test_post_close_vestige_dropped_state_interrupted(caplog) -> None:
     tracker.process_vehicle_state(VS_DOCKED_IDLE)
     clock.advance(INTERRUPT_SUSTAIN_SECONDS + 1)
     tracker.tick()
-    assert tracker.state == STATE_INTERRUPTED
+    assert tracker.state == STATE_IDLE
 
     with caplog.at_level(logging.DEBUG, logger="custom_components.navimow.run_tracker"):
         events = _process(
@@ -527,7 +523,7 @@ def test_post_close_vestige_dropped_state_interrupted(caplog) -> None:
             ),
         )
     assert [e for e in events if e.kind == EVENT_RUN_STARTED] == []
-    assert tracker.state == STATE_INTERRUPTED
+    assert tracker.state == STATE_IDLE
     dbgs = [
         r.getMessage()
         for r in caplog.records
@@ -537,7 +533,7 @@ def test_post_close_vestige_dropped_state_interrupted(caplog) -> None:
 
 
 def test_post_close_genuine_remow_start_accepted() -> None:
-    """The critical no-false-positive case: from `STATE_COMPLETED`,
+    """The critical no-false-positive case: from rest (IDLE + completed reference),
     a **genuine** fresh mow's first real packet (`mp = 0, cmp small,
     sub small`) must be accepted. The arming window is wide here
     (BUG-19), but the drop signature is not — `mp = 0` fails the
@@ -555,7 +551,7 @@ def test_post_close_genuine_remow_start_accepted() -> None:
         tracker, _pkt(mp=100, cmp=10000, sub=232.89, wk=232.89, boundary=1, t=3_000)
     )
     tracker.process_vehicle_state(VS_DOCKED_CHARGING)
-    assert tracker.state == STATE_COMPLETED
+    assert tracker.state == STATE_IDLE
 
     # Fresh mow starts: genuine first real packet.
     events = _process(
@@ -576,7 +572,7 @@ def test_post_close_genuine_remow_start_accepted() -> None:
 def test_2026_07_20_replay_end_to_end() -> None:
     """Deterministic replay of the 2026-07-20 wire trace end-to-end.
 
-    Preconditions: tracker restored to `STATE_COMPLETED` from a prior
+    Preconditions: tracker restored to rest (IDLE; HARD-20 migrates the legacy string) from a prior
     close (2026-07-19 completed multi-zone). Vestige arrives on the
     wire immediately after `vs = 4`. Genuine first real packet
     arrives ~56 s later.
@@ -600,7 +596,7 @@ def test_2026_07_20_replay_end_to_end() -> None:
         tracker, _pkt(mp=100, cmp=10000, sub=232.89, wk=232.89, boundary=1, t=2_000)
     )
     tracker.process_vehicle_state(VS_DOCKED_CHARGING)
-    assert tracker.state == STATE_COMPLETED
+    assert tracker.state == STATE_IDLE
 
     # 11:21:5x — RUN pressed (vs 2→4). HARD-18 (#117): this opens the run
     # provisionally and fires run_started at the activation edge; the
@@ -711,7 +707,7 @@ def test_post_close_frozen_sub_vestige_dropped(caplog) -> None:
     (zero-`sub` × post-close) and `test_idle_frozen_sub_vestige_dropped`
     (frozen-`sub` × IDLE). This pins the one cell where both combine: a
     frozen-`sub` vestige (`sub` = the previous close's `sub`, large)
-    arriving in `STATE_COMPLETED`. Armed (post-close) ∧ ceiling matches
+    arriving at rest (IDLE, post-close). Armed (post-close) ∧ ceiling matches
     → dropped, closed run untouched.
     """
     tracker = RunTracker()
@@ -721,7 +717,7 @@ def test_post_close_frozen_sub_vestige_dropped(caplog) -> None:
         tracker, _pkt(mp=100, cmp=10000, sub=232.89, wk=232.89, boundary=1, t=3_000)
     )
     tracker.process_vehicle_state(VS_DOCKED_CHARGING)
-    assert tracker.state == STATE_COMPLETED
+    assert tracker.state == STATE_IDLE
     prev_last_sub = tracker.current_run.get("last_sub")
     prev_zones_len = len(tracker.current_run["zones"])
 
@@ -739,7 +735,7 @@ def test_post_close_frozen_sub_vestige_dropped(caplog) -> None:
             ),
         )
     assert [e for e in events if e.kind == EVENT_RUN_STARTED] == []
-    assert tracker.state == STATE_COMPLETED
+    assert tracker.state == STATE_IDLE
     assert tracker.current_run.get("last_sub") == prev_last_sub
     assert len(tracker.current_run["zones"]) == prev_zones_len
     dbgs = [

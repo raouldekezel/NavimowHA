@@ -15,9 +15,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from custom_components.navimow.run_tracker import (
-    STATE_COMPLETED,
     STATE_IDLE,
-    STATE_INTERRUPTED,
     STATE_PAUSED_DOCKED,
     STATE_RUNNING,
 )
@@ -50,11 +48,11 @@ def _make_coord(*, tracker_state, tracker_zones=None, stats_boundary=None):
 
 
 def test_completed_run_clears_current_zone_even_with_stale_stats() -> None:
-    """Run just closed with ``STATE_COMPLETED``. Cloud has stopped
+    """Run just closed (at rest in IDLE, completed record). Cloud has stopped
     emitting type-2 so stats still carries the last zone. Sensor must
     render ``None``, not the frozen stats value."""
     coord = _make_coord(
-        tracker_state=STATE_COMPLETED,
+        tracker_state=STATE_IDLE,
         tracker_zones=None,
         stats_boundary=1,  # frozen from the mow that just closed
     )
@@ -64,7 +62,7 @@ def test_completed_run_clears_current_zone_even_with_stale_stats() -> None:
 
 def test_interrupted_run_clears_current_zone_even_with_stale_stats() -> None:
     coord = _make_coord(
-        tracker_state=STATE_INTERRUPTED,
+        tracker_state=STATE_IDLE,
         tracker_zones=None,
         stats_boundary=1,
     )
@@ -120,7 +118,7 @@ def test_attrs_none_when_run_closed_even_with_stale_stats() -> None:
     attribute also clears — a stale value in attributes would be as
     misleading as one in the state."""
     coord = _make_coord(
-        tracker_state=STATE_COMPLETED,
+        tracker_state=STATE_IDLE,
         tracker_zones=None,
         stats_boundary=1,
     )
