@@ -1,0 +1,34 @@
+{
+  "_comment": "HARD-21 (#123) item-2 evidence: run_tracker Store after the first post-raoul.27 mow closed, 2026-07-23, serial redacted. state=\"idle\" \u2192 the on-disk vocabulary is current, the raoul.27 restore migration is spent.",
+  "store_version": 1,
+  "store_key": "navimow.REDACTED-ROBOT-SERIAL.run_tracker",
+  "tracker_state": "idle",
+  "vehicle_state": 1,
+  "counters": {
+    "wk_regressions_observed": 2,
+    "invariant_deviations_observed": 1,
+    "strict_progress_rejections": 0,
+    "aborted_starts_committed": 1
+  },
+  "drops": {
+    "pending_reset_holds": 1
+  },
+  "current_run_reference": {
+    "start_time": 1784832111304,
+    "last_time": 1784832186141,
+    "provisional": false,
+    "sub0": 43.98,
+    "last_sub": 46.37,
+    "last_mp": 12,
+    "zones": [
+      {
+        "boundary_id": 1,
+        "first_time": 1784832134137,
+        "last_time": 1784832186141,
+        "cmp_max": 1916,
+        "sub_entry": 43.98,
+        "sub_exit": 46.37
+      }
+    ]
+  }
+}
