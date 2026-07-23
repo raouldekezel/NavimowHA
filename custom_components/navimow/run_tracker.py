@@ -97,14 +97,15 @@ the BUG-19 forgotten-resting-state class unrepresentable.
     IDLE (seeded reference) ─fresh type-2, strict progress─▶ open NEW
         run [run_started]   (FEAT-06 / #54 — not a reopen; an echo, or an
         empty post-abort reference, is conservatively rejected + counted)
-    RUNNING ─vs ∈ {1,2,3,6}─▶ PAUSED_DOCKED
-    PAUSED_DOCKED ─fresh type-2, strict progress─▶ RUNNING   (resume,
-        same run — intra-run recharge dock does not split)
+    RUNNING ─vs ∈ {1,2,6}─▶ PAUSED_DOCKED
+    RUNNING/PAUSED_DOCKED ─vs = 3 (VS_STOPPED)─▶ (no change — inert)
+    PAUSED_DOCKED ─fresh type-2 while vs ∈ {4,5} (departure)─▶ RUNNING
+        (resume, same run — intra-run recharge dock does not split)
     RUNNING/PAUSED_DOCKED ─(mp ≥ 100 OR (mp ≥ 99 ∧ zones[-1].cmp_max
-        ≥ 10000)) ∧ vs ∈ {1,2,3}─▶ IDLE [run_finished: completed]
+        ≥ 10000)) ∧ vs ∈ {1,2}─▶ IDLE [run_finished: completed]
     RUNNING/PAUSED_DOCKED ─fresh reset (sub < last, sub < ceiling)─▶
         close open run [run_finished], open new run [run_started]
-    PAUSED_DOCKED ─vs ∈ {1,3} sustained 60 s─▶ IDLE
+    PAUSED_DOCKED ─vs = 1 sustained 60 s─▶ IDLE
         [run_finished: interrupted]
 
 HARD-18 (2026-07-21, #117): finishing the FEAT-06 session migration.
@@ -141,9 +142,11 @@ run dict without it (legacy, or a no-dock close) falls back cleanly.
 Future runs only; persisted `history[]` is untouched.
 
 BUG-09 (2026-07-04): the completion criterion is
-`mp ≥ MP_COMPLETION_THRESHOLD` ∧ `vs ∈ {1, 2, 3}` (docked idle /
-charging / catch-all "stopped"; `vs = 6` = post-mow mapping, excluded
-so the map-consolidation phase does not race the completion close).
+`mp ≥ MP_COMPLETION_THRESHOLD` ∧ `vs ∈ {1, 2}` (docked idle / charging;
+`vs = 6` = post-mow mapping, excluded so the map-consolidation phase
+does not race the completion close). HARD-19 §2 (#120): `vs = 3`
+(VS_STOPPED) also excluded — MAP-01 confirmed it is a user pause
+off-dock as often as an at-dock state, so it is evidence of nothing.
 See `docs/diag/2026-07-07_map-01_vs-empirical/` — the earlier comment
 that named `vs = 6` an "explicit user pause" was empirically wrong.
 Immediate close, no debounce.
@@ -240,16 +243,20 @@ STATE_PAUSED_DOCKED = "paused_docked"
 # via `docs/diag/2026-07-07_map-01_vs-empirical/`).
 VS_DOCKED_IDLE = 1
 VS_DOCKED_CHARGING = 2
-# vs = 3 is a **catch-all** for "not mowing, not returning, not
-# charging, not mapping". Observed sub-cases: (a) user pause emitted
-# off-dock during a mow (`/state = isPaused`), (b) transient at-dock
-# idle flip between charging samples (`/state = isIdel`), (c) docked
-# but unpowered (`/state = isDocked` on an unplugged base). The
-# historical name `_UNPOWERED` refers only to case (c); the symbol is
-# kept to minimise ripple across `DOCKED_STATES` and friends, but the
-# semantics are broader — the `/state` channel discriminates sub-cases
-# and posture confirms on-vs-off-dock.
-VS_DOCKED_UNPOWERED = 3
+# vs = 3 is a **generic stopped state** — "not mowing, not returning,
+# not charging, not mapping" — and it is NOT a dock state. Observed
+# sub-cases (MAP-01, 2026-07-07): (a) a real user pause emitted off-dock
+# mid-mow (`/state = isPaused`, posture far from origin), (b) a transient
+# at-dock idle flip between charging samples (`/state = isIdel`),
+# (c) docked on an unpowered base (`/state = isDocked`). Because it spans
+# off-dock and at-dock indistinguishably on the type-1 channel, HARD-19
+# §2 (#120) treats vs = 3 as **evidence of nothing**: excluded from
+# DOCKED_STATES, it never stamps a dock arrival, clears one, arms or
+# disarms the interrupt timer, resumes a paused run, or closes. The
+# historical name `VS_DOCKED_UNPOWERED` (which read case (c) as the whole
+# story) is retired for `VS_STOPPED`. Dock vs departure discrimination
+# now lives in the {1,2,6} / {4,5} sets below.
+VS_STOPPED = 3
 VS_MOWING = 4
 VS_RETURNING = 5
 # vs = 6 = firmware post-mow map-consolidation phase (isMapping in the
@@ -261,30 +268,35 @@ VS_TRANSIENT = 8  # firmware-reset transient (posture all-zero)
 
 # Any docked variant that puts an open run on hold. vs = 6 (isMapping)
 # belongs here because the robot is at-dock and immobile during
-# post-mow map consolidation.
-DOCKED_STATES = frozenset(
-    {VS_DOCKED_IDLE, VS_DOCKED_CHARGING, VS_DOCKED_UNPOWERED, VS_MAPPING}
-)
-# Docked-and-not-charging: signal that a recharge is not imminent.
-# vs=2 (charging) → resume coming; vs=6 (isMapping post-mow) →
-# firmware consolidating, no timeout; vs ∈ {1, 3} → terminal for the
-# open run once sustained.
-DOCKED_NOT_CHARGING = frozenset({VS_DOCKED_IDLE, VS_DOCKED_UNPOWERED})
+# post-mow map consolidation. HARD-19 §2 (#120): vs = 3 (VS_STOPPED) is
+# NOT a dock state — a user pause off-dock also emits it — so it is
+# excluded; only the true at-dock states {1, 2, 6} put a run on hold.
+DOCKED_STATES = frozenset({VS_DOCKED_IDLE, VS_DOCKED_CHARGING, VS_MAPPING})
+# HARD-19 §2 (#120): departure evidence — the robot is physically off
+# the dock and moving. The only signal that clears an intermediate dock
+# stamp (a mid-run recharge that resumed) and re-opens a provisional
+# abort window. vs = 3 is deliberately NOT here (evidence of nothing).
+DEPARTURE_STATES = frozenset({VS_MOWING, VS_RETURNING})
+# Docked-and-not-charging: the sustained-interrupt timer arms only here.
+# vs=2 (charging) → resume coming; vs=6 (isMapping post-mow) → firmware
+# consolidating, no timeout; vs=1 (idle) → terminal for the open run
+# once sustained. HARD-19 §2 (#120): vs = 3 left the set — it is not a
+# dock state, so the vs = 3 sustained-interrupt path is retired.
+DOCKED_NOT_CHARGING = frozenset({VS_DOCKED_IDLE})
 
 # BUG-09: docked variants that qualify for the mp-completion criterion.
 # vs = 6 (isMapping post-mow) is excluded because it is a firmware
 # phase, not a terminal dock state — closing during isMapping would
 # race the consolidation.
 #
-# CAVEAT (documented 2026-07-07, `docs/diag/2026-07-07_map-01_vs-empirical/`):
-# vs = 3 belongs here for the docked/unpowered sub-case, but a real
-# user pause off-dock also emits vs = 3. A user pause at mp = 99 far
-# from the dock would trigger a completion close through this set even
-# though the robot is not at the dock. Not observed in the wild;
-# discussed in the diag findings as a follow-up.
-DOCKED_NOT_USER_PAUSED = frozenset(
-    {VS_DOCKED_IDLE, VS_DOCKED_CHARGING, VS_DOCKED_UNPOWERED}
-)
+# HARD-19 §2 (#120): vs = 3 removed. MAP-01 (2026-07-07,
+# `docs/diag/2026-07-07_map-01_vs-empirical/`) confirmed that a real
+# user pause off-dock emits vs = 3, so a pause at mp = 99/100 far from
+# the base used to close "completed" through this set — the exact hazard
+# MAP-01 follow-up 2 named. The completion predicate is now the two true
+# at-dock resting states {1, 2}; vs = 3 (VS_STOPPED) is evidence of
+# nothing and never completes a run.
+DOCKED_NOT_USER_PAUSED = frozenset({VS_DOCKED_IDLE, VS_DOCKED_CHARGING})
 
 # BUG-14 (2026-07-09, #89): threshold raised from 99 to 100. The
 # earlier value (99) was chosen when the only observed firmware plateau
@@ -734,7 +746,7 @@ class RunTracker:
         if parsed.get("time") is not None:
             self._last_accepted_time_ms = parsed["time"]
 
-        # BUG-09: completion criterion (`mp ≥ 99 ∧ vs ∈ {1,2,3}`). Fires
+        # BUG-09: completion criterion (`mp ≥ 99 ∧ vs ∈ {1,2}`). Fires
         # when a fresh type-2 pushes `last_mp` over the threshold while
         # the robot is already docked (the mp-then-dock path is handled
         # by `process_vehicle_state`).
@@ -759,13 +771,16 @@ class RunTracker:
         from `parsed.get("time")`. The keyword-only default keeps every
         existing caller (and test) valid.
 
-        Otherwise: entries into `DOCKED_STATES` from `RUNNING` move a
-        live run into `PAUSED_DOCKED`. Resume of a *seeded* run is driven
-        by a fresh type-2 in `process_type2`, not by a vs=4/5 signal —
-        type-1 briefly showing `vs=4` during a dock-poke must not falsely
-        "resume" a real run. A *provisional* run, having no mowing data
-        to hold for, treats any sustained dock as an aborted start (see
-        `tick` and `_close_run`).
+        Otherwise: entries into `DOCKED_STATES` (`{1, 2, 6}`) from
+        `RUNNING` move a live run into `PAUSED_DOCKED`. Resume of a
+        *seeded* run is driven by a fresh type-2 in `process_type2`
+        (gated on departure evidence `vehicle_state ∈ {4, 5}`, HARD-19 §3),
+        not by the vs edge itself — a type-1 briefly showing `vs=4` during
+        a dock-poke must not by itself "resume" a real run. A *provisional*
+        run, having no mowing data to hold for, treats any sustained dock
+        as an aborted start (see `tick` and `_close_run`). HARD-19 §2
+        (#120): `vs = 3` (VS_STOPPED) is inert here — it returns before any
+        transition.
         """
         events: list[Event] = []
 
@@ -773,6 +788,21 @@ class RunTracker:
             return events
 
         self.vehicle_state = vs
+
+        # HARD-19 §2 (#120): vs = 3 (VS_STOPPED) is evidence of nothing. It
+        # is not a dock state (excluded from DOCKED_STATES) and not
+        # departure evidence — a generic stopped state spanning an off-dock
+        # user pause, a transient at-dock idle flip, and an unpowered base
+        # indistinguishably on the type-1 channel. It never stamps a dock
+        # arrival, clears one, arms or disarms the interrupt timer, resumes
+        # a paused run, or closes: the open run (RUNNING or PAUSED_DOCKED)
+        # rides through untouched, its timer context intact, so the 2→3→2
+        # flip MAP-01 catalogued at the dock passes straight through.
+        # `vehicle_state` is updated above so the display ladder can render
+        # « En pause » (§5); no machine transition occurs, and completion
+        # cannot fire (the predicate is {1, 2}).
+        if vs == VS_STOPPED:
+            return events
 
         # HARD-18: eager session start. HARD-20 (#122): the three terminal
         # origins collapsed to `IDLE`, so this is a single equality test.
@@ -858,8 +888,9 @@ class RunTracker:
         # before the robot arrived at the dock — process_type2 alone
         # can't fire the close in that ordering because no further
         # type-2 packet is guaranteed after dock arrival. Firing here
-        # closes the run as soon as `vs` enters {1, 2, 3}. A provisional
-        # run cannot complete here (`last_mp is None`).
+        # closes the run as soon as `vs` enters {1, 2} (vs = 3 already
+        # returned inert above; vs = 6 holds). A provisional run cannot
+        # complete here (`last_mp is None`).
         completion = self._maybe_complete_run()
         if completion is not None:
             events.append(completion)
@@ -1541,7 +1572,7 @@ class RunTracker:
     def _maybe_complete_run(self) -> Event | None:
         """BUG-09 completion criterion (BUG-14 refined): close on
         `mp ≥ 100`, OR on `mp ≥ 99 ∧ zones[-1].cmp_max ≥ 10000`, with
-        `vehicle_state ∈ DOCKED_NOT_USER_PAUSED` (`{1, 2, 3}`) in either
+        `vehicle_state ∈ DOCKED_NOT_USER_PAUSED` (`{1, 2}`) in either
         case. Immediate close with no debounce. Returns the close event,
         or `None` when neither branch fires.
 
@@ -1753,9 +1784,12 @@ class RunTracker:
         # `_interrupt_timer_started_at` is monotonic and cannot be
         # restored across a process restart. `tick()` re-arms it on the
         # first call after restart if the machine is `PAUSED_DOCKED`
-        # under `vs ∈ {1, 3}` — so the sustained-docked interruption
-        # detector survives a restart even if `vehicle_state` is
-        # restored from the snapshot rather than re-derived. A pending
+        # under `vs = 1` (DOCKED_NOT_CHARGING, HARD-19 §2) — so the
+        # sustained-docked interruption detector survives a restart even if
+        # `vehicle_state` is restored from the snapshot rather than
+        # re-derived. A restored `PAUSED_DOCKED` under `vs = 3` cannot arm
+        # (vs = 3 is not a dock state) — it waits for the next real dock or
+        # departure edge. A pending
         # reset is intentionally *not* persisted: worst case a mid-flight
         # candidate re-confirms one packet later after a restart, which
         # is safer than serialising a transient decision.
