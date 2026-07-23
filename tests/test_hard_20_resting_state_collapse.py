@@ -6,7 +6,7 @@ the *current* build before the refactor lands — they encode today's
 behaviour so the refactor cannot move it (risk R1's method).
 
 They are deliberately **state-string-agnostic**: none asserts
-`STATE_COMPLETED` / `STATE_INTERRUPTED` (removed by the refactor) nor
+the removed terminal-state constants nor
 `STATE_IDLE` (fails pre-refactor). Each pins the *gating trichotomy* and
 the *record*, which are invariant across the collapse:
 

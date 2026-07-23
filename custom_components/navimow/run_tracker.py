@@ -68,33 +68,44 @@ re-anchors, so persistent drift there is structurally impossible.
 No calendar assumption survives contact with evidence: nothing here
 encodes what week (ISO Monday, Sunday, etc.) the firmware follows.
 
-State machine (converged, authoritative per the brief; BUG-09 revised;
-FEAT-06 revised — session-scoped runs; HARD-18 revised — eager start):
+State machine (BUG-09 / FEAT-06 / HARD-18 revised; HARD-20 (#122)
+revised — three states, not five).
 
-    {IDLE, COMPLETED, INTERRUPTED} ─vs=4─▶ RUNNING(provisional)
-        [run_started]   (HARD-18 / #117 — a run is a user session and
-        starts at activation; `start_time` = the type-1 `time`, ~1.5 s
-        after the press. All baseline anchors are None until seeded.)
+HARD-20 (SPIKE-03 #115 outcome B): the terminal resting states are gone.
+A close is a machine transition to IDLE; the completed/interrupted
+distinction lives in the close *record* (`run_finished` payload →
+`last_finished_run["result"]`, `history[]`), the only place any consumer
+reads it. Invariant: **IDLE = at rest, carrying an OPTIONAL last-closed
+`current_run` reference** (kept across a close since FEAT-06) that keys
+the post-close gating and holds the records. Three states — IDLE,
+RUNNING, PAUSED_DOCKED — leave nothing to enumerate, which is what makes
+the BUG-19 forgotten-resting-state class unrepresentable.
+
+    IDLE ─vs=4─▶ RUNNING(provisional) [run_started]   (HARD-18 / #117 —
+        a run is a user session and starts at activation; start_time =
+        the type-1 time, ~1.5 s after the press. Anchors None until
+        seeded.)
     RUNNING(provisional) ─first accepted type-2─▶ RUNNING (seeded)
         (sub₀ / mow_start_type / wk₀ / zone from the packet; start_time
         keeps the activation anchor; no second run_started)
     RUNNING(provisional) ─vs ∈ DOCKED_STATES sustained 60 s─▶
-        INTERRUPTED [run_finished]   (aborted start — a pressed run that
-        wandered and was sent home; minimal entry: session_area=None,
-        zones=[], real wander duration. Any dock, charging included.)
-    IDLE ─fresh type-2─▶ RUNNING [run_started]
+        IDLE [run_finished: interrupted]   (aborted start — minimal
+        entry: session_area=None, zones=[], real wander duration. Any
+        dock, charging included.)
+    IDLE (no reference, or reset sub < ceiling) ─fresh type-2─▶
+        RUNNING [run_started]
+    IDLE (seeded reference) ─fresh type-2, strict progress─▶ open NEW
+        run [run_started]   (FEAT-06 / #54 — not a reopen; an echo, or an
+        empty post-abort reference, is conservatively rejected + counted)
     RUNNING ─vs ∈ {1,2,3,6}─▶ PAUSED_DOCKED
     PAUSED_DOCKED ─fresh type-2, strict progress─▶ RUNNING   (resume,
         same run — intra-run recharge dock does not split)
     RUNNING/PAUSED_DOCKED ─(mp ≥ 100 OR (mp ≥ 99 ∧ zones[-1].cmp_max
-        ≥ 10000)) ∧ vs ∈ {1,2,3}─▶ COMPLETED [run_finished]
+        ≥ 10000)) ∧ vs ∈ {1,2,3}─▶ IDLE [run_finished: completed]
     RUNNING/PAUSED_DOCKED ─fresh reset (sub < last, sub < ceiling)─▶
         close open run [run_finished], open new run [run_started]
-    PAUSED_DOCKED ─vs ∈ {1,3} sustained 60 s─▶ INTERRUPTED
-        [run_finished]
-    COMPLETED/INTERRUPTED ─fresh type-2 with strict progress─▶
-        open NEW run [run_started] (FEAT-06 / #54)
-    COMPLETED/INTERRUPTED ─fresh reset (sub < ceiling)─▶ open new run
+    PAUSED_DOCKED ─vs ∈ {1,3} sustained 60 s─▶ IDLE
+        [run_finished: interrupted]
 
 HARD-18 (2026-07-21, #117): finishing the FEAT-06 session migration.
 `process_vehicle_state` opens a **provisional** run on the vs=4
@@ -144,8 +155,9 @@ FEAT-06 (2026-07-05, #54): a run maps to a **user session** — an
 activation → final dock cycle. Intra-run recharge docks (vs=2 while
 `mp < threshold`) do NOT split the session (unchanged). What changes
 is the post-close boundary: a fresh accepted type-2 arriving after a
-`COMPLETED` / `INTERRUPTED` no longer *reopens* the closed run — it
-opens a **new run** at that packet's time, with `sub₀` = that packet's
+close (HARD-20: at rest in IDLE with a seeded reference) no longer
+*reopens* the closed run — it opens a **new run** at that packet's
+time, with `sub₀` = that packet's
 `sub`. Per-session area is then `sub − sub₀` (per-zone deltas already
 use absolute `sub` pairs and are unaffected). The `run_reopened` event
 is retired.
@@ -164,9 +176,9 @@ A `sub` regression *above* `RESET_SUB_CEILING` is not accepted as an
 immediate reset — the packet is stashed as a *pending* reset and only
 promoted retroactively when the next accepted packet confirms it
 coherently (B2 on #49: one anomalous packet must not destroy a live
-run). New-session transitions from COMPLETED / INTERRUPTED require
-strict `sub > last_sub` progress (B1 on #49: an echo packet after a
-close must not spawn phantom sessions).
+run). New-session transitions from a resting IDLE with a seeded
+reference require strict `sub > last_sub` progress (B1 on #49: an echo
+packet after a close must not spawn phantom sessions).
 
 vs=2 (charging) still holds PAUSED_DOCKED when the run has not reached
 the completion threshold — a mid-run recharge pause below `mp = 99`
@@ -491,11 +503,11 @@ class RunTracker:
         #   `_update_zone` seeds `zones[0].cmp_max = 10000` (monotonic
         #   max — sensor.<slug>_current_zone_progress sticks at 100 %
         #   for the whole zone).
-        # - From post-close (`STATE_COMPLETED` / `STATE_INTERRUPTED`,
-        #   the operator's dominant path since Store persistence
-        #   landed FEAT-05c 2026-07-04): vestige takes the `is_reset`
-        #   branch (0.0 < prev `last_sub`) → `_open_run(vestige)` ⇒
-        #   same anchoring collateral, same `zones[0]` poisoning.
+        # - From post-close (HARD-20: at rest in IDLE with a seeded
+        #   reference — the operator's dominant path since Store
+        #   persistence landed FEAT-05c 2026-07-04): vestige takes the
+        #   `is_reset` branch (0.0 < prev `last_sub`) → `_open_run(vestige)`
+        #   ⇒ same anchoring collateral, same `zones[0]` poisoning.
         # - From BUG-06 sentinel-then-vestige (open run, `zones ==
         #   []`): sentinel already anchored the run, only
         #   `_update_zone` and `last_mp` are at risk — still real.
@@ -864,9 +876,9 @@ class RunTracker:
         than enumerating the armed ones — the raoul.22 enumeration
         (IDLE ∪ "open run with zones == []") missed post-close, which
         turned out to be the operator's dominant real-world entry
-        state (Store restore rehydrates `STATE_COMPLETED` /
-        `STATE_INTERRUPTED` after any prior close; every next mow
-        starts from that entry, not from IDLE).
+        state (HARD-20: Store restore rehydrates a resting IDLE with a
+        seeded reference after any prior close; every next mow starts
+        from that reference-bearing rest, not from a fresh IDLE).
 
         Concretely the guard is armed in:
 
@@ -890,11 +902,11 @@ class RunTracker:
           boundary arrives. A vestige delivered at the second packet
           position (before the real boundary) must still be dropped.
           `STATE_PAUSED_DOCKED` covers the sentinel-then-dock variant.
-        - **Post-close** (`STATE_COMPLETED` / `STATE_INTERRUPTED`) —
-          the operator's dominant path (BUG-19, 2026-07-20 wire
-          trace). The closed run stays referenced by `current_run`
+        - **Post-close** (HARD-20: at rest in IDLE with a seeded
+          reference) — the operator's dominant path (BUG-19, 2026-07-20
+          wire trace). The closed run stays referenced by `current_run`
           with non-empty `zones` from the completed session, but the
-          state check filters it out of the dark predicate: the
+          `zones == []` half of the dark predicate filters it out: the
           `zones` filled here belong to the *previous* run, not to a
           new one being seeded. Absent the guard, the vestige takes
           the `is_reset` branch (0.0 < prev `last_sub`, below
@@ -1615,10 +1627,13 @@ class RunTracker:
         False when the version doesn't match (caller decides whether to
         drop the payload or upgrade it).
 
-        A pre-FEAT-06 snapshot may carry an open run without ``sub₀``;
-        that is left as-is so the next ``_close_run`` reports
-        ``session_area = None`` rather than fabricating a value from
-        the firmware task-scoped accumulator (the FEAT-06 bug).
+        An open run with ``sub₀ = None`` is a live HARD-18 (#117) shape —
+        a provisional run opened at the vs=4 edge has no baseline until
+        its first type-2 seeds it — restored faithfully so the next
+        ``_close_run`` reports ``session_area = None`` rather than
+        fabricating a value from the firmware task-scoped accumulator.
+        (The same tolerance covered the pre-FEAT-06 migration, now dead —
+        HARD-21 #123 item 3.)
         """
         if snap.get("version") != SNAPSHOT_VERSION:
             return False

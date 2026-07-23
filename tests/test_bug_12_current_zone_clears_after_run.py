@@ -48,7 +48,7 @@ def _make_coord(*, tracker_state, tracker_zones=None, stats_boundary=None):
 
 
 def test_completed_run_clears_current_zone_even_with_stale_stats() -> None:
-    """Run just closed with ``STATE_COMPLETED``. Cloud has stopped
+    """Run just closed (at rest in IDLE, completed record). Cloud has stopped
     emitting type-2 so stats still carries the last zone. Sensor must
     render ``None``, not the frozen stats value."""
     coord = _make_coord(

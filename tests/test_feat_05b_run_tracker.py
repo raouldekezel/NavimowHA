@@ -291,7 +291,7 @@ def test_bug_10_sunday_wk_reset_run_opens_via_fresh_reset_path() -> None:
         ],
     )
 
-    # Exactly one `run_started` (fresh reset path from STATE_COMPLETED);
+    # Exactly one `run_started` (fresh reset path from a resting IDLE with a reference);
     # no `run_finished` (nothing was open to close on the state side).
     kinds = [e.kind for e in events]
     assert kinds == [EVENT_RUN_STARTED], kinds
@@ -1522,7 +1522,7 @@ def test_snapshot_is_isolated_from_subsequent_mutation() -> None:
 def test_benign_paths_do_not_consult_invariant_deviation() -> None:
     """The invariant observer only fires on continuations
     (`STATE_RUNNING` / `STATE_PAUSED_DOCKED`, `is_reset=False`) and on
-    post-close new-session opens (`STATE_COMPLETED` / `STATE_INTERRUPTED`,
+    post-close new-session opens (at rest in IDLE with a seeded reference,
     strict progress). Every other path — fresh IDLE open, fresh reset
     below the ceiling, pending-reset stash — must not touch the counter,
     so the operator's signal stays specific to actual anchor-drift
