@@ -688,16 +688,26 @@ class RunTracker:
                 # run's `wk₀`, then accept. A persistent deviation streak
                 # WARNs at HARD-06 / #62 threshold; it never blocks.
                 self._observe_invariant_deviation(parsed)
-                # Resume from a pause when a fresh type-2 continues.
-                if self.state == STATE_PAUSED_DOCKED:
+                # HARD-19 §3 (#120): resume from a pause + drop the
+                # intermediate dock stamp ONLY on departure evidence — the
+                # robot physically left the dock (`vehicle_state ∈ {4, 5}`)
+                # and a fresh type-2 is now continuing the mow, so the dock
+                # it left was a mid-run recharge, not the session's final
+                # dock. Only a subsequent (final) dock's arrival can then end
+                # the run. A type-2 that arrives while still docked
+                # (`vehicle_state ∈ {1, 2, 6}` — the late BUG-09 completing
+                # flush, or a cross-stream skew where the packet beats the
+                # off-dock type-1) still updates accumulators and may complete
+                # the run below, but it never resumes and never clears the
+                # stamp: the run then ends at the frozen dock arrival, not the
+                # flush packet (family 6, inverted). `current_run` is non-None
+                # here (PAUSED_DOCKED implies an open run).
+                if (
+                    self.state == STATE_PAUSED_DOCKED
+                    and self.vehicle_state in DEPARTURE_STATES
+                ):
                     self.state = STATE_RUNNING
                     self._interrupt_timer_started_at = None
-                    # HARD-19 (#120): the mower left the dock to continue the
-                    # mow, so the dock it just left was an intermediate
-                    # recharge, not the session's final dock — drop its
-                    # arrival stamp. Only a subsequent (final) dock's arrival
-                    # can then end the run. `current_run` is non-None here
-                    # (PAUSED_DOCKED implies an open run).
                     self.current_run["dock_arrival_time"] = None
 
         # HARD-18 (#117): seed a provisional run from its first accepted
@@ -833,8 +843,11 @@ class RunTracker:
                 # the tracker owns the edge without importing HA state.
                 # Frozen through the docked idle↔charge flips (those re-enter
                 # via the PAUSED_DOCKED branch below, which does not stamp)
-                # and cleared on resume (a mid-run recharge dock is not the
-                # session's final dock). Gated on `time_ms` so a legacy
+                # and cleared only on departure evidence (§3: a resume with
+                # `vehicle_state ∈ {4, 5}` — a mid-run recharge dock the
+                # robot then left is not the session's final dock). vs entry
+                # is `{1, 2, 6}` only — vs = 3 returned inert above and never
+                # reaches this stamp. Gated on `time_ms` so a legacy
                 # caller without it falls back to the last packet cursor in
                 # `_close_run`. For a provisional run the stamp coincides
                 # with `last_time` (both = this edge's `time_ms`), so the
@@ -868,7 +881,9 @@ class RunTracker:
                     # (frozen at the dock-entry edge above).
                     self._arm_interrupt_timer()
                 else:
-                    # Left the dock again before the debounce fired — the
+                    # Departure evidence (`vs ∈ {4, 5}` — vs = 3 returned
+                    # inert above, so this else is reached only on {4, 5}):
+                    # left the dock again before the debounce fired, so the
                     # provisional window re-opens off-dock; a real type-2
                     # (resume + seed) or a sustained re-dock (abort) will
                     # resolve it. Disarm and keep the wander duration live.
@@ -876,8 +891,8 @@ class RunTracker:
                     self._interrupt_timer_started_at = None
                     if time_ms is not None:
                         self.current_run["last_time"] = time_ms
-                    # HARD-19 (#120): that dock was intermediate — drop its
-                    # arrival stamp (symmetric with the seeded resume).
+                    # HARD-19 §3 (#120): that dock was intermediate — drop
+                    # its arrival stamp (symmetric with the seeded resume).
                     self.current_run["dock_arrival_time"] = None
             else:
                 # Charging / explicit pause reset the timer; docked-and-
@@ -1431,6 +1446,10 @@ class RunTracker:
             "last_wk": wk,
             "last_mp": parsed.get("mowing_percentage"),
             "zones": [],
+            # HARD-19 §3 (#120): a fresh run carries no dock arrival — the
+            # key is present-and-None so the stamp is a first-class field
+            # (a legacy snapshot without it still falls back via `.get`).
+            "dock_arrival_time": None,
         }
         self.state = STATE_RUNNING
         self._interrupt_timer_started_at = None
@@ -1480,6 +1499,10 @@ class RunTracker:
             "last_mp": None,
             "zones": [],
             "provisional": True,
+            # HARD-19 §3 (#120): structural clear — a provisional run has no
+            # dock arrival until it docks. For an aborted start the dock
+            # entry stamp coincides with `last_time` (§1c/§1d values agree).
+            "dock_arrival_time": None,
         }
         self.state = STATE_RUNNING
         self._interrupt_timer_started_at = None
@@ -1516,26 +1539,26 @@ class RunTracker:
         # HARD-19 (#120): a run that closed at a dock ends at the dock's
         # arrival edge, not at its last accepted type-2. `dock_arrival_time`
         # is stamped on the RUNNING → PAUSED_DOCKED transition (see
-        # `process_vehicle_state`) and frozen through the docked idle↔charge
-        # flips, so the session duration is exactly FEAT-06's activation →
-        # dock arrival (symmetric with HARD-18's activation-anchored
-        # `start_time`). The `max(…, last_time)` floor guarantees a session
-        # never ends before its last accepted packet — the sole shape that
-        # exercises it is BUG-09's (#89) dock-first-then-`mp = 100` flush,
-        # whose completing type-2 postdates the dock arrival by seconds.
-        # Closes with no observed dock (a reset-driven close mid-mow, a
-        # legacy / degraded run without the key) carry no stamp and fall
-        # back to the last packet cursor. `last_time` is deliberately NOT
-        # mutated — it stays the packet cursor the post-close gating
-        # baseline (`last_sub`) and everything downstream read.
+        # `process_vehicle_state`), frozen through the docked idle↔charge
+        # flips and through a late completing flush (§3 clears the stamp
+        # only on departure evidence), so the session duration is exactly
+        # FEAT-06's activation → dock arrival (symmetric with HARD-18's
+        # activation-anchored `start_time`). The end is the stamp itself —
+        # strict, no `max(…, last_time)` floor (operator arbitration §1:
+        # "use dock_arrival_time as end_time INSTEAD OF the last type-2
+        # timestamp"; a late BUG-09 #89 completing flush is bookkeeping
+        # emitted at task teardown, its `time` is emission time, not session
+        # activity, so it must not move the end past the physical arrival).
+        # One accepted cosmetic consequence: a zone's last packet time may
+        # exceed the run's `end_time` by the flush seconds. Closes with no
+        # observed dock (a reset-driven close mid-mow, a legacy / degraded
+        # run without the key) carry no stamp and fall back to the last
+        # packet cursor. `last_time` is deliberately NOT mutated — it stays
+        # the packet cursor the post-close gating baseline (`last_sub`) and
+        # everything downstream read.
         last_time = r.get("last_time")
         dock_arrival = r.get("dock_arrival_time")
-        if dock_arrival is None:
-            end = last_time
-        elif last_time is None:
-            end = dock_arrival
-        else:
-            end = max(dock_arrival, last_time)
+        end = dock_arrival if dock_arrival is not None else last_time
         duration_ms: int | None = None
         if start is not None and end is not None:
             duration_ms = end - start

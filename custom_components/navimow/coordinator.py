@@ -308,7 +308,15 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # FEAT-05 (b): feed the run tracker downstream of layer-1 so it
         # only sees ordering-clean packets. Emitted events are just
         # logged here; step (c) will fire them on the HA event bus.
-        self._forward_run_events(self.run_tracker.process_type2(parsed))
+        tracker_state_before = self.run_tracker.state
+        run_events = self.run_tracker.process_type2(parsed)
+        self._forward_run_events(run_events)
+        # HARD-19 §4 (#120): a departure-gated resume (PAUSED_DOCKED →
+        # RUNNING, dock stamp cleared) emits no run event; persist that
+        # silent transition too, symmetric with the dock-entry save on the
+        # type-1 path. When an event WAS emitted the forward above saved.
+        if not run_events and self.run_tracker.state != tracker_state_before:
+            self._schedule_store_save()
         # Stats belong to the coordinator's shared data dict, so refresh
         # entities via the standard path (they are on the ~30 s tick anyway;
         # this just makes updates land immediately when a payload arrives).
@@ -364,11 +372,21 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # HARD-18 (#117): also pass the type-1 `time` so the tracker
             # can anchor a provisional run's `start_time` on the vs=4
             # activation edge (and stamp the wander end on dock entry).
-            self._forward_run_events(
-                self.run_tracker.process_vehicle_state(
-                    vehicle_state, time_ms=parsed.get("time")
-                )
+            tracker_state_before = self.run_tracker.state
+            run_events = self.run_tracker.process_vehicle_state(
+                vehicle_state, time_ms=parsed.get("time")
             )
+            self._forward_run_events(run_events)
+            # HARD-19 §4 (#120): a dock entry (RUNNING → PAUSED_DOCKED,
+            # dock_arrival_time stamped) closes nothing, so it emits no run
+            # event and `_forward_run_events` schedules no save; the
+            # heartbeat save only runs while RUNNING. Persist the silent
+            # transition so the stamp (and the PAUSED_DOCKED context) survives
+            # a restart between the dock edge and the close — this also
+            # repairs the pre-existing mid-pause restart imprecision. When an
+            # event WAS emitted the forward above already saved.
+            if not run_events and self.run_tracker.state != tracker_state_before:
+                self._schedule_store_save()
             self.async_set_updated_data(self._build_data())
 
         # Position pushes go through a dedicated dispatcher (throttled to
