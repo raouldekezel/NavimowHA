@@ -33,7 +33,7 @@ from custom_components.navimow.location import parse_location_type_2
 from custom_components.navimow.run_tracker import (
     EVENT_RUN_FINISHED,
     EVENT_RUN_STARTED,
-    STATE_COMPLETED,
+    STATE_IDLE,
     STATE_PAUSED_DOCKED,
     STATE_RUNNING,
     VS_DOCKED_CHARGING,
@@ -144,7 +144,7 @@ def test_2026_07_09_day_closes_completed_via_cmp_10000() -> None:
     # -- Final dock arrival at 12:52 CEST ------------------------------- #
     all_events += tracker.process_vehicle_state(VS_RETURNING)
     all_events += tracker.process_vehicle_state(VS_DOCKED_CHARGING)
-    assert tracker.state == STATE_COMPLETED, "BUG-14 cmp rule must fire"
+    assert tracker.state == STATE_IDLE, "BUG-14 cmp rule must fire"
 
     # Exactly one open and one close over the full cycle.
     started = [e for e in all_events if e.kind == EVENT_RUN_STARTED]
@@ -179,7 +179,7 @@ def test_full_recharge_cycle_with_mp_100_finish_closes_completed() -> None:
 
     all_events += tracker.process_vehicle_state(VS_RETURNING)
     all_events += tracker.process_vehicle_state(VS_DOCKED_CHARGING)
-    assert tracker.state == STATE_COMPLETED
+    assert tracker.state == STATE_IDLE
 
     started = [e for e in all_events if e.kind == EVENT_RUN_STARTED]
     finished = [e for e in all_events if e.kind == EVENT_RUN_FINISHED]
@@ -245,7 +245,7 @@ def test_two_recharge_cycles_still_one_session() -> None:
     # Finally reaches mp = 100, docks, closes.
     all_events += _process(tracker, _pkt(mp=100, sub=240.0, t=6_000))
     all_events += tracker.process_vehicle_state(VS_DOCKED_CHARGING)
-    assert tracker.state == STATE_COMPLETED
+    assert tracker.state == STATE_IDLE
 
     started = [e for e in all_events if e.kind == EVENT_RUN_STARTED]
     finished = [e for e in all_events if e.kind == EVENT_RUN_FINISHED]

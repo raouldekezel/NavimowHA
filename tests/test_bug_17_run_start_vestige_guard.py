@@ -65,7 +65,6 @@ from custom_components.navimow.run_tracker import (
     INTERRUPT_SUSTAIN_SECONDS,
     MP_TASK_END,
     RUN_START_SUB_TOLERANCE,
-    STATE_COMPLETED,
     STATE_IDLE,
     STATE_PAUSED_DOCKED,
     STATE_RUNNING,
@@ -457,7 +456,7 @@ def test_post_close_vestige_dropped_state_completed(caplog) -> None:
         tracker, _pkt(mp=100, cmp=10000, sub=232.89, wk=232.89, boundary=1, t=3_000)
     )
     tracker.process_vehicle_state(VS_DOCKED_CHARGING)
-    assert tracker.state == STATE_COMPLETED
+    assert tracker.state == STATE_IDLE
     prev_last_sub = tracker.current_run.get("last_sub")
     prev_last_mp = tracker.current_run.get("last_mp")
     prev_zones_len = len(tracker.current_run["zones"])
@@ -478,7 +477,7 @@ def test_post_close_vestige_dropped_state_completed(caplog) -> None:
     # Guard fired: no run_started, no state transition, no mutation
     # of the closed run's cursors.
     assert [e for e in events if e.kind == EVENT_RUN_STARTED] == []
-    assert tracker.state == STATE_COMPLETED
+    assert tracker.state == STATE_IDLE
     assert tracker.current_run.get("last_sub") == prev_last_sub
     assert tracker.current_run.get("last_mp") == prev_last_mp
     assert len(tracker.current_run["zones"]) == prev_zones_len
@@ -499,7 +498,6 @@ def test_post_close_vestige_dropped_state_interrupted(caplog) -> None:
     """
     from custom_components.navimow.run_tracker import (
         INTERRUPT_SUSTAIN_SECONDS,
-        STATE_INTERRUPTED,
     )
 
     clock = _FakeClock()
@@ -511,7 +509,7 @@ def test_post_close_vestige_dropped_state_interrupted(caplog) -> None:
     tracker.process_vehicle_state(VS_DOCKED_IDLE)
     clock.advance(INTERRUPT_SUSTAIN_SECONDS + 1)
     tracker.tick()
-    assert tracker.state == STATE_INTERRUPTED
+    assert tracker.state == STATE_IDLE
 
     with caplog.at_level(logging.DEBUG, logger="custom_components.navimow.run_tracker"):
         events = _process(
@@ -527,7 +525,7 @@ def test_post_close_vestige_dropped_state_interrupted(caplog) -> None:
             ),
         )
     assert [e for e in events if e.kind == EVENT_RUN_STARTED] == []
-    assert tracker.state == STATE_INTERRUPTED
+    assert tracker.state == STATE_IDLE
     dbgs = [
         r.getMessage()
         for r in caplog.records
@@ -555,7 +553,7 @@ def test_post_close_genuine_remow_start_accepted() -> None:
         tracker, _pkt(mp=100, cmp=10000, sub=232.89, wk=232.89, boundary=1, t=3_000)
     )
     tracker.process_vehicle_state(VS_DOCKED_CHARGING)
-    assert tracker.state == STATE_COMPLETED
+    assert tracker.state == STATE_IDLE
 
     # Fresh mow starts: genuine first real packet.
     events = _process(
@@ -600,7 +598,7 @@ def test_2026_07_20_replay_end_to_end() -> None:
         tracker, _pkt(mp=100, cmp=10000, sub=232.89, wk=232.89, boundary=1, t=2_000)
     )
     tracker.process_vehicle_state(VS_DOCKED_CHARGING)
-    assert tracker.state == STATE_COMPLETED
+    assert tracker.state == STATE_IDLE
 
     # 11:21:5x — RUN pressed (vs 2→4). HARD-18 (#117): this opens the run
     # provisionally and fires run_started at the activation edge; the
@@ -721,7 +719,7 @@ def test_post_close_frozen_sub_vestige_dropped(caplog) -> None:
         tracker, _pkt(mp=100, cmp=10000, sub=232.89, wk=232.89, boundary=1, t=3_000)
     )
     tracker.process_vehicle_state(VS_DOCKED_CHARGING)
-    assert tracker.state == STATE_COMPLETED
+    assert tracker.state == STATE_IDLE
     prev_last_sub = tracker.current_run.get("last_sub")
     prev_zones_len = len(tracker.current_run["zones"])
 
@@ -739,7 +737,7 @@ def test_post_close_frozen_sub_vestige_dropped(caplog) -> None:
             ),
         )
     assert [e for e in events if e.kind == EVENT_RUN_STARTED] == []
-    assert tracker.state == STATE_COMPLETED
+    assert tracker.state == STATE_IDLE
     assert tracker.current_run.get("last_sub") == prev_last_sub
     assert len(tracker.current_run["zones"]) == prev_zones_len
     dbgs = [

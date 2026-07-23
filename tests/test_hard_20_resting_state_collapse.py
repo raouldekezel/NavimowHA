@@ -34,6 +34,8 @@ from custom_components.navimow.location import parse_location_type_2
 from custom_components.navimow.run_tracker import (
     EVENT_RUN_STARTED,
     INTERRUPT_SUSTAIN_SECONDS,
+    SNAPSHOT_VERSION,
+    STATE_IDLE,
     VS_DOCKED_CHARGING,
     VS_DOCKED_IDLE,
     VS_MOWING,
@@ -216,3 +218,89 @@ def test_t4_resting_empty_reference_rejects_then_vs4_self_resolves(
     started = tracker.process_vehicle_state(VS_MOWING, time_ms=_T0 + 300_000)
     assert [e.kind for e in started] == [EVENT_RUN_STARTED]
     assert tracker.is_provisional is True
+
+
+# --------------------------------------------------------------------- #
+# Migration round-trips — legacy terminal state strings → IDLE           #
+# --------------------------------------------------------------------- #
+
+
+def _legacy_snapshot(state: str) -> dict:
+    """A pre-raoul.27 tracker snapshot carrying a removed terminal-state
+    string plus a seeded post-close reference and lifetime counters —
+    the shape the 07-19 / 07-20 / 07-23 Store dumps persisted."""
+    return {
+        "version": SNAPSHOT_VERSION,
+        "state": state,
+        "vehicle_state": VS_DOCKED_CHARGING,
+        "current_run": {
+            "start_time": _T0,
+            "mow_start_type": 0,
+            "wk0": 0.0,
+            "sub0": 10.0,
+            "last_time": _T0 + 60_000,
+            "last_sub": 200.0,
+            "last_wk": 200.0,
+            "last_mp": 100,
+            "zones": [
+                {
+                    "boundary_id": 1,
+                    "first_time": _T0,
+                    "last_time": _T0 + 60_000,
+                    "cmp_max": 10000,
+                    "sub_entry": 10.0,
+                    "sub_exit": 200.0,
+                }
+            ],
+        },
+        "last_accepted_wk": 200.0,
+        "last_accepted_time_ms": _T0 + 60_000,
+        "drops": {"pending_reset_holds": 1},
+        "counters": {
+            "wk_regressions_observed": 2,
+            "invariant_deviations_observed": 1,
+            "strict_progress_rejections": 0,
+            "aborted_starts_committed": 1,
+        },
+    }
+
+
+@pytest.mark.parametrize("legacy", ["completed", "interrupted"])
+def test_restore_migrates_legacy_terminal_state_to_idle(legacy: str) -> None:
+    tracker = RunTracker()
+    assert tracker.restore(_legacy_snapshot(legacy)) is True
+
+    # The dead vocabulary maps to IDLE...
+    assert tracker.state == STATE_IDLE
+    # ...the seeded reference, counters and drops survive byte-intact...
+    assert tracker.current_run["last_sub"] == 200.0
+    assert tracker.current_run["zones"][0]["boundary_id"] == 1
+    assert tracker.counters["aborted_starts_committed"] == 1
+    assert tracker.counters["wk_regressions_observed"] == 2
+    assert tracker.drops["pending_reset_holds"] == 1
+    # ...and a re-snapshot writes the current vocabulary only.
+    assert tracker.snapshot()["state"] == STATE_IDLE
+
+    # The migrated reference still keys the post-close gate: an echo
+    # (sub == last_sub, no strict progress) is conservatively rejected.
+    base = tracker.counters["strict_progress_rejections"]
+    echo = _feed_t2(
+        tracker, boundary=1, mp=100, cmp=6000, sub=200.0, wk=200.0, time=_T0 + 200_000
+    )
+    assert echo == []
+    assert tracker.counters["strict_progress_rejections"] == base + 1
+
+
+def test_restore_unknown_state_maps_to_idle_with_warn(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    tracker = RunTracker()
+    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        assert tracker.restore(_legacy_snapshot("some_removed_future_state")) is True
+    # Never raises; unknown → IDLE + one WARN; reference still intact.
+    assert tracker.state == STATE_IDLE
+    assert tracker.current_run["last_sub"] == 200.0
+    assert any(
+        "unknown state" in r.getMessage() and r.levelno == logging.WARNING
+        for r in caplog.records
+    )

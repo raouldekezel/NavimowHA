@@ -33,7 +33,6 @@ from custom_components.navimow.run_tracker import (
     EVENT_RUN_FINISHED,
     EVENT_RUN_STARTED,
     RESULT_COMPLETED,
-    STATE_COMPLETED,
     STATE_IDLE,
     STATE_RUNNING,
     VS_DOCKED_CHARGING,
@@ -220,7 +219,7 @@ def test_afternoon_new_session_ignores_echo_of_morning_close_packet() -> None:
         ],
     )
     tracker.process_vehicle_state(VS_DOCKED_CHARGING)
-    assert tracker.state == STATE_COMPLETED
+    assert tracker.state == STATE_IDLE
 
     # Echo — same sub/mp, later time, no strict progress.
     echo = _feed(
@@ -238,7 +237,7 @@ def test_afternoon_new_session_ignores_echo_of_morning_close_packet() -> None:
         ],
     )
     assert echo == []
-    assert tracker.state == STATE_COMPLETED
+    assert tracker.state == STATE_IDLE
 
 
 # --------------------------------------------------------------------- #
@@ -572,7 +571,7 @@ def test_wk_regression_warn_not_emitted_on_fresh_session_start(caplog) -> None:
     the WARN threshold.
     """
     tracker = RunTracker()
-    tracker.state = STATE_COMPLETED
+    tracker.state = STATE_IDLE
     tracker._last_accepted_wk = 1189.34
     tracker._last_accepted_time_ms = 1_000_000_000_000
     tracker.current_run = {
@@ -669,7 +668,7 @@ def test_idle_open_close_still_works_no_regression() -> None:
     assert (
         events[0].payload["session_area"] == 0.0
     )  # 50 − 50 (open packet is also close)
-    assert tracker.state == STATE_COMPLETED
+    assert tracker.state == STATE_IDLE
 
 
 # --------------------------------------------------------------------- #
@@ -742,7 +741,7 @@ def test_feat_06_fixture_drift_yields_complete_second_session_no_warn(
     )
     morning_close = tracker.process_vehicle_state(VS_DOCKED_CHARGING)
     assert [e.kind for e in morning_close] == [EVENT_RUN_FINISHED]
-    assert tracker.state == STATE_COMPLETED
+    assert tracker.state == STATE_IDLE
     assert tracker.current_run["wk0"] == 945.0
 
     # HARD-18 (#117): the RUN press opens the afternoon session

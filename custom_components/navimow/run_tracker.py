@@ -192,11 +192,18 @@ _LOGGER = logging.getLogger(__name__)
 
 # Tracker states (internal, distinct from the display `run_state`
 # enum step (c) will expose).
+#
+# HARD-20 (#122, SPIKE-03 outcome B): three states, not five. The terminal
+# resting states COMPLETED / INTERRUPTED were collapsed into IDLE — a close
+# is a machine transition to IDLE, and the completed/interrupted label lives
+# in the close *record* (`last_finished_run["result"]`, `history[]`), the
+# only place any consumer reads it. IDLE = at rest, carrying an OPTIONAL
+# last-closed `current_run` reference that keys the post-close gating and
+# holds the records. The RESULT_* labels below are the record vocabulary and
+# are untouched.
 STATE_IDLE = "idle"
 STATE_RUNNING = "running"
 STATE_PAUSED_DOCKED = "paused_docked"
-STATE_COMPLETED = "completed"
-STATE_INTERRUPTED = "interrupted"
 
 # vehicleState values (from MAP-01 diag / #25, corrected on 2026-07-07
 # via `docs/diag/2026-07-07_map-01_vs-empirical/`).
@@ -568,8 +575,58 @@ class RunTracker:
         # observed (not enforced, HARD-06 / #62) on continuations and
         # post-close new-session opens; every packet proceeds.
         if self.state == STATE_IDLE:
-            self._open_run(parsed)
-            events.append(self._event_run_started())
+            # HARD-20 (#122): IDLE = at rest, with an OPTIONAL last-closed
+            # `current_run` reference (kept across a close since FEAT-06
+            # #54). Its contents key the gate — which is what the old
+            # `state ∈ {COMPLETED, INTERRUPTED}` enumeration always meant:
+            # no reference (first boot) → ungated open; seeded reference →
+            # post-close gating; empty reference (post-abort, both axes
+            # None) → conservative reject, self-resolving at the next vs=4.
+            if is_reset:
+                # Split by ceiling: sub << ceiling → a genuine run-start;
+                # sub above → hold as a pending candidate a coherent
+                # successor must confirm (BUG-08 mixed-epoch packets must
+                # not destroy a live run). Nothing open to close here.
+                if incoming_sub is not None and incoming_sub < RESET_SUB_CEILING:
+                    self._open_run(parsed)
+                    events.append(self._event_run_started())
+                else:
+                    self._stash_pending_reset(parsed)
+                    return events
+            else:
+                # FEAT-06 (#54): a fresh type-2 with strict progress after a
+                # close opens a NEW session (not a reopen); an echo (same
+                # sub/mp, only time fresher) is rejected, else a stream tail
+                # spawns phantom sessions after every close (B1 on #49).
+                # The `current_run is not None` guard makes the first-boot
+                # path byte-identical to the pre-HARD-20 IDLE open:
+                # current_run None ⇒ prev_sub None ⇒ is_reset False ⇒ here ⇒
+                # guard short-circuits ⇒ `_observe_invariant_deviation`
+                # no-ops (no wk₀) ⇒ `_open_run` + run_started.
+                # HARD-18 (#117): the refusal is counted + DEBUG-logged
+                # (was silent) so the audits see whether strict progress
+                # ever fires in production.
+                if self.current_run is not None and not self._has_strict_progress(
+                    parsed
+                ):
+                    self.counters["strict_progress_rejections"] += 1
+                    _LOGGER.debug(
+                        "run_tracker: type-2 rejected by strict progress "
+                        "(sub=%s last_sub=%s mp=%s last_mp=%s time=%s)",
+                        incoming_sub,
+                        self.current_run.get("last_sub") if self.current_run else None,
+                        incoming_mp,
+                        self.current_run.get("last_mp") if self.current_run else None,
+                        parsed.get("time"),
+                    )
+                    return events
+                # HARD-06 (#62): observe the invariant against the closed
+                # run's `wk₀` BEFORE `_open_run` re-anchors (a no-op on
+                # first boot with no reference); persistent drift here is
+                # structurally impossible.
+                self._observe_invariant_deviation(parsed)
+                self._open_run(parsed)
+                events.append(self._event_run_started())
         elif self.state in (STATE_RUNNING, STATE_PAUSED_DOCKED):
             if is_reset:
                 # Split by ceiling: sub << ceiling → obviously a genuine
@@ -592,52 +649,6 @@ class RunTracker:
                 if self.state == STATE_PAUSED_DOCKED:
                     self.state = STATE_RUNNING
                     self._interrupt_timer_started_at = None
-        elif self.state in (STATE_COMPLETED, STATE_INTERRUPTED):
-            if is_reset:
-                if incoming_sub is not None and incoming_sub < RESET_SUB_CEILING:
-                    self._open_run(parsed)
-                    events.append(self._event_run_started())
-                else:
-                    self._stash_pending_reset(parsed)
-                    return events
-            else:
-                # FEAT-06 (#54): a fresh accepted type-2 with strict
-                # progress after a close no longer *reopens* the closed
-                # run — it opens a **new session** anchored at this
-                # packet's time and `sub`. Strict progress rejects echo
-                # packets (identical `sub` / `mp` with only `time`
-                # fresher) — otherwise a stream tail would spawn phantom
-                # sessions after every close (B1 on #49 generalised).
-                #
-                # HARD-18 (#117): this is the terminal-state path reached
-                # only *without* a preceding vs=4 (the docked post-close
-                # scenario). It stays untouched by the eager-start window,
-                # but its refusal is no longer silent — count and DEBUG-
-                # log it so the audits stop being blind to whether the
-                # strict-progress filter ever fires in production.
-                if not self._has_strict_progress(parsed):
-                    self.counters["strict_progress_rejections"] += 1
-                    _LOGGER.debug(
-                        "run_tracker: type-2 rejected by strict progress "
-                        "(sub=%s last_sub=%s mp=%s last_mp=%s time=%s)",
-                        incoming_sub,
-                        self.current_run.get("last_sub") if self.current_run else None,
-                        incoming_mp,
-                        self.current_run.get("last_mp") if self.current_run else None,
-                        parsed.get("time"),
-                    )
-                    return events
-                # HARD-06 (#62): observe the invariant against the
-                # CLOSED run's `wk₀` BEFORE `_open_run` re-anchors,
-                # so the observability reference is the anchor the
-                # packet was expected to share — the one whose 2 m²
-                # drift silently killed an afternoon in the review
-                # fixture. Post `_open_run`, subsequent packets sit
-                # under the fresh anchor and are within tolerance;
-                # persistent drift here is structurally impossible.
-                self._observe_invariant_deviation(parsed)
-                self._open_run(parsed)
-                events.append(self._event_run_started())
 
         # HARD-18 (#117): seed a provisional run from its first accepted
         # type-2. The run was opened at the vs=4 activation edge with all
@@ -725,14 +736,11 @@ class RunTracker:
 
         self.vehicle_state = vs
 
-        # HARD-18: eager session start. Once `state == RUNNING` this
-        # condition is structurally false, so a repeated vs=4 or a
-        # 4→5→4 wobble cannot re-open (dedupe is free, no flag needed).
-        if vs == VS_MOWING and self.state in (
-            STATE_IDLE,
-            STATE_COMPLETED,
-            STATE_INTERRUPTED,
-        ):
+        # HARD-18: eager session start. HARD-20 (#122): the three terminal
+        # origins collapsed to `IDLE`, so this is a single equality test.
+        # Once `state == RUNNING` it is structurally false, so a repeated
+        # vs=4 or a 4→5→4 wobble cannot re-open (dedupe is free, no flag).
+        if vs == VS_MOWING and self.state == STATE_IDLE:
             self._open_provisional_run(time_ms)
             events.append(self._event_run_started())
             return events
@@ -1425,9 +1433,10 @@ class RunTracker:
         session_area: float | None = None
         if last_sub is not None and sub0 is not None:
             session_area = last_sub - sub0
-        self.state = (
-            STATE_COMPLETED if result == RESULT_COMPLETED else STATE_INTERRUPTED
-        )
+        # HARD-20 (#122): a close transitions the machine to IDLE; the
+        # completed/interrupted distinction lives in `result` (the record
+        # below), never in resting state. Zero other diff in `_close_run`.
+        self.state = STATE_IDLE
         self._interrupt_timer_started_at = None
         return Event(
             kind=EVENT_RUN_FINISHED,
@@ -1613,7 +1622,21 @@ class RunTracker:
         """
         if snap.get("version") != SNAPSHOT_VERSION:
             return False
-        self.state = snap.get("state", STATE_IDLE)
+        state = snap.get("state", STATE_IDLE)
+        # MIGRATION(raoul.27): SPIKE-03 outcome B (#115/#122) removed the
+        # terminal resting states; snapshots written ≤ raoul.26 may still
+        # carry them. Dead-vocabulary translation — never raise. Retire only
+        # after a post-upgrade Store save is VERIFIED ON DISK (state ∈
+        # current vocabulary; saves fire on heartbeat/close, never at rest)
+        # — HARD-21 policy (#123).
+        if state in ("completed", "interrupted"):
+            state = STATE_IDLE
+        elif state not in (STATE_IDLE, STATE_RUNNING, STATE_PAUSED_DOCKED):
+            _LOGGER.warning(
+                "run_tracker restore: unknown state %r — mapping to idle", state
+            )
+            state = STATE_IDLE
+        self.state = state
         self.vehicle_state = snap.get("vehicle_state")
         self.current_run = snap.get("current_run")
         self._last_accepted_wk = snap.get("last_accepted_wk")

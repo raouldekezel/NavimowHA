@@ -25,9 +25,7 @@ from custom_components.navimow.run_tracker import (
     RESET_SUB_CEILING,
     RESULT_COMPLETED,
     RESULT_INTERRUPTED,
-    STATE_COMPLETED,
     STATE_IDLE,
-    STATE_INTERRUPTED,
     STATE_PAUSED_DOCKED,
     STATE_RUNNING,
     VS_DOCKED_CHARGING,
@@ -243,7 +241,7 @@ def test_bug_10_sunday_wk_reset_run_opens_via_fresh_reset_path() -> None:
     tracker = RunTracker()
 
     # Simulate yesterday's completed run leaving the cursor at 1189.34.
-    tracker.state = STATE_COMPLETED
+    tracker.state = STATE_IDLE
     tracker._last_accepted_wk = 1189.34
     tracker._last_accepted_time_ms = 1_000_000_000_000
     tracker.current_run = {
@@ -406,7 +404,7 @@ def test_vs_1_sustained_interrupts_then_new_session_on_continuation() -> None:
     events = tracker.tick()
     assert [e.kind for e in events] == [EVENT_RUN_FINISHED]
     assert events[0].payload["result"] == RESULT_INTERRUPTED
-    assert tracker.state == STATE_INTERRUPTED
+    assert tracker.state == STATE_IDLE
 
     # FEAT-06 (#54): a fresh accepted type-2 after a close opens a
     # NEW session (not a reopen). start_time = this packet's time,
@@ -464,7 +462,7 @@ def test_vs_3_base_unpowered_interrupts_after_60s() -> None:
     events = tracker.tick()
     assert [e.kind for e in events] == [EVENT_RUN_FINISHED]
     assert events[0].payload["result"] == RESULT_INTERRUPTED
-    assert tracker.state == STATE_INTERRUPTED
+    assert tracker.state == STATE_IDLE
 
 
 # --------------------------------------------------------------------- #
@@ -623,7 +621,7 @@ def test_mid_run_wk_reset_run_stays_open_deviation_warns_at_five(caplog) -> None
     # `session_area` is `sub`-only (last_sub − sub₀) — the `wk` reset
     # never touched it. sub₀ = 50, last_sub = 52 + (5 − 1) × 3 = 64.
     assert payload["session_area"] == 14.0
-    assert tracker.state == STATE_INTERRUPTED
+    assert tracker.state == STATE_IDLE
 
     # Next session (fresh reset below the ceiling) opens cleanly with
     # its own anchor.
@@ -755,7 +753,7 @@ def test_mp_100_plus_dock_closes_run_completed() -> None:
     finishes = [e for e in events if e.kind == EVENT_RUN_FINISHED]
     assert len(finishes) == 1
     assert finishes[0].payload["result"] == RESULT_COMPLETED
-    assert tracker.state == STATE_COMPLETED
+    assert tracker.state == STATE_IDLE
 
 
 # --------------------------------------------------------------------- #
@@ -911,7 +909,7 @@ def test_completed_run_ignores_trailing_echo_packets() -> None:
         ],
     )
     tracker.process_vehicle_state(VS_DOCKED_CHARGING)
-    assert tracker.state == STATE_COMPLETED
+    assert tracker.state == STATE_IDLE
 
     # Three echo packets — same sub/mp, only time advancing.
     echo_events = _feed(
@@ -930,7 +928,7 @@ def test_completed_run_ignores_trailing_echo_packets() -> None:
         ],
     )
     assert echo_events == []
-    assert tracker.state == STATE_COMPLETED
+    assert tracker.state == STATE_IDLE
 
 
 def test_interrupted_run_reopens_only_on_strict_progress() -> None:
@@ -956,7 +954,7 @@ def test_interrupted_run_reopens_only_on_strict_progress() -> None:
     tracker.process_vehicle_state(VS_DOCKED_IDLE)
     clock.advance(INTERRUPT_SUSTAIN_SECONDS + 1)
     tracker.tick()  # fires INTERRUPTED
-    assert tracker.state == STATE_INTERRUPTED
+    assert tracker.state == STATE_IDLE
 
     # Echo of the closing packet — same sub/mp, later time. Must NOT
     # reopen.
@@ -975,7 +973,7 @@ def test_interrupted_run_reopens_only_on_strict_progress() -> None:
         ],
     )
     assert events == []
-    assert tracker.state == STATE_INTERRUPTED
+    assert tracker.state == STATE_IDLE
 
 
 # --------------------------------------------------------------------- #
@@ -1589,7 +1587,7 @@ def test_benign_paths_do_not_consult_invariant_deviation() -> None:
         ],
     )
     tracker.process_vehicle_state(VS_DOCKED_CHARGING)
-    assert tracker.state == STATE_COMPLETED
+    assert tracker.state == STATE_IDLE
     assert tracker.counters["invariant_deviations_observed"] == 0
 
     # Robot leaves the dock (RUN pressed). HARD-18 (#117): vs=4 from a

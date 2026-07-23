@@ -42,8 +42,7 @@ from custom_components.navimow.run_tracker import (
     MP_PARTIAL_THRESHOLD,
     RESULT_COMPLETED,
     RESULT_INTERRUPTED,
-    STATE_COMPLETED,
-    STATE_INTERRUPTED,
+    STATE_IDLE,
     STATE_PAUSED_DOCKED,
     STATE_RUNNING,
     VS_DOCKED_CHARGING,
@@ -130,7 +129,7 @@ def test_mp_100_then_dock_arrival_closes_completed() -> None:
     finishes = [e for e in events if e.kind == EVENT_RUN_FINISHED]
     assert len(finishes) == 1
     assert finishes[0].payload["result"] == RESULT_COMPLETED
-    assert tracker.state == STATE_COMPLETED
+    assert tracker.state == STATE_IDLE
 
 
 def test_dock_first_then_mp_100_closes_completed() -> None:
@@ -160,7 +159,7 @@ def test_dock_first_then_mp_100_closes_completed() -> None:
     finishes = [e for e in events if e.kind == EVENT_RUN_FINISHED]
     assert len(finishes) == 1
     assert finishes[0].payload["result"] == RESULT_COMPLETED
-    assert tracker.state == STATE_COMPLETED
+    assert tracker.state == STATE_IDLE
 
 
 # --------------------------------------------------------------------- #
@@ -269,7 +268,7 @@ def test_mp_99_plus_cmp_10000_closes_completed() -> None:
     finishes = [e for e in events if e.kind == EVENT_RUN_FINISHED]
     assert len(finishes) == 1
     assert finishes[0].payload["result"] == RESULT_COMPLETED
-    assert tracker.state == STATE_COMPLETED
+    assert tracker.state == STATE_IDLE
 
 
 def test_mp_100_is_the_first_completing_value() -> None:
@@ -335,7 +334,7 @@ def test_fast_path_preempts_sustained_timer_when_user_unpauses() -> None:
     finishes = [e for e in events if e.kind == EVENT_RUN_FINISHED]
     assert len(finishes) == 1
     assert finishes[0].payload["result"] == RESULT_COMPLETED
-    assert tracker.state == STATE_COMPLETED
+    assert tracker.state == STATE_IDLE
 
 
 def test_sustained_timer_labels_completed_via_restore_race() -> None:
@@ -371,7 +370,7 @@ def test_sustained_timer_labels_completed_via_restore_race() -> None:
     finishes = [e for e in events if e.kind == EVENT_RUN_FINISHED]
     assert len(finishes) == 1
     assert finishes[0].payload["result"] == RESULT_COMPLETED
-    assert restored.state == STATE_COMPLETED
+    assert restored.state == STATE_IDLE
 
 
 def test_sustained_timer_still_labels_interrupted_below_threshold() -> None:
@@ -391,7 +390,7 @@ def test_sustained_timer_still_labels_interrupted_below_threshold() -> None:
     finishes = [e for e in events if e.kind == EVENT_RUN_FINISHED]
     assert len(finishes) == 1
     assert finishes[0].payload["result"] == RESULT_INTERRUPTED
-    assert tracker.state == STATE_INTERRUPTED
+    assert tracker.state == STATE_IDLE
 
 
 def test_sustained_timer_labels_interrupted_on_mp_99_below_cmp() -> None:
@@ -413,7 +412,7 @@ def test_sustained_timer_labels_interrupted_on_mp_99_below_cmp() -> None:
     finishes = [e for e in events if e.kind == EVENT_RUN_FINISHED]
     assert len(finishes) == 1
     assert finishes[0].payload["result"] == RESULT_INTERRUPTED
-    assert tracker.state == STATE_INTERRUPTED
+    assert tracker.state == STATE_IDLE
 
 
 def test_sustained_timer_labels_completed_on_mp_99_cmp_10000() -> None:
@@ -445,7 +444,7 @@ def test_sustained_timer_labels_completed_on_mp_99_cmp_10000() -> None:
     finishes = [e for e in events if e.kind == EVENT_RUN_FINISHED]
     assert len(finishes) == 1
     assert finishes[0].payload["result"] == RESULT_COMPLETED
-    assert restored.state == STATE_COMPLETED
+    assert restored.state == STATE_IDLE
 
 
 # --------------------------------------------------------------------- #
@@ -541,12 +540,12 @@ def test_snapshot_after_bug_09_close_survives_restore() -> None:
     source = RunTracker()
     _open_at(source, mp=100)
     source.process_vehicle_state(VS_DOCKED_CHARGING)
-    assert source.state == STATE_COMPLETED
+    assert source.state == STATE_IDLE
 
     snap = source.snapshot()
     restored = RunTracker()
     assert restored.restore(snap) is True
-    assert restored.state == STATE_COMPLETED
+    assert restored.state == STATE_IDLE
 
     # An echo packet (same mp, same sub, only time fresher) must NOT
     # reopen.
@@ -563,4 +562,4 @@ def test_snapshot_after_bug_09_close_survives_restore() -> None:
         },
     )
     assert events == []
-    assert restored.state == STATE_COMPLETED
+    assert restored.state == STATE_IDLE
