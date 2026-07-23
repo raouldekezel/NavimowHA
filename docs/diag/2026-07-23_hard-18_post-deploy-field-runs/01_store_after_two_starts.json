@@ -1,0 +1,48 @@
+{
+  "_comment": "HARD-18 (#117) post-deploy field validation on NavimowHA-v1.1.0-raoul.26. Robot i210 LiDAR Pro. Serial redacted. Times are firmware epoch-ms (UTC; local offset +02:00). Two manual starts: (essai-1) seeded-then-interrupted after a single task type-2; (essai-2) immediate return-to-dock aborted start.",
+  "store_file": "navimow.REDACTED-ROBOT-SERIAL.run_tracker",
+  "tracker_counters": {
+    "wk_regressions_observed": 2,
+    "invariant_deviations_observed": 1,
+    "strict_progress_rejections": 0,
+    "aborted_starts_committed": 1
+  },
+  "tracker_drops": {
+    "pending_reset_holds": 1
+  },
+  "tracker_state_after": "interrupted",
+  "tracker_current_run_residue": {
+    "start_time": 1784821538919,
+    "provisional": true,
+    "zones": [],
+    "sub0": null,
+    "last_mp": null
+  },
+  "essai_1_seeded_then_interrupted": {
+    "result": "interrupted",
+    "start_time": 1784819886536,
+    "end_time": 1784819964497,
+    "duration_ms": 77961,
+    "session_area": 0.0,
+    "mow_start_type": 1,
+    "zones": [
+      {
+        "boundary_id": 1,
+        "first_time": 1784819964497,
+        "last_time": 1784819964497,
+        "cmp_max": 1701,
+        "sub_entry": 41.28,
+        "sub_exit": 41.28
+      }
+    ]
+  },
+  "essai_2_aborted_start_immediate_return": {
+    "result": "interrupted",
+    "start_time": 1784821538919,
+    "end_time": 1784821593143,
+    "duration_ms": 54224,
+    "session_area": null,
+    "mow_start_type": null,
+    "zones": []
+  }
+}
