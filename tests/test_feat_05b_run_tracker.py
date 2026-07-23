@@ -30,9 +30,9 @@ from custom_components.navimow.run_tracker import (
     STATE_RUNNING,
     VS_DOCKED_CHARGING,
     VS_DOCKED_IDLE,
-    VS_DOCKED_UNPOWERED,
     VS_MAPPING,
     VS_MOWING,
+    VS_STOPPED,
     VS_TRANSIENT,
     WK_REGRESSION_STREAK_TO_WARN,
     RunTracker,
@@ -349,7 +349,10 @@ def test_synthetic_vs_2_pause_and_resume_bracket() -> None:
     assert tracker.tick() == []
     assert tracker.state == STATE_PAUSED_DOCKED
 
-    # Fresh type-2 with sub ≥ last → resume, same run.
+    # Resume: the robot physically leaves the dock (departure evidence
+    # vs=4, HARD-19 §3 #120), then a fresh type-2 with sub ≥ last continues
+    # the same run.
+    tracker.process_vehicle_state(VS_MOWING)
     events = _feed(
         tracker,
         [
@@ -430,15 +433,18 @@ def test_vs_1_sustained_interrupts_then_new_session_on_continuation() -> None:
 
 
 # --------------------------------------------------------------------- #
-# 6. vs=3 base-loss mid-pause interrupts after 60 s                     #
+# 6. vs=3 (VS_STOPPED) is inert — never interrupts (HARD-19 §2, #120)    #
 # --------------------------------------------------------------------- #
 
 
-def test_vs_3_base_unpowered_interrupts_after_60s() -> None:
-    """`vs=3` = docked-but-base-unpowered. The base cannot recharge the
-    battery, so this is equivalent to `vs=1` for interruption purposes
-    — the BUG-04 pathological case Fable pointed out. The timer must
-    arm and fire at the sustained threshold.
+def test_vs_3_stopped_is_inert_never_interrupts() -> None:
+    """HARD-19 §2 (#120) inverts the old `vs=3` sustained-interrupt path.
+    MAP-01 (2026-07-07) established `vs=3` (VS_STOPPED) as a generic
+    stopped state a real user pause off-dock emits, so it is no longer
+    treated as docked: it does not move the open run to PAUSED_DOCKED and
+    does not arm the sustained-interrupt timer. The run stays RUNNING and
+    open indefinitely on `vs=3` alone — a later real dock or departure
+    resolves it.
     """
     clock = FakeClock()
     tracker = RunTracker(clock=clock)
@@ -455,14 +461,12 @@ def test_vs_3_base_unpowered_interrupts_after_60s() -> None:
             }
         ],
     )
-    tracker.process_vehicle_state(VS_DOCKED_UNPOWERED)
-    assert tracker.state == STATE_PAUSED_DOCKED
+    tracker.process_vehicle_state(VS_STOPPED)
+    assert tracker.state == STATE_RUNNING  # inert — not PAUSED_DOCKED
 
     clock.advance(INTERRUPT_SUSTAIN_SECONDS + 1)
-    events = tracker.tick()
-    assert [e.kind for e in events] == [EVENT_RUN_FINISHED]
-    assert events[0].payload["result"] == RESULT_INTERRUPTED
-    assert tracker.state == STATE_IDLE
+    assert tracker.tick() == []  # no timer armed → no close
+    assert tracker.state == STATE_RUNNING
 
 
 # --------------------------------------------------------------------- #
@@ -496,7 +500,9 @@ def test_vs_6_paused_holds_docked_indefinitely() -> None:
     assert tracker.tick() == []
     assert tracker.state == STATE_PAUSED_DOCKED
 
-    # Resume via fresh type-2 (sub ≥ last).
+    # Resume: the robot leaves the dock (departure evidence vs=4, HARD-19
+    # §3 #120), then a fresh type-2 (sub ≥ last) continues the same run.
+    tracker.process_vehicle_state(VS_MOWING)
     events = _feed(
         tracker,
         [

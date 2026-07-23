@@ -206,8 +206,10 @@ def test_fresh_type2_at_mp_99_during_recharge_pause_resumes_run() -> None:
     tracker.process_vehicle_state(VS_DOCKED_CHARGING)
     assert tracker.state == STATE_PAUSED_DOCKED
 
-    # A follow-up type-2 with strict progress on `sub` (typical of the
-    # first packet emitted after the robot leaves the dock).
+    # The robot leaves the dock (departure evidence vs=4, HARD-19 §3 #120),
+    # then a follow-up type-2 with strict progress on `sub` (the first
+    # packet emitted after leaving the dock) resumes the same run.
+    tracker.process_vehicle_state(VS_MOWING)
     events = _process(tracker, _pkt(mp=99, sub=200.5, t=2_000))
     assert tracker.state == STATE_RUNNING
     # No close event fired anywhere in this continuation.

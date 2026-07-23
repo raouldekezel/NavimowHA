@@ -36,6 +36,7 @@ from custom_components.navimow.run_tracker import (
     VS_DOCKED_IDLE,
     VS_MOWING,
     VS_RETURNING,
+    VS_STOPPED,
     RunTracker,
 )
 from custom_components.navimow.sensor import SENSOR_DESCRIPTIONS
@@ -264,6 +265,40 @@ def test_run_state_returning_takes_precedence_over_starting() -> None:
     coord.vehicle_state = VS_RETURNING
     assert coord.run_tracker.is_provisional is True
     assert _desc("current_run_state").value_fn(coord) == "returning"
+
+
+def test_run_state_running_vs_3_reads_paused() -> None:
+    """HARD-19 §5 (#120) display pin: an open (seeded, RUNNING) run whose
+    live `vehicle_state` is `vs = 3` (VS_STOPPED — a user pause) renders
+    « En pause ». The tracker machine is untouched (vs = 3 is inert there);
+    only the display ladder maps the physical-now stopped state to the
+    existing `paused` enum key.
+    """
+    coord = _make_coordinator()
+    _feed_type2(
+        coord,
+        {
+            "type": 2,
+            "mowingPercentage": 40,
+            "subtotalArea": "100.0",
+            "mowingWeekArea": "100.0",
+            "time": 1_000_000_000_000,
+        },
+    )
+    assert coord.run_tracker.state == STATE_RUNNING
+    coord.vehicle_state = VS_STOPPED
+    assert _desc("current_run_state").value_fn(coord) == "paused"
+
+
+def test_run_state_vs_3_paused_takes_precedence_over_starting() -> None:
+    """HARD-19 §5 (#120) display pin: a provisional start stalled at
+    `vs = 3` reads « En pause », not « Démarrage » — the physical-now
+    stopped label outranks the provisional flag (below vs = 5)."""
+    coord = _make_coordinator()
+    coord.run_tracker.process_vehicle_state(VS_MOWING, time_ms=1_000_000_000_000)
+    assert coord.run_tracker.is_provisional is True
+    coord.vehicle_state = VS_STOPPED
+    assert _desc("current_run_state").value_fn(coord) == "paused"
 
 
 # --------------------------------------------------------------------- #

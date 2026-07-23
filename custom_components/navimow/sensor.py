@@ -35,7 +35,7 @@ from .const import (
     SIGNAL_ZONE_NAMES_UPDATED,
 )
 from .coordinator import NavimowCoordinator
-from .run_tracker import STATE_PAUSED_DOCKED, STATE_RUNNING, VS_RETURNING
+from .run_tracker import STATE_PAUSED_DOCKED, STATE_RUNNING, VS_RETURNING, VS_STOPPED
 from .zone_registry import ZoneRecord
 
 
@@ -108,6 +108,11 @@ def _run_state_display(c: NavimowCoordinator) -> str:
     """Map tracker (state, vehicle_state) to the display enum."""
     ts = c.run_tracker.state
     if ts == STATE_RUNNING:
+        # HARD-19 §5 (#120) precedence ladder, display-level only (the
+        # machine is untouched — vs = 3 is inert there): the physical-now
+        # labels outrank the provisional flag.
+        #   vs = 5 → « Retour » > vs = 3 → « En pause » > provisional →
+        #   « Démarrage » > « En cours ».
         # `returning` = run open AND vs=5 (docked in MAP-01). Operator
         # arbitration (#117, 2026-07-23): the vs=5 → returning split is
         # evaluated BEFORE the provisional check — an aborting start that
@@ -118,6 +123,12 @@ def _run_state_display(c: NavimowCoordinator) -> str:
         # returning-to-dock.
         if c.vehicle_state == VS_RETURNING:
             return "returning"
+        # HARD-19 §5 (#120): a vs = 3 (VS_STOPPED) pause reads « En pause »
+        # even on an open/provisional run — a start stalled at vs = 3 is
+        # paused, not starting. Reuses the existing `paused` enum key
+        # (PAUSED_DOCKED already maps there). Outranks the provisional flag.
+        if c.vehicle_state == VS_STOPPED:
+            return "paused"
         # HARD-18 (#117): the provisional start window (a run opened on
         # the vs=4 activation edge, not yet seeded by a type-2) renders
         # as `starting` — the robot is exiting the dock / navigating to

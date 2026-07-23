@@ -47,10 +47,10 @@ from custom_components.navimow.run_tracker import (
     STATE_RUNNING,
     VS_DOCKED_CHARGING,
     VS_DOCKED_IDLE,
-    VS_DOCKED_UNPOWERED,
     VS_MAPPING,
     VS_MOWING,
     VS_RETURNING,
+    VS_STOPPED,
     RunTracker,
 )
 
@@ -103,9 +103,8 @@ def test_constants_reflect_design_decision() -> None:
     assert MP_COMPLETION_THRESHOLD == 100
     assert MP_PARTIAL_THRESHOLD == 99
     assert CMP_ZONE_COMPLETE_THRESHOLD == 10000
-    assert DOCKED_NOT_USER_PAUSED == frozenset(
-        {VS_DOCKED_IDLE, VS_DOCKED_CHARGING, VS_DOCKED_UNPOWERED}
-    )
+    # HARD-19 §2 (#120): vs=3 removed — it is not a dock state.
+    assert DOCKED_NOT_USER_PAUSED == frozenset({VS_DOCKED_IDLE, VS_DOCKED_CHARGING})
 
 
 # --------------------------------------------------------------------- #
@@ -142,8 +141,9 @@ def test_dock_first_then_mp_100_closes_completed() -> None:
     tracker.process_vehicle_state(VS_DOCKED_CHARGING)
     assert tracker.state == STATE_PAUSED_DOCKED
 
-    # A fresh type-2 with strict progress bumps mp to 100 — reopens the
-    # RUNNING state (resume from pause) and immediately closes.
+    # A fresh type-2 bumps mp to 100 while still docked (vehicle_state=2 ∉
+    # departure {4,5}, so HARD-19 §3 does not resume) — the packet updates
+    # the accumulators and the completion predicate closes it in place.
     events = _process(
         tracker,
         {
@@ -163,7 +163,7 @@ def test_dock_first_then_mp_100_closes_completed() -> None:
 
 
 # --------------------------------------------------------------------- #
-# 3. All three docked-not-user-paused vs values complete                #
+# 3. The two docked resting states complete; vs=3 (stopped) does NOT     #
 # --------------------------------------------------------------------- #
 
 
@@ -177,17 +177,19 @@ def test_dock_arrival_on_vs_1_completes() -> None:
     assert finishes[0].payload["result"] == RESULT_COMPLETED
 
 
-def test_dock_arrival_on_vs_3_completes() -> None:
-    """`vs = 3` (docked, dock unpowered) qualifies too — the robot is
-    on the dock even if the dock has no power. `last_mp` is the
-    ground truth for the label.
+def test_stopped_vs_3_does_not_complete() -> None:
+    """HARD-19 §2 (#120): `vs = 3` (VS_STOPPED) is NOT a dock state —
+    MAP-01 (2026-07-07) confirmed a real user pause off-dock emits it. A
+    completed-shaped run (mp = 100) that sees `vs = 3` must therefore NOT
+    close: the robot may be paused far from the base. The run stays open
+    and the completion predicate `{1, 2}` never fires on vs = 3. Regression
+    guard for MAP-01 follow-up 2 (the off-dock completed-close hazard).
     """
     tracker = RunTracker()
     _open_at(tracker, mp=100)
-    events = tracker.process_vehicle_state(VS_DOCKED_UNPOWERED)
-    finishes = [e for e in events if e.kind == EVENT_RUN_FINISHED]
-    assert len(finishes) == 1
-    assert finishes[0].payload["result"] == RESULT_COMPLETED
+    events = tracker.process_vehicle_state(VS_STOPPED)
+    assert [e for e in events if e.kind == EVENT_RUN_FINISHED] == []
+    assert tracker.state == STATE_RUNNING  # inert — no transition, no close
 
 
 # --------------------------------------------------------------------- #

@@ -37,10 +37,10 @@ from custom_components.navimow.run_tracker import (
     STATE_RUNNING,
     VS_DOCKED_CHARGING,
     VS_DOCKED_IDLE,
-    VS_DOCKED_UNPOWERED,
     VS_MAPPING,
     VS_MOWING,
     VS_RETURNING,
+    VS_STOPPED,
     RunTracker,
 )
 
@@ -212,8 +212,11 @@ def test_repeated_vs4_and_wobble_do_not_refire() -> None:
 
 
 @pytest.mark.parametrize(
+    # HARD-19 §2 (#120): vs=3 (VS_STOPPED) is not a dock state, so it no
+    # longer arms the provisional-abort countdown — see the dedicated
+    # inert-vs-3 pin below. Only true dock states {1, 2, 6} abort a start.
     "dock_vs",
-    [VS_DOCKED_IDLE, VS_DOCKED_CHARGING, VS_DOCKED_UNPOWERED, VS_MAPPING],
+    [VS_DOCKED_IDLE, VS_DOCKED_CHARGING, VS_MAPPING],
 )
 def test_aborted_start_commits_minimal_interrupted_entry(dock_vs: int) -> None:
     clk = _FakeClock()
@@ -246,6 +249,29 @@ def test_aborted_start_commits_minimal_interrupted_entry(dock_vs: int) -> None:
     assert payload["mow_start_type"] is None
     assert tracker.state == STATE_IDLE
     assert tracker.counters["aborted_starts_committed"] == 1
+
+
+def test_provisional_start_stalled_at_vs_3_stays_open_no_abort() -> None:
+    """HARD-19 §2 (#120): a provisional start that stalls at `vs = 3`
+    (VS_STOPPED — a user pause while wandering off-dock) does NOT arm the
+    abort countdown. vs = 3 is evidence of nothing: the provisional run
+    rides through as RUNNING, its timer un-armed, and never commits an
+    aborted-start entry from a stopped state alone.
+    """
+    clk = _FakeClock()
+    tracker = RunTracker(clock=clk)
+    tracker.process_vehicle_state(VS_MOWING, time_ms=_T0)
+    assert tracker.is_provisional is True
+
+    ev = tracker.process_vehicle_state(VS_STOPPED, time_ms=_T0 + 1_000)
+    assert ev == []
+    assert tracker.state == STATE_RUNNING  # inert — not PAUSED_DOCKED
+
+    # No countdown armed → no abort even long past the sustain window.
+    clk.advance(INTERRUPT_SUSTAIN_SECONDS + 5)
+    assert tracker.tick() == []
+    assert tracker.state == STATE_RUNNING
+    assert tracker.is_provisional is True
 
 
 def test_seeded_run_recharge_does_not_abort() -> None:
@@ -365,9 +391,7 @@ def test_bug06_sentinel_first_packet_seeds_sub0_zero() -> None:
 # --------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize(
-    "dock_vs", [VS_DOCKED_IDLE, VS_DOCKED_CHARGING, VS_DOCKED_UNPOWERED]
-)
+@pytest.mark.parametrize("dock_vs", [VS_DOCKED_IDLE, VS_DOCKED_CHARGING])
 def test_no_completion_while_provisional(dock_vs: int) -> None:
     tracker = RunTracker()
     tracker.process_vehicle_state(VS_MOWING, time_ms=_T0)

@@ -7,20 +7,24 @@ seeded run's `end_time` still came from the last accepted type-2, so the
 *return* transit (last mow packet → dock) was excluded — an
 outbound-counted / return-dropped asymmetry. HARD-19 stamps the
 dock-arrival type-1 `time` on `current_run["dock_arrival_time"]` and
-`_close_run` reads `end = max(dock_arrival, last_time)`, making a
-session's duration exactly FEAT-06's activation → dock arrival, both
-edges type-1-stamped.
+`_close_run` reads `end = dock_arrival_time if present else last_time`
+(strict, no `max()` floor), making a session's duration exactly
+FEAT-06's activation → dock arrival, both edges type-1-stamped.
 
-Adopted design: issue #120 body + operator clarification (2026-07-23) +
-Fable brief v2 / v2.1. The stamp lives in the run (rides the snapshot
-deepcopy, no `SNAPSHOT_VERSION` bump), set on the RUNNING → PAUSED_DOCKED
-edge, frozen through the docked idle↔charge flips, dropped on resume,
-and floored by `last_time` so a session never ends before its last
-accepted packet (the one BUG-09 #89 dock-first-then-`mp = 100` shape).
+Adopted design: the consolidated normative body of issue #120 (2026-07-23)
+— operator arbitrations ×3 + Fable brief v2/v2.1 + Sol's PR-#126 review.
+The stamp lives in the run (rides the snapshot deepcopy, no
+`SNAPSHOT_VERSION` bump), set on the RUNNING → PAUSED_DOCKED edge (dock
+evidence `{1, 2, 6}`), frozen through the docked idle↔charge flips, and
+cleared ONLY on departure evidence (`vehicle_state ∈ {4, 5}`). §1 makes
+the end strict: a late BUG-09 (#89) completing flush received while still
+docked completes the run at the *dock arrival*, not the packet (family 6,
+inverted). §2 corrects the dock vocabulary machine-wide: `vs = 3`
+(VS_STOPPED) is not docked — it is inert (evidence of nothing).
 
-Tests map to the brief's eight families plus the v2.1 ordering pins
-O1/O2 (observable behaviour only — the tracker/coordinator API,
-`caplog`, snapshot/restore; no source introspection).
+Tests map to the brief's families plus the §2/§5/§6 pins (observable
+behaviour only — the tracker/coordinator API, `caplog`, snapshot/restore;
+no source introspection).
 """
 
 from __future__ import annotations
@@ -42,9 +46,10 @@ from custom_components.navimow.run_tracker import (
     STATE_RUNNING,
     VS_DOCKED_CHARGING,
     VS_DOCKED_IDLE,
-    VS_DOCKED_UNPOWERED,
     VS_MAPPING,
     VS_MOWING,
+    VS_RETURNING,
+    VS_STOPPED,
     RunTracker,
 )
 
@@ -109,9 +114,7 @@ def _seed_running(tracker: RunTracker, *, start: int = _T0) -> None:
 # ===================================================================== #
 
 
-@pytest.mark.parametrize(
-    "dock_vs", [VS_DOCKED_IDLE, VS_DOCKED_CHARGING, VS_DOCKED_UNPOWERED]
-)
+@pytest.mark.parametrize("dock_vs", [VS_DOCKED_IDLE, VS_DOCKED_CHARGING])
 def test_pin_o1_fast_completion_ends_strictly_at_dock_arrival(dock_vs: int) -> None:
     """Pin O1 (type-1 first, the immediate-completion path). After mowing
     to `mp = 100` off-dock, a SINGLE `process_vehicle_state(vs, time_ms=Y)`
@@ -120,8 +123,10 @@ def test_pin_o1_fast_completion_ends_strictly_at_dock_arrival(dock_vs: int) -> N
     input delivered. The close cannot fall back to the packet cursor
     because the type-1 that closes is the type-1 that stamps.
 
-    `vs = 6` (isMapping) is excluded from the completion set (BUG-09 #89),
-    so it is covered separately below, not here.
+    Parametrized over the completion predicate `vs ∈ {1, 2}` (HARD-19 §2,
+    #120). `vs = 6` (isMapping) is excluded from the completion set (BUG-09
+    #89) and `vs = 3` (VS_STOPPED) is not a dock state — both are covered
+    separately below.
     """
     tracker = RunTracker()
     _seed_running(tracker)
@@ -140,6 +145,30 @@ def test_pin_o1_fast_completion_ends_strictly_at_dock_arrival(dock_vs: int) -> N
     assert p["start_time"] == _T0
     assert p["duration_ms"] == dock_y - _T0
     assert tracker.state == STATE_IDLE
+
+
+def test_pin_o1_no_dock_leg_vs_3_stopped_is_inert() -> None:
+    """The former `vs = 3` leg of O1, now the explicit no-dock pin (HARD-19
+    §2, #120). A completed-shaped run (mp = 100) that sees `vs = 3`
+    (VS_STOPPED — a possible off-dock user pause) produces **no stamp, no
+    transition, no timer, no close**: vs = 3 is evidence of nothing. The
+    run stays open, exactly as raoul.28 would leave a non-dock pause.
+    """
+    clk = _FakeClock()
+    tracker = RunTracker(clock=clk)
+    _seed_running(tracker)
+    _feed_t2(tracker, mp=100, cmp=10000, sub=40.0, boundary=1, time=_T0 + 2_000)
+
+    closed = tracker.process_vehicle_state(VS_STOPPED, time_ms=_T0 + 5_000)
+    assert closed == []  # no close
+    assert tracker.state == STATE_RUNNING  # no transition
+    assert tracker.current_run["dock_arrival_time"] is None  # no stamp
+    assert tracker._interrupt_timer_started_at is None  # no timer armed
+
+    # And the sustained timer cannot fire on vs = 3 either.
+    clk.advance(INTERRUPT_SUSTAIN_SECONDS + 5)
+    assert tracker.tick() == []
+    assert tracker.state == STATE_RUNNING
 
 
 def test_vs6_stamps_arrival_but_holds_then_vs1_completes_at_the_vs6_edge() -> None:
@@ -408,16 +437,19 @@ def test_legacy_snapshot_without_key_falls_back_to_last_time_no_raise() -> None:
 
 
 # ===================================================================== #
-# Family 6 — BUG-09 dock-first-then-mp=100: the max(stamp, packet) floor  #
+# Family 6 (INVERTED) — dock-first-then-mp=100 ends at the dock arrival   #
 # ===================================================================== #
 
 
-def test_bug09_dock_first_then_mp100_end_is_floored_to_the_packet() -> None:
-    """The one shape that exercises the floor. The robot docks at Y with
+def test_bug09_dock_first_then_mp100_ends_at_dock_not_the_flush_packet() -> None:
+    """Family 6, inverted by §1/§3 (#120). The robot docks at Y with
     `mp < 100` (holds), then the completing type-2 arrives *after* the dock
-    arrival. It resumes-and-completes in the same call; its packet time
-    postdates the dock, so `end = max(dock, packet) = packet` — a session
-    never ends before its last accepted data (§2b floor, #89).
+    arrival while the robot is STILL docked (`vehicle_state = 2 ∉ departure
+    {4, 5}`). Under §3 that packet does NOT resume and does NOT clear the
+    stamp — it only updates accumulators and completes the run. Under §1
+    the end is the strict dock arrival Y, NOT the flush packet (the late
+    completion flush is bookkeeping emitted at task teardown; its `time` is
+    emission time, not session activity). No `max()` floor.
     """
     tracker = RunTracker()
     _seed_running(tracker)
@@ -432,9 +464,9 @@ def test_bug09_dock_first_then_mp100_end_is_floored_to_the_packet() -> None:
     assert [e.kind for e in events] == [EVENT_RUN_FINISHED]
     p = events[0].payload
     assert p["result"] == RESULT_COMPLETED
-    assert p["end_time"] == packet
-    assert p["end_time"] == max(dock_y, packet)  # the floor, made explicit
-    assert p["duration_ms"] == packet - _T0
+    assert p["end_time"] == dock_y  # the dock arrival, NOT the flush packet
+    assert p["end_time"] != packet
+    assert p["duration_ms"] == dock_y - _T0
 
 
 # ===================================================================== #
@@ -515,6 +547,209 @@ def test_last_sub_gating_baseline_unaffected_by_the_stamp() -> None:
 
 
 # ===================================================================== #
+# §2 inertness — vs=3 (VS_STOPPED) touches nothing at the dock            #
+# ===================================================================== #
+
+
+def test_inertness_pin_2_3_2_flip_at_dock_touches_nothing() -> None:
+    """The MAP-01 `2 → 3 → 2` flip catalogued at the dock (2.2 s). Docked
+    with a stamp at Y, a transient `vs = 3` (VS_STOPPED) passes straight
+    through: the stamp stays Y, the timer context is untouched, and the run
+    is neither resumed nor closed. vs = 3 is evidence of nothing (§2, #120).
+    """
+    clk = _FakeClock()
+    tracker = RunTracker(clock=clk)
+    _seed_running(tracker)
+
+    dock_y = _T0 + 3_000
+    tracker.process_vehicle_state(VS_DOCKED_CHARGING, time_ms=dock_y)  # vs=2 dock
+    assert tracker.state == STATE_PAUSED_DOCKED
+    assert tracker.current_run["dock_arrival_time"] == dock_y
+    timer_before = tracker._interrupt_timer_started_at
+
+    # vs=3 blip — inert.
+    ev = tracker.process_vehicle_state(VS_STOPPED, time_ms=dock_y + 1_000)
+    assert ev == []
+    assert tracker.state == STATE_PAUSED_DOCKED  # not resumed, not closed
+    assert tracker.current_run["dock_arrival_time"] == dock_y  # stamp unmoved
+    assert tracker._interrupt_timer_started_at == timer_before  # timer intact
+
+    # Back to vs=2 — still the same dock, still stamped at Y.
+    tracker.process_vehicle_state(VS_DOCKED_CHARGING, time_ms=dock_y + 2_200)
+    assert tracker.state == STATE_PAUSED_DOCKED
+    assert tracker.current_run["dock_arrival_time"] == dock_y  # never restamped
+
+
+# ===================================================================== #
+# §3/§6 departure-ordering — type-2 before the off-dock type-1           #
+# ===================================================================== #
+
+
+def test_departure_ordering_type2_before_offdock_type1() -> None:
+    """A continuation type-2 delivered while `vehicle_state` is still docked
+    does NOT resume or clear the stamp (§3 departure gate). The timer is
+    safe: once the off-dock `vs = 4` type-1 lands, `tick()` re-checks the
+    live `vehicle_state` and will not fire while off-dock. The later
+    departure edge enables the resume — the next continuation type-2 (now
+    with `vehicle_state ∈ {4, 5}`) resumes the run and clears the stamp.
+    """
+    clk = _FakeClock()
+    tracker = RunTracker(clock=clk)
+    _seed_running(tracker)
+
+    dock_y = _T0 + 3_000
+    tracker.process_vehicle_state(VS_DOCKED_IDLE, time_ms=dock_y)  # vs=1 dock, arms
+    assert tracker.state == STATE_PAUSED_DOCKED
+    assert tracker.current_run["dock_arrival_time"] == dock_y
+
+    # (1) type-2 arrives while STILL docked (vs=1) → no resume, no clear.
+    _feed_t2(tracker, mp=55, cmp=5500, sub=25.0, boundary=1, time=_T0 + 3_500)
+    assert tracker.state == STATE_PAUSED_DOCKED  # not resumed
+    assert tracker.current_run["dock_arrival_time"] == dock_y  # not cleared
+
+    # (2) the off-dock type-1 (vs=4). Seeded runs do not resume on the vs
+    # edge itself; it disarms the timer and updates the live vehicle_state.
+    tracker.process_vehicle_state(VS_MOWING, time_ms=_T0 + 4_000)
+    assert tracker.state == STATE_PAUSED_DOCKED
+    # Timer-safe: tick must NOT fire while physically off-dock (vs=4),
+    # even long past the sustain window.
+    clk.advance(INTERRUPT_SUSTAIN_SECONDS + 5)
+    assert tracker.tick() == []
+    assert tracker.state == STATE_PAUSED_DOCKED
+
+    # (3) the later {4,5} edge enables the resume — the next continuation
+    # type-2 (vehicle_state now 4) resumes and clears the stamp.
+    _feed_t2(tracker, mp=60, cmp=6000, sub=30.0, boundary=1, time=_T0 + 5_000)
+    assert tracker.state == STATE_RUNNING
+    assert tracker.current_run["dock_arrival_time"] is None
+
+
+def test_restored_paused_docked_with_vs_3_cannot_time_out() -> None:
+    """A snapshot taken at `PAUSED_DOCKED` with `vehicle_state = 3`
+    (reachable live: dock on {1,2,6} → a vs=3 blip leaves the state
+    PAUSED_DOCKED but vehicle_state = 3). After restore the sustained timer
+    can no longer fire on vs = 3 (not a dock state). It resolves on the next
+    real dock edge: a `vs = 1` arms the timer, and a later tick closes at
+    the frozen dock arrival.
+    """
+    dock_y = _T0 + 3_000
+    snap = {
+        "version": SNAPSHOT_VERSION,
+        "state": STATE_PAUSED_DOCKED,
+        "vehicle_state": VS_STOPPED,
+        "current_run": {
+            "start_time": _T0,
+            "mow_start_type": 0,
+            "wk0": 50.0,
+            "sub0": 10.0,
+            "last_time": _T0 + 1_000,
+            "last_sub": 40.0,
+            "last_wk": 90.0,
+            "last_mp": 50,  # below threshold → interrupted
+            "zones": [
+                {
+                    "boundary_id": 1,
+                    "first_time": _T0,
+                    "last_time": _T0 + 1_000,
+                    "cmp_max": 5000,
+                    "sub_entry": 10.0,
+                    "sub_exit": 40.0,
+                }
+            ],
+            "dock_arrival_time": dock_y,
+        },
+        "last_accepted_wk": 90.0,
+        "last_accepted_time_ms": _T0 + 1_000,
+        "drops": {"pending_reset_holds": 0},
+        "counters": {},
+    }
+    clk = _FakeClock()
+    tracker = RunTracker(clock=clk)
+    assert tracker.restore(snap) is True
+    assert tracker.state == STATE_PAUSED_DOCKED
+
+    # vs = 3 cannot arm or fire the sustained timer.
+    tracker.tick()
+    clk.advance(INTERRUPT_SUSTAIN_SECONDS + 5)
+    assert tracker.tick() == []
+    assert tracker.state == STATE_PAUSED_DOCKED
+
+    # A real dock edge (vs = 1) arms it; the next sustained tick closes at
+    # the frozen dock arrival.
+    tracker.process_vehicle_state(VS_DOCKED_IDLE, time_ms=dock_y + 10_000)
+    tracker.tick()  # arm
+    clk.advance(INTERRUPT_SUSTAIN_SECONDS + 1)
+    closed = tracker.tick()
+    assert [e.kind for e in closed] == [EVENT_RUN_FINISHED]
+    assert closed[0].payload["result"] == RESULT_INTERRUPTED
+    assert closed[0].payload["end_time"] == dock_y  # frozen dock arrival
+
+
+# ===================================================================== #
+# §6 operator regression blocks                                         #
+# ===================================================================== #
+
+
+def test_regression_vs_3_while_mowing_open_run_untouched() -> None:
+    """`vs = 3` while mowing: the run stays open, nothing armed, stamped, or
+    closed."""
+    tracker = RunTracker()
+    _seed_running(tracker)
+    _feed_t2(tracker, mp=50, cmp=5000, sub=25.0, boundary=1, time=_T0 + 2_000)
+    ev = tracker.process_vehicle_state(VS_STOPPED, time_ms=_T0 + 2_500)
+    assert ev == []
+    assert tracker.state == STATE_RUNNING
+    assert tracker.current_run["dock_arrival_time"] is None
+    assert tracker._interrupt_timer_started_at is None
+
+
+def test_regression_vs_3_then_vs_4_is_the_same_run() -> None:
+    """`vs = 3 → vs = 4`: same open run, no split."""
+    tracker = RunTracker()
+    _seed_running(tracker)
+    start = tracker.current_run["start_time"]
+    tracker.process_vehicle_state(VS_STOPPED, time_ms=_T0 + 2_000)
+    tracker.process_vehicle_state(VS_MOWING, time_ms=_T0 + 2_500)
+    assert tracker.state == STATE_RUNNING
+    assert tracker.current_run["start_time"] == start  # unchanged — same run
+
+
+def test_regression_vs_5_then_vs_1_confirms_dock_stamps_and_closes() -> None:
+    """`vs = 5 → vs ∈ {1, 2}`: the returning transit carries no stamp; the
+    confirmed dock stamps the arrival and closes normally at it."""
+    tracker = RunTracker()
+    _seed_running(tracker)
+    _feed_t2(tracker, mp=100, cmp=10000, sub=40.0, boundary=1, time=_T0 + 2_000)
+
+    tracker.process_vehicle_state(VS_RETURNING, time_ms=_T0 + 3_000)  # transit
+    assert tracker.state == STATE_RUNNING
+    assert tracker.current_run["dock_arrival_time"] is None  # no stamp on vs=5
+
+    dock_y = _T0 + 5_000
+    closed = tracker.process_vehicle_state(VS_DOCKED_IDLE, time_ms=dock_y)
+    assert [e.kind for e in closed] == [EVENT_RUN_FINISHED]
+    p = closed[0].payload
+    assert p["result"] == RESULT_COMPLETED
+    assert p["end_time"] == dock_y
+
+
+def test_regression_vs_5_then_vs_6_mapping_handling_unchanged() -> None:
+    """`vs = 5 → vs = 6`: mapping handling is unchanged — vs=6 stamps the
+    arrival and HOLDS (excluded from completion), no close during
+    consolidation."""
+    tracker = RunTracker()
+    _seed_running(tracker)
+    _feed_t2(tracker, mp=100, cmp=10000, sub=40.0, boundary=1, time=_T0 + 2_000)
+
+    tracker.process_vehicle_state(VS_RETURNING, time_ms=_T0 + 3_000)
+    y6 = _T0 + 5_000
+    ev = tracker.process_vehicle_state(VS_MAPPING, time_ms=y6)
+    assert ev == []  # held — vs=6 excluded from completion
+    assert tracker.state == STATE_PAUSED_DOCKED
+    assert tracker.current_run["dock_arrival_time"] == y6  # mapping stamps
+
+
+# ===================================================================== #
 # Pin O2 — coordinator-level: the /state topic is not a tracker input     #
 # ===================================================================== #
 
@@ -549,6 +784,8 @@ def _make_coordinator():
     coord.zone_registry = ZoneRegistry()
     coord._store = None
     coord._last_store_save_monotonic = 0.0
+    coord._last_state = None
+    coord._last_data_source = None
     coord._build_data = MagicMock(return_value={})
     coord.async_set_updated_data = MagicMock()
     return coord
@@ -602,11 +839,20 @@ def test_pin_o2_state_topic_docked_writes_nothing_then_type1_ends_at_dock() -> N
     assert tr.current_run.get("dock_arrival_time") is None
 
     # (O2) /state → docked FIRST. The /state handler is not a tracker input.
+    # Sol §4 (#120): the scheduled callback MUST actually execute — a
+    # MagicMock loop swallows `call_soon_threadsafe`, so force it to run the
+    # callback inline. No green on a swallowed callback.
+    coord.hass.loop.call_soon_threadsafe.side_effect = lambda callback, *args: callback(
+        *args
+    )
     coord._handle_state(
         DeviceStateMessage(
             device_id=_DEVICE_ID, timestamp=t + 3_000, state="isDocked", battery=80
         )
     )
+    # The callback ran (proof it was not swallowed): _update_from_state set
+    # the coordinator's last /state — yet it wrote NOTHING to the tracker.
+    assert coord._last_state is not None
     assert tr.state == STATE_RUNNING  # no transition
     assert tr.current_run is not None  # not closed
     assert tr.current_run.get("dock_arrival_time") is None  # no stamp from /state
@@ -629,3 +875,71 @@ def test_pin_o2_state_topic_docked_writes_nothing_then_type1_ends_at_dock() -> N
     assert coord.last_finished_run["result"] == RESULT_COMPLETED
     assert coord.last_finished_run["end_time"] == dock_y  # strict dock arrival
     assert coord.last_finished_run["duration_ms"] == dock_y - (t + 1_000)
+
+
+# ===================================================================== #
+# §4 — persistence on a silent (event-less) vehicle-state transition      #
+# ===================================================================== #
+
+
+def test_dock_entry_persists_even_though_no_run_event_fires() -> None:
+    """§4 (#120), coordinator-level with a fake Store hook. A dock entry
+    that closes nothing (mp < 100) emits no run event, and the heartbeat
+    save only runs while RUNNING — so the stamp used to live only in
+    memory until the eventual close. Now the silent RUNNING → PAUSED_DOCKED
+    transition schedules a Store save. A subsequent idle↔charge flip that
+    does NOT change the tracker state schedules no extra save (no
+    over-persisting).
+    """
+    coord = _make_coordinator()
+    coord._store = MagicMock()  # fake save hook — _schedule_store_save proceeds
+
+    t = 1_000_000_000_000
+    _feed_type2(
+        coord,
+        {
+            "type": 2,
+            "currentMowBoundary": 1,
+            "currentMowProgress": 5000,
+            "mowingPercentage": 50,  # below completion → dock will not close
+            "subtotalArea": "20.0",
+            "mowingWeekArea": "300.0",
+            "time": t + 1_000,
+        },
+    )
+    coord.vehicle_state = VS_MOWING  # off-dock
+    assert coord.run_tracker.state == STATE_RUNNING
+    saves_before = coord.hass.async_create_task.call_count
+
+    # Dock entry (vs=2, mp<100): no run event, but a stamp + PAUSED_DOCKED.
+    dock_y = t + 5_000
+    with patch("custom_components.navimow.coordinator.async_dispatcher_send"):
+        coord._handle_location_position(
+            {
+                "type": 1,
+                "postureX": "0.0",
+                "postureY": "0.0",
+                "vehicleState": VS_DOCKED_CHARGING,
+                "time": dock_y,
+            }
+        )
+    assert coord.run_tracker.state == STATE_PAUSED_DOCKED
+    assert coord.run_tracker.current_run["dock_arrival_time"] == dock_y
+    # A save WAS scheduled despite no run event.
+    assert coord.hass.async_create_task.call_count == saves_before + 1
+
+    # An idle↔charge flip that does not change the tracker state (still
+    # PAUSED_DOCKED) schedules no extra save.
+    saves_after_dock = coord.hass.async_create_task.call_count
+    with patch("custom_components.navimow.coordinator.async_dispatcher_send"):
+        coord._handle_location_position(
+            {
+                "type": 1,
+                "postureX": "0.0",
+                "postureY": "0.0",
+                "vehicleState": VS_DOCKED_IDLE,
+                "time": dock_y + 1_000,
+            }
+        )
+    assert coord.run_tracker.state == STATE_PAUSED_DOCKED
+    assert coord.hass.async_create_task.call_count == saves_after_dock
