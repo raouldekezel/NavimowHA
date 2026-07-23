@@ -68,8 +68,8 @@ re-anchors, so persistent drift there is structurally impossible.
 No calendar assumption survives contact with evidence: nothing here
 encodes what week (ISO Monday, Sunday, etc.) the firmware follows.
 
-State machine (BUG-09 / FEAT-06 / HARD-18 revised; HARD-20 (#122)
-revised — three states, not five).
+State machine (BUG-09 / FEAT-06 / HARD-18 / HARD-19 revised; HARD-20
+(#122) revised — three states, not five).
 
 HARD-20 (SPIKE-03 #115 outcome B): the terminal resting states are gone.
 A close is a machine transition to IDLE; the completed/interrupted
@@ -120,6 +120,25 @@ vestige gate stays armed for the whole start window). If it docks
 before any type-2 seeds it, the sustained-dock timer commits a minimal
 `interrupted` history entry (an aborted start is a session too — the
 duration includes the real dock-exit / navigation wander).
+
+HARD-19 (2026-07-23, #120): a run's `end_time` is the **dock-arrival**
+type-1 `time` — the RUNNING → PAUSED_DOCKED edge of the *final* dock —
+for every dock-closed run, mirroring HARD-18's activation-anchored
+`start_time`. A session's duration is therefore exactly FEAT-06's
+definition, **activation → dock arrival, both edges type-1-stamped**
+(HARD-18 #117 / HARD-19 #120), so the *return* transit (last mow packet
+→ dock) is now counted, closing the outbound/return asymmetry HARD-18
+opened. The stamp lives in `current_run["dock_arrival_time"]`, set on
+the dock edge in `process_vehicle_state`, frozen through the docked
+idle↔charge flips (charging after arrival never moves the end), and
+dropped on resume (an intra-run recharge dock is not the final dock).
+`_close_run` reads `end = max(dock_arrival, last_time)`; the floor keeps
+the one BUG-09 dock-first-then-`mp = 100` shape (#89) ending at its late
+completing packet — a session never ends before its last accepted data.
+Closes with no observed dock keep the last-packet fallback. Riding in
+the `current_run` deepcopy, the key needs no snapshot-shape change; a
+run dict without it (legacy, or a no-dock close) falls back cleanly.
+Future runs only; persisted `history[]` is untouched.
 
 BUG-09 (2026-07-04): the completion criterion is
 `mp ≥ MP_COMPLETION_THRESHOLD` ∧ `vs ∈ {1, 2, 3}` (docked idle /
@@ -661,6 +680,13 @@ class RunTracker:
                 if self.state == STATE_PAUSED_DOCKED:
                     self.state = STATE_RUNNING
                     self._interrupt_timer_started_at = None
+                    # HARD-19 (#120): the mower left the dock to continue the
+                    # mow, so the dock it just left was an intermediate
+                    # recharge, not the session's final dock — drop its
+                    # arrival stamp. Only a subsequent (final) dock's arrival
+                    # can then end the run. `current_run` is non-None here
+                    # (PAUSED_DOCKED implies an open run).
+                    self.current_run["dock_arrival_time"] = None
 
         # HARD-18 (#117): seed a provisional run from its first accepted
         # type-2. The run was opened at the vs=4 activation edge with all
@@ -761,6 +787,30 @@ class RunTracker:
 
         if self.state == STATE_RUNNING:
             if vs in DOCKED_STATES:
+                # HARD-19 (#120): stamp the dock-arrival edge on the current
+                # run FIRST — before the arm / complete logic below — so a
+                # completion close fired later in this same call (the BUG-09
+                # dock-then-`mp = 100` fast path, #89) reads a stamp that
+                # already exists. There is no window where the close can
+                # precede the stamp because the type-1 that closes IS the
+                # type-1 that stamps; the ordering concern raised on #120
+                # (a later `/state → docked` losing the race) cannot occur —
+                # the stamp never comes from the entity's `/state` stream,
+                # only from this type-1 edge. This is the RUNNING →
+                # PAUSED_DOCKED transition — the same event the mower
+                # entity's non-docked → docked activity is derived from, one
+                # layer down (both read the identical vehicleState feed), so
+                # the tracker owns the edge without importing HA state.
+                # Frozen through the docked idle↔charge flips (those re-enter
+                # via the PAUSED_DOCKED branch below, which does not stamp)
+                # and cleared on resume (a mid-run recharge dock is not the
+                # session's final dock). Gated on `time_ms` so a legacy
+                # caller without it falls back to the last packet cursor in
+                # `_close_run`. For a provisional run the stamp coincides
+                # with `last_time` (both = this edge's `time_ms`), so the
+                # HARD-18 abort mechanics below are untouched.
+                if time_ms is not None:
+                    self.current_run["dock_arrival_time"] = time_ms
                 # HARD-18 abort arming: a provisional run has no mowing
                 # data to hold for, so *any* dock entry (including vs=2
                 # charging and vs=6) starts the close countdown. The
@@ -796,6 +846,9 @@ class RunTracker:
                     self._interrupt_timer_started_at = None
                     if time_ms is not None:
                         self.current_run["last_time"] = time_ms
+                    # HARD-19 (#120): that dock was intermediate — drop its
+                    # arrival stamp (symmetric with the seeded resume).
+                    self.current_run["dock_arrival_time"] = None
             else:
                 # Charging / explicit pause reset the timer; docked-and-
                 # not-charging arms it.
@@ -1429,7 +1482,29 @@ class RunTracker:
             # wander `duration_ms` from the type-1 `last_time`).
             self.counters["aborted_starts_committed"] += 1
         start = r.get("start_time")
-        end = r.get("last_time")
+        # HARD-19 (#120): a run that closed at a dock ends at the dock's
+        # arrival edge, not at its last accepted type-2. `dock_arrival_time`
+        # is stamped on the RUNNING → PAUSED_DOCKED transition (see
+        # `process_vehicle_state`) and frozen through the docked idle↔charge
+        # flips, so the session duration is exactly FEAT-06's activation →
+        # dock arrival (symmetric with HARD-18's activation-anchored
+        # `start_time`). The `max(…, last_time)` floor guarantees a session
+        # never ends before its last accepted packet — the sole shape that
+        # exercises it is BUG-09's (#89) dock-first-then-`mp = 100` flush,
+        # whose completing type-2 postdates the dock arrival by seconds.
+        # Closes with no observed dock (a reset-driven close mid-mow, a
+        # legacy / degraded run without the key) carry no stamp and fall
+        # back to the last packet cursor. `last_time` is deliberately NOT
+        # mutated — it stays the packet cursor the post-close gating
+        # baseline (`last_sub`) and everything downstream read.
+        last_time = r.get("last_time")
+        dock_arrival = r.get("dock_arrival_time")
+        if dock_arrival is None:
+            end = last_time
+        elif last_time is None:
+            end = dock_arrival
+        else:
+            end = max(dock_arrival, last_time)
         duration_ms: int | None = None
         if start is not None and end is not None:
             duration_ms = end - start
