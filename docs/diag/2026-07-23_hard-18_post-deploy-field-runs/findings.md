@@ -9,7 +9,8 @@ this run would have read ~0 s), and an **immediate return-to-dock**
 commits the arbitrated **minimal aborted-start** entry (essai 2:
 `result=interrupted`, `zones=[]`, `session_area=None`, `mow_start_type=None`,
 `duration=54.2 s` of real wander), with `counters.aborted_starts_committed`
-incrementing to `1`.
+incrementing to `1`. The display legs of the §6 checklist are
+operator-attested (see Findings) — the checklist is complete.
 
 ## Context
 
@@ -63,6 +64,14 @@ Times UTC; `+02:00` local.
   (15:19:24, the first task packet). The 78 s **is** the démarrage (dock
   exit + navigation). Pre-HARD-18 this run would have anchored `start_time`
   on the first type-2 and read ~0 s. Confirms §1b/§1c anchoring in prod.
+- **Display legs of the §6 checklist: operator-attested (2026-07-23).**
+  The operator confirmed observing live, across the two essais:
+  `etat_de_la_tonte` rendering **« Démarrage »** within ~2 s of the press,
+  the flip to **« En tonte »** at the first task packet (essai 1), and
+  **« Retour »** on the return leg. Attested observation, not wire/log
+  evidence — recorded per the PR #121 Fable review to close the §6
+  checklist; the Store rows in `01_store_after_two_starts.json` carry the
+  hard evidence for the tracker side.
 - **Single-packet `session_area = 0` is honest, not a regression (essai
   1).** `session_area = last_sub − sub0`; only one task packet arrived, so
   the anchor and the last value are the same `41.28` → `0.0`. The Prunier
