@@ -108,21 +108,25 @@ def _run_state_display(c: NavimowCoordinator) -> str:
     """Map tracker (state, vehicle_state) to the display enum."""
     ts = c.run_tracker.state
     if ts == STATE_RUNNING:
+        # `returning` = run open AND vs=5 (docked in MAP-01). Operator
+        # arbitration (#117, 2026-07-23): the vs=5 → returning split is
+        # evaluated BEFORE the provisional check — an aborting start that
+        # is physically heading home renders « Retour », not
+        # « Démarrage ». vs=4 (mowing/navigating) is the dominant open-run
+        # signal and stays `running`/`starting`; folding it into
+        # `returning` would spuriously flag every mowing tick as
+        # returning-to-dock.
+        if c.vehicle_state == VS_RETURNING:
+            return "returning"
         # HARD-18 (#117): the provisional start window (a run opened on
         # the vs=4 activation edge, not yet seeded by a type-2) renders
         # as `starting` — the robot is exiting the dock / navigating to
-        # the boundary, not yet mowing. Takes precedence over the
-        # vs-derived running/returning split for the whole window, so the
-        # state reflects the press ~1.5 s later instead of holding the
-        # previous close's label for ~3 min.
+        # the boundary, not yet mowing — so the state reflects the press
+        # ~1.5 s later instead of holding the previous close's label for
+        # ~3 min.
         if c.run_tracker.is_provisional:
             return "starting"
-        # `returning` = run open AND vs=5 (docked in MAP-01). vs=4
-        # (mowing) is the ordinary open-run state and stays as
-        # `running`. Fable brief mentions vs ∈ {4, 5} but vs=4 is the
-        # dominant mowing signal — folding it into `returning` would
-        # spuriously flag every mowing tick as returning-to-dock.
-        return "returning" if c.vehicle_state == VS_RETURNING else "running"
+        return "running"
     if ts == STATE_PAUSED_DOCKED:
         return "paused"
     return "idle"

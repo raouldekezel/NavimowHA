@@ -420,12 +420,20 @@ class RunTracker:
         }
         self.counters: dict[str, int] = {
             "wk_regressions_observed": 0,
+            # HARD-18 (#117): from raoul.26 this counter only ever sees
+            # *within-session* deviations. Sessions now open at the vs=4
+            # activation edge with `wk0 = None`, so the first packet
+            # re-anchors instead of being judged against the previous
+            # session's dead anchor — the cross-boundary drift shape that
+            # produced the pre-raoul.26 instance baseline. A flat counter
+            # post-deploy is therefore expected, not a sign the invariant
+            # machinery broke.
             "invariant_deviations_observed": 0,
-            # HARD-18 (#117): strict-progress rejections on the terminal-
-            # state path (no preceding vs=4) — previously a silent
-            # `return`. `aborted_starts_committed` counts provisional runs
-            # closed by the sustained-dock abort (a pressed run that
-            # wandered and was sent home without ever mowing).
+            # strict-progress rejections on the terminal-state path (no
+            # preceding vs=4) — previously a silent `return`.
+            # `aborted_starts_committed` counts provisional runs closed by
+            # the sustained-dock abort (a pressed run that wandered and was
+            # sent home without ever mowing).
             "strict_progress_rejections": 0,
             "aborted_starts_committed": 0,
         }
@@ -493,6 +501,45 @@ class RunTracker:
         # BUG-16's (#92) frozen-`sub` variant into the same guard.
         # See `_gate_run_start_vestige` for the full rationale.
         if self._gate_run_start_vestige(parsed):
+            return events
+
+        # HARD-18 (#117) — Sol/Fable review 2026-07-23 (blocking): a
+        # type-2 that arrives while a provisional start is STILL DOCKED
+        # must be ignored — neither resume nor seed. Placed right after
+        # the vestige gate (which keeps its own ceiling-replay drop
+        # accounting) and before every state transition.
+        #
+        # Why not seed here: seeding resumes to RUNNING and clears the
+        # abort timer, leaving `RUNNING ∧ docked ∧ timer=None`. `tick()`
+        # acts only in PAUSED_DOCKED, so with no further vs *edge* to
+        # forward (type-1 ~2 s vs type-2 30-90 s cadence skew makes a
+        # delayed docked type-2 ordinary) the run would render `running`
+        # indefinitely while docked. Worse, if that delayed packet is a
+        # near-close replay (`mp ≥ threshold ∧ ceiling cmp`), the later
+        # abort `_close_run` would see `_is_completed()` true and mint a
+        # phantom *completed* session. Ignoring preserves the arbitrated
+        # minimal-abort entry unconditionally; a genuine micro-mow's data
+        # is dropped (the DEBUG line keeps the evidence) — accepted per
+        # the arbitration. A real dock-poke is recovered by the off-dock
+        # type-1 (which returns the provisional run to RUNNING in
+        # `process_vehicle_state`); the next type-2 then seeds normally.
+        if (
+            self.is_provisional
+            and self.state == STATE_PAUSED_DOCKED
+            and self.vehicle_state in DOCKED_STATES
+        ):
+            _LOGGER.debug(
+                "run_tracker: type-2 ignored while provisional start "
+                "remains docked "
+                "(mp=%s cmp=%s sub=%s wk=%s action=%s boundary=%s time=%s)",
+                parsed.get("mowing_percentage"),
+                parsed.get("current_mow_progress"),
+                parsed.get("area_session"),
+                parsed.get("area_week"),
+                parsed.get("action"),
+                parsed.get("boundary"),
+                parsed.get("time"),
+            )
             return events
 
         # BUG-10 (2026-07-05, #58): layer 2 is now observability. A `wk`

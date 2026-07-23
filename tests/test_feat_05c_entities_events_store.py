@@ -246,6 +246,28 @@ def test_run_state_paused() -> None:
     assert _desc("current_run_state").value_fn(coord) == "paused"
 
 
+def test_run_state_starting_while_provisional() -> None:
+    """HARD-18 (#117): the vs=4 activation edge opens a provisional run;
+    the display renders `starting` before any type-2 seeds it."""
+    coord = _make_coordinator()
+    coord.run_tracker.process_vehicle_state(VS_MOWING, time_ms=1_000_000_000_000)
+    coord.vehicle_state = VS_MOWING
+    assert coord.run_tracker.is_provisional is True
+    assert _desc("current_run_state").value_fn(coord) == "starting"
+
+
+def test_run_state_returning_takes_precedence_over_starting() -> None:
+    """HARD-18 operator arbitration (#117, 2026-07-23): the vs=5 →
+    `returning` split is evaluated BEFORE the provisional check — an
+    aborting start physically heading home renders `returning`, not
+    `starting`."""
+    coord = _make_coordinator()
+    coord.run_tracker.process_vehicle_state(VS_MOWING, time_ms=1_000_000_000_000)
+    coord.vehicle_state = VS_RETURNING
+    assert coord.run_tracker.is_provisional is True
+    assert _desc("current_run_state").value_fn(coord) == "returning"
+
+
 # --------------------------------------------------------------------- #
 # 3. last_run_* sensors                                                 #
 # --------------------------------------------------------------------- #

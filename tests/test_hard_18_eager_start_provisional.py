@@ -439,31 +439,54 @@ def test_terminal_strict_progress_rejection_counted_and_logged(
 
 
 # --------------------------------------------------------------------- #
-# 10. PAUSED_DOCKED-provisional + fresh type-2 resumes and seeds         #
+# 10. PAUSED_DOCKED-provisional — Sol/Fable blocking-fix behaviour        #
 # --------------------------------------------------------------------- #
 
 
-def test_paused_provisional_type2_resumes_and_seeds() -> None:
-    tracker = RunTracker()
+def test_paused_provisional_type2_while_docked_is_ignored(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Sol/Fable review 2026-07-23 (blocking): a delayed type-2 that
+    arrives while a provisional start is STILL docked must be IGNORED —
+    neither resume nor seed. Seeding would strand the run at
+    `RUNNING ∧ docked ∧ timer=None`, which `tick()` (PAUSED_DOCKED-only)
+    could never close. The run stays provisional + PAUSED_DOCKED, the
+    abort timer keeps running, and the sustained-dock close still fires
+    the arbitrated minimal interrupted entry.
+    """
+    clk = _FakeClock()
+    tracker = RunTracker(clock=clk)
     tracker.process_vehicle_state(VS_MOWING, time_ms=_T0)
     tracker.process_vehicle_state(VS_DOCKED_IDLE, time_ms=_T0 + 1_000)
     assert tracker.state == STATE_PAUSED_DOCKED
     assert tracker.is_provisional is True
 
-    # Dock-poke then a real task: the type-2 resumes to RUNNING and seeds.
-    ev = _feed_t2(tracker, mp=3, cmp=104, sub=12.24, time=_T0 + 2_000)
+    # Delayed type-2 while still docked → ignored + DEBUG-logged.
+    with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
+        ev = _feed_t2(tracker, mp=3, cmp=104, sub=12.24, time=_T0 + 2_000)
     assert ev == []
-    assert tracker.state == STATE_RUNNING
-    assert tracker.is_provisional is False
-    assert tracker.current_run["sub0"] == 12.24
-    assert tracker.current_run["start_time"] == _T0
+    assert tracker.state == STATE_PAUSED_DOCKED
+    assert tracker.is_provisional is True  # not seeded
+    assert tracker.current_run["sub0"] is None
+    assert any(
+        "ignored while provisional start remains docked" in r.message
+        for r in caplog.records
+    )
+
+    # The abort timer was untouched — a sustained dock still closes it.
+    clk.advance(INTERRUPT_SUSTAIN_SECONDS + 1)
+    closed = tracker.tick()
+    assert [e.kind for e in closed] == [EVENT_RUN_FINISHED]
+    assert closed[0].payload["result"] == RESULT_INTERRUPTED
+    assert tracker.counters["aborted_starts_committed"] == 1
 
 
-def test_paused_provisional_offdock_returns_to_running() -> None:
-    """A provisional run that pokes the dock then leaves again (vs=4/5
-    before any type-2) returns to RUNNING and disarms — the state must
-    never read 'paused' while the robot is off-dock. A later tick then
-    does not abort a re-attempting run.
+def test_paused_provisional_offdock_type1_then_type2_seeds() -> None:
+    """Sol/Fable review 2026-07-23: the dock-poke recovery leg. A
+    provisional run that pokes the dock then leaves again (off-dock
+    type-1) returns to RUNNING and disarms — the state must never read
+    'paused' while the robot is off-dock — and the *next* type-2 then
+    seeds normally.
     """
     clk = _FakeClock()
     tracker = RunTracker(clock=clk)
@@ -471,14 +494,23 @@ def test_paused_provisional_offdock_returns_to_running() -> None:
     tracker.process_vehicle_state(VS_DOCKED_IDLE, time_ms=_T0 + 1_000)
     assert tracker.state == STATE_PAUSED_DOCKED
 
+    # Off-dock again before the debounce → back to RUNNING, disarmed.
     ev = tracker.process_vehicle_state(VS_MOWING, time_ms=_T0 + 2_000)
     assert ev == []
     assert tracker.state == STATE_RUNNING
     assert tracker.is_provisional is True
-    # Disarmed: a sustained interval off-dock does not commit an abort.
+    # A sustained interval off-dock does not commit an abort.
     clk.advance(INTERRUPT_SUSTAIN_SECONDS + 5)
     assert tracker.tick() == []
     assert tracker.state == STATE_RUNNING
+
+    # The next type-2 (now off-dock) seeds normally.
+    seed = _feed_t2(tracker, mp=3, cmp=104, sub=12.24, time=_T0 + 3_000)
+    assert seed == []
+    assert tracker.state == STATE_RUNNING
+    assert tracker.is_provisional is False
+    assert tracker.current_run["sub0"] == 12.24
+    assert tracker.current_run["start_time"] == _T0
 
 
 # --------------------------------------------------------------------- #
