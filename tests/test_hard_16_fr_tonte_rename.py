@@ -95,11 +95,13 @@ def test_no_passage_left_on_any_renamed_key() -> None:
 
 def test_run_state_enum_unchanged() -> None:
     """The nested ``state.*`` sub-dict qualifies the outcome, not the
-    noun. It must stay identical (post-FEAT-08 rename, the key is now
-    `current_run_state`)."""
+    noun. The HARD-16 nouns stay identical (post-FEAT-08 rename, the key
+    is now `current_run_state`); HARD-18 (#117) adds the `starting`
+    provisional-window state, which is the only permitted addition."""
     state = _fr_sensor("current_run_state")["state"]
     assert state == {
         "idle": "Au repos",
+        "starting": "Démarrage",
         "running": "En cours",
         "paused": "En pause",
         "returning": "Retour",

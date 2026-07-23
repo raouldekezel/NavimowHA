@@ -84,6 +84,7 @@
         "name": "Current run state",
         "state": {
           "idle": "Idle",
+          "starting": "Starting",
           "running": "Running",
           "paused": "Paused",
           "returning": "Returning"
