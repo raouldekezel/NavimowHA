@@ -12,15 +12,16 @@ dock-arrival type-1 `time` on `current_run["dock_arrival_time"]` and
 FEAT-06's activation → dock arrival, both edges type-1-stamped.
 
 Adopted design: the consolidated normative body of issue #120 (2026-07-23)
-— operator arbitrations ×3 + Fable brief v2/v2.1 + Sol's PR-#126 review.
+— operator arbitrations ×4 + Fable brief v2/v2.1 + Sol's PR-#126 review.
 The stamp lives in the run (rides the snapshot deepcopy, no
 `SNAPSHOT_VERSION` bump), set on the RUNNING → PAUSED_DOCKED edge (dock
-evidence `{1, 2, 6}`), frozen through the docked idle↔charge flips, and
-cleared ONLY on departure evidence (`vehicle_state ∈ {4, 5}`). §1 makes
-the end strict: a late BUG-09 (#89) completing flush received while still
-docked completes the run at the *dock arrival*, not the packet (family 6,
-inverted). §2 corrects the dock vocabulary machine-wide: `vs = 3`
-(VS_STOPPED) is not docked — it is inert (evidence of nothing).
+evidence `DOCK_EVIDENCE = {1, 2}`), frozen through the docked idle↔charge
+flips, and cleared ONLY on departure evidence (`DEPARTURE_EVIDENCE
+= {4, 5}`). §1 makes the end strict: a late BUG-09 (#89) completing flush
+received while still docked completes the run at the *dock arrival*, not
+the packet (family 6, inverted). §2 corrects the dock vocabulary
+machine-wide: `vs = 3` (VS_STOPPED) and `vs = 6` (VS_MAPPING) are both
+inert — evidence of nothing (arbitrations 3 & 4).
 
 Tests map to the brief's families plus the §2/§5/§6 pins (observable
 behaviour only — the tracker/coordinator API, `caplog`, snapshot/restore;
@@ -35,6 +36,8 @@ import pytest
 
 from custom_components.navimow.location import parse_location_type_2
 from custom_components.navimow.run_tracker import (
+    DEPARTURE_EVIDENCE,
+    DOCK_EVIDENCE,
     EVENT_RUN_FINISHED,
     EVENT_RUN_STARTED,
     INTERRUPT_SUSTAIN_SECONDS,
@@ -50,6 +53,7 @@ from custom_components.navimow.run_tracker import (
     VS_MOWING,
     VS_RETURNING,
     VS_STOPPED,
+    VS_TRANSIENT,
     RunTracker,
 )
 
@@ -147,53 +151,58 @@ def test_pin_o1_fast_completion_ends_strictly_at_dock_arrival(dock_vs: int) -> N
     assert tracker.state == STATE_IDLE
 
 
-def test_pin_o1_no_dock_leg_vs_3_stopped_is_inert() -> None:
-    """The former `vs = 3` leg of O1, now the explicit no-dock pin (HARD-19
-    §2, #120). A completed-shaped run (mp = 100) that sees `vs = 3`
-    (VS_STOPPED — a possible off-dock user pause) produces **no stamp, no
-    transition, no timer, no close**: vs = 3 is evidence of nothing. The
-    run stays open, exactly as raoul.28 would leave a non-dock pause.
+@pytest.mark.parametrize("inert_vs", [VS_STOPPED, VS_MAPPING])
+def test_pin_o1_no_dock_legs_vs_3_and_vs_6_are_inert(inert_vs: int) -> None:
+    """The no-dock pins (HARD-19 §2 arbitrations 3 & 4, #120): `vs = 3`
+    (VS_STOPPED) and `vs = 6` (VS_MAPPING) each → no stamp, no transition,
+    no timer, no close, even on a completed-shaped run (mp = 100). Both are
+    location-agnostic (evidence of nothing); the run stays open, exactly as
+    raoul.28 would leave a non-dock signal.
     """
     clk = _FakeClock()
     tracker = RunTracker(clock=clk)
     _seed_running(tracker)
     _feed_t2(tracker, mp=100, cmp=10000, sub=40.0, boundary=1, time=_T0 + 2_000)
 
-    closed = tracker.process_vehicle_state(VS_STOPPED, time_ms=_T0 + 5_000)
+    closed = tracker.process_vehicle_state(inert_vs, time_ms=_T0 + 5_000)
     assert closed == []  # no close
     assert tracker.state == STATE_RUNNING  # no transition
     assert tracker.current_run["dock_arrival_time"] is None  # no stamp
     assert tracker._interrupt_timer_started_at is None  # no timer armed
 
-    # And the sustained timer cannot fire on vs = 3 either.
+    # And the sustained timer cannot fire on an inert state either.
     clk.advance(INTERRUPT_SUSTAIN_SECONDS + 5)
     assert tracker.tick() == []
     assert tracker.state == STATE_RUNNING
 
 
-def test_vs6_stamps_arrival_but_holds_then_vs1_completes_at_the_vs6_edge() -> None:
-    """The vs=6 arm of family 1: vs=6 (isMapping) is a DOCKED_STATES member
-    so the arrival edge IS stamped, but it is excluded from the completion
-    set — the run HOLDS (no close, no timer). A later flip to vs=1 fires
-    the completion, and the end is the *first* dock arrival (the vs=6
-    edge), frozen through the 6→1 flip, not the vs=1 time.
+def test_post_mow_mapping_5_6_1_ends_at_the_vs1_edge() -> None:
+    """Post-mow mapping sequence `5 → 6 → 1` (HARD-19 §2 arbitration 4,
+    #120), replacing the former frozen-vs=6-arrival arm. vs=6 (VS_MAPPING)
+    is now inert: the run stays RUNNING through the map-merge phase (no
+    stamp, no hold). The dock arrival is the `vs = 1` edge — that stamps and
+    completes, so `end == t(vs=1)`, NOT the earlier vs=6 time. Accepted §2
+    cost: the end is later than the physical arrival by the mapping
+    duration.
     """
     tracker = RunTracker()
     _seed_running(tracker)
     _feed_t2(tracker, mp=100, cmp=10000, sub=40.0, boundary=1, time=_T0 + 2_000)
 
+    tracker.process_vehicle_state(VS_RETURNING, time_ms=_T0 + 4_000)  # transit
     y6 = _T0 + 5_000
-    ev6 = tracker.process_vehicle_state(VS_MAPPING, time_ms=y6)
-    assert ev6 == []  # held: vs=6 excluded from completion
-    assert tracker.state == STATE_PAUSED_DOCKED
-    assert tracker.current_run["dock_arrival_time"] == y6
+    ev6 = tracker.process_vehicle_state(VS_MAPPING, time_ms=y6)  # inert
+    assert ev6 == []
+    assert tracker.state == STATE_RUNNING  # not held — vs=6 inert
+    assert tracker.current_run["dock_arrival_time"] is None  # no vs=6 stamp
 
-    ev1 = tracker.process_vehicle_state(VS_DOCKED_IDLE, time_ms=_T0 + 7_000)
+    y1 = _T0 + 7_000
+    ev1 = tracker.process_vehicle_state(VS_DOCKED_IDLE, time_ms=y1)
     assert [e.kind for e in ev1] == [EVENT_RUN_FINISHED]
     p = ev1[0].payload
     assert p["result"] == RESULT_COMPLETED
-    assert p["end_time"] == y6  # frozen at the first (vs=6) dock arrival
-    assert p["duration_ms"] == y6 - _T0
+    assert p["end_time"] == y1  # the vs=1 dock arrival, NOT the vs=6 time
+    assert p["duration_ms"] == y1 - _T0
 
 
 # ===================================================================== #
@@ -547,7 +556,7 @@ def test_last_sub_gating_baseline_unaffected_by_the_stamp() -> None:
 
 
 # ===================================================================== #
-# §2 inertness — vs=3 (VS_STOPPED) touches nothing at the dock            #
+# §2 inertness — vs∈{3,6} touch nothing at the dock (2→3→2, 1→6→1)        #
 # ===================================================================== #
 
 
@@ -578,6 +587,40 @@ def test_inertness_pin_2_3_2_flip_at_dock_touches_nothing() -> None:
     tracker.process_vehicle_state(VS_DOCKED_CHARGING, time_ms=dock_y + 2_200)
     assert tracker.state == STATE_PAUSED_DOCKED
     assert tracker.current_run["dock_arrival_time"] == dock_y  # never restamped
+
+
+def test_inertness_pin_1_6_1_flip_at_dock_touches_nothing() -> None:
+    """The `1 → 6 → 1` analogue (HARD-19 §2 arbitration 4, #120). Docked at
+    Y on vs=1 (stamp posed, sustained timer armed), a transient `vs = 6`
+    (VS_MAPPING) passes straight through: the stamp stays Y, the ARMED timer
+    context is preserved (not reset), and the run is neither resumed nor
+    closed — the countdown carries across the blip and still fires at Y.
+    """
+    clk = _FakeClock()
+    tracker = RunTracker(clock=clk)
+    _seed_running(tracker)
+
+    dock_y = _T0 + 3_000
+    tracker.process_vehicle_state(VS_DOCKED_IDLE, time_ms=dock_y)  # vs=1 dock, arms
+    assert tracker.state == STATE_PAUSED_DOCKED
+    assert tracker.current_run["dock_arrival_time"] == dock_y
+    armed_at = tracker._interrupt_timer_started_at
+    assert armed_at is not None  # vs=1 armed the sustained timer
+
+    # vs=6 blip — inert; must not reset the armed countdown.
+    ev = tracker.process_vehicle_state(VS_MAPPING, time_ms=dock_y + 1_000)
+    assert ev == []
+    assert tracker.state == STATE_PAUSED_DOCKED  # not resumed, not closed
+    assert tracker.current_run["dock_arrival_time"] == dock_y  # stamp unmoved
+    assert tracker._interrupt_timer_started_at == armed_at  # timer intact
+
+    # Back to vs=1; the countdown (armed at Y) still fires at the frozen Y.
+    tracker.process_vehicle_state(VS_DOCKED_IDLE, time_ms=dock_y + 2_000)
+    assert tracker.current_run["dock_arrival_time"] == dock_y  # never restamped
+    clk.advance(INTERRUPT_SUSTAIN_SECONDS + 1)
+    closed = tracker.tick()
+    assert [e.kind for e in closed] == [EVENT_RUN_FINISHED]
+    assert closed[0].payload["end_time"] == dock_y
 
 
 # ===================================================================== #
@@ -624,19 +667,20 @@ def test_departure_ordering_type2_before_offdock_type1() -> None:
     assert tracker.current_run["dock_arrival_time"] is None
 
 
-def test_restored_paused_docked_with_vs_3_cannot_time_out() -> None:
-    """A snapshot taken at `PAUSED_DOCKED` with `vehicle_state = 3`
-    (reachable live: dock on {1,2,6} → a vs=3 blip leaves the state
-    PAUSED_DOCKED but vehicle_state = 3). After restore the sustained timer
-    can no longer fire on vs = 3 (not a dock state). It resolves on the next
-    real dock edge: a `vs = 1` arms the timer, and a later tick closes at
-    the frozen dock arrival.
+@pytest.mark.parametrize("inert_vs", [VS_STOPPED, VS_MAPPING])
+def test_restored_paused_docked_with_inert_vs_cannot_time_out(inert_vs: int) -> None:
+    """A snapshot taken at `PAUSED_DOCKED` with `vehicle_state ∈ {3, 6}`
+    (reachable live: dock on {1,2} → a vs=3 or vs=6 blip leaves the state
+    PAUSED_DOCKED but the vehicle_state inert). After restore the sustained
+    timer can no longer fire on either (neither is a dock state). It resolves
+    on the next real dock edge: a `vs = 1` arms the timer, and a later tick
+    closes at the frozen dock arrival.
     """
     dock_y = _T0 + 3_000
     snap = {
         "version": SNAPSHOT_VERSION,
         "state": STATE_PAUSED_DOCKED,
-        "vehicle_state": VS_STOPPED,
+        "vehicle_state": inert_vs,
         "current_run": {
             "start_time": _T0,
             "mow_start_type": 0,
@@ -668,7 +712,7 @@ def test_restored_paused_docked_with_vs_3_cannot_time_out() -> None:
     assert tracker.restore(snap) is True
     assert tracker.state == STATE_PAUSED_DOCKED
 
-    # vs = 3 cannot arm or fire the sustained timer.
+    # An inert vs (3 or 6) cannot arm or fire the sustained timer.
     tracker.tick()
     clk.advance(INTERRUPT_SUSTAIN_SECONDS + 5)
     assert tracker.tick() == []
@@ -733,20 +777,56 @@ def test_regression_vs_5_then_vs_1_confirms_dock_stamps_and_closes() -> None:
     assert p["end_time"] == dock_y
 
 
-def test_regression_vs_5_then_vs_6_mapping_handling_unchanged() -> None:
-    """`vs = 5 → vs = 6`: mapping handling is unchanged — vs=6 stamps the
-    arrival and HOLDS (excluded from completion), no close during
-    consolidation."""
+def test_regression_vs_5_then_vs_6_then_vs_1_post_mow() -> None:
+    """`vs = 5 → vs = 6 → vs = 1` (updated per arbitration 4, supersedes
+    "mapping handling unchanged"). The returning transit (vs=5, departure)
+    and the mapping phase (vs=6, inert) both carry no stamp; only the vs=1
+    dock arrival stamps and closes, at its own time — same behaviour as the
+    post-mow pin above."""
     tracker = RunTracker()
     _seed_running(tracker)
     _feed_t2(tracker, mp=100, cmp=10000, sub=40.0, boundary=1, time=_T0 + 2_000)
 
-    tracker.process_vehicle_state(VS_RETURNING, time_ms=_T0 + 3_000)
-    y6 = _T0 + 5_000
-    ev = tracker.process_vehicle_state(VS_MAPPING, time_ms=y6)
-    assert ev == []  # held — vs=6 excluded from completion
-    assert tracker.state == STATE_PAUSED_DOCKED
-    assert tracker.current_run["dock_arrival_time"] == y6  # mapping stamps
+    tracker.process_vehicle_state(VS_RETURNING, time_ms=_T0 + 3_000)  # transit
+    tracker.process_vehicle_state(VS_MAPPING, time_ms=_T0 + 5_000)  # inert
+    assert tracker.state == STATE_RUNNING  # neither stamps nor holds
+    assert tracker.current_run["dock_arrival_time"] is None
+
+    y1 = _T0 + 7_000
+    closed = tracker.process_vehicle_state(VS_DOCKED_IDLE, time_ms=y1)
+    assert [e.kind for e in closed] == [EVENT_RUN_FINISHED]
+    p = closed[0].payload
+    assert p["result"] == RESULT_COMPLETED
+    assert p["end_time"] == y1  # only the vs=1 arrival ends the run
+
+
+# ===================================================================== #
+# §6 partition pin — every vehicleState is classified                    #
+# ===================================================================== #
+
+
+def test_partition_pin_every_vehiclestate_is_classified() -> None:
+    """Partition pin (HARD-19 §2, #120): the four evidentiary groups
+    partition every steady vehicleState — DOCK_EVIDENCE {1,2},
+    DEPARTURE_EVIDENCE {4,5}, and the two inert singletons VS_STOPPED (3) /
+    VS_MAPPING (6). The groups are pairwise disjoint and their union is
+    {1..6}, so a future firmware `vs = 7` breaks THIS test instead of
+    falling into a silent hole. VS_TRANSIENT (8) is the out-of-band
+    firmware-reset sentinel, handled before the partition (returns early),
+    so it is deliberately outside the union.
+    """
+    groups = [
+        DOCK_EVIDENCE,
+        DEPARTURE_EVIDENCE,
+        frozenset({VS_STOPPED}),
+        frozenset({VS_MAPPING}),
+    ]
+    for i in range(len(groups)):
+        for j in range(i + 1, len(groups)):
+            assert not (groups[i] & groups[j]), (groups[i], groups[j])
+    union = set().union(*groups)
+    assert union == {1, 2, 3, 4, 5, 6}
+    assert VS_TRANSIENT not in union  # reset sentinel, out of band
 
 
 # ===================================================================== #

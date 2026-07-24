@@ -9,7 +9,8 @@ did fire (89 s after the battery finished charging, ~53 min after
 dock), the hardcoded `interrupted` label mis-labeled a completed run.
 
 BUG-09 fix: completion criterion becomes `mp ≥ MP_COMPLETION_THRESHOLD
-∧ vs ∈ DOCKED_NOT_USER_PAUSED ({1, 2, 3})`, evaluated from both
+∧ vs ∈ DOCK_EVIDENCE ({1, 2})` (HARD-19 §2 #120 narrowed it from the old
+{1, 2, 3} — vs = 3 and vs = 6 are inert), evaluated from both
 `process_type2` and `process_vehicle_state` (so either ordering
 closes). The result label is derived in `_close_run` from `last_mp`,
 so the sustained-timer fallback path also labels consistently.
@@ -34,7 +35,7 @@ from __future__ import annotations
 from custom_components.navimow.location import parse_location_type_2
 from custom_components.navimow.run_tracker import (
     CMP_ZONE_COMPLETE_THRESHOLD,
-    DOCKED_NOT_USER_PAUSED,
+    DOCK_EVIDENCE,
     EVENT_RUN_FINISHED,
     EVENT_RUN_STARTED,
     INTERRUPT_SUSTAIN_SECONDS,
@@ -42,6 +43,7 @@ from custom_components.navimow.run_tracker import (
     MP_PARTIAL_THRESHOLD,
     RESULT_COMPLETED,
     RESULT_INTERRUPTED,
+    SNAPSHOT_VERSION,
     STATE_IDLE,
     STATE_PAUSED_DOCKED,
     STATE_RUNNING,
@@ -103,8 +105,9 @@ def test_constants_reflect_design_decision() -> None:
     assert MP_COMPLETION_THRESHOLD == 100
     assert MP_PARTIAL_THRESHOLD == 99
     assert CMP_ZONE_COMPLETE_THRESHOLD == 10000
-    # HARD-19 §2 (#120): vs=3 removed — it is not a dock state.
-    assert DOCKED_NOT_USER_PAUSED == frozenset({VS_DOCKED_IDLE, VS_DOCKED_CHARGING})
+    # HARD-19 §2 (#120): the completion predicate is DOCK_EVIDENCE — the two
+    # dock-exclusive states. vs=3 and vs=6 are inert (not here).
+    assert DOCK_EVIDENCE == frozenset({VS_DOCKED_IDLE, VS_DOCKED_CHARGING})
 
 
 # --------------------------------------------------------------------- #
@@ -193,27 +196,27 @@ def test_stopped_vs_3_does_not_complete() -> None:
 
 
 # --------------------------------------------------------------------- #
-# 4. vs=6 (isMapping) is excluded — hold semantics preserved            #
+# 4. vs=6 (isMapping) is INERT — never completes, never holds            #
 # --------------------------------------------------------------------- #
 
 
-def test_mapping_holds_even_at_mp_100() -> None:
-    """`vs = 6` is a deliberate exclusion: firmware post-mow map
-    consolidation (isMapping). Even at `mp = 100` the run must not
-    auto-close — the mapping phase is at-dock and immobile, closing
-    through it would race the consolidation. The run parks in
-    PAUSED_DOCKED with no close event.
+def test_mapping_vs_6_is_inert_run_stays_running() -> None:
+    """HARD-19 §2 arbitration 4 (#120): `vs = 6` (VS_MAPPING) is inert —
+    location-agnostic (a user-initiated remap runs off-dock), evidence of
+    nothing. Even at `mp = 100` it must NOT auto-close and must NOT move
+    the run to PAUSED_DOCKED: the open run rides through as RUNNING. The
+    post-mow `5 → 6 → 1` sequence closes at the later `vs = 1` edge, not at
+    vs = 6 (pinned in test_hard_19).
 
-    (Historical note: the earlier test/label named vs = 6 an "explicit
-    user pause" — empirically wrong per the 2026-07-07 diag. The
-    behavioural invariant "vs = 6 holds the run" is unchanged; only
-    the reason is corrected.)
+    (Before arbitration 4, vs = 6 "held" the run in PAUSED_DOCKED; the
+    behavioural invariant is now "vs = 6 is inert" — the empirical basis is
+    that mapping is a driving activity, not a dock state.)
     """
     tracker = RunTracker()
     _open_at(tracker, mp=100)
     events = tracker.process_vehicle_state(VS_MAPPING)
     assert [e for e in events if e.kind == EVENT_RUN_FINISHED] == []
-    assert tracker.state == STATE_PAUSED_DOCKED
+    assert tracker.state == STATE_RUNNING  # inert — not PAUSED_DOCKED
 
 
 # --------------------------------------------------------------------- #
@@ -319,18 +322,18 @@ def test_mp_100_while_returning_does_not_close() -> None:
 # --------------------------------------------------------------------- #
 
 
-def test_fast_path_preempts_sustained_timer_when_user_unpauses() -> None:
-    """Sequence: mp reaches 100, firmware enters post-mow mapping
-    (vs=6, hold), then transitions to vs=1 once consolidation
-    finishes. The vs=6 → vs=1 transition itself qualifies for the
-    BUG-09 fast path — no need to wait for the sustained-60 s timer.
-    Documents the composition of the two rules (isMapping hold + fast
-    completion).
+def test_post_mow_mapping_then_vs1_completes_on_the_fast_path() -> None:
+    """Sequence: mp reaches 100, firmware enters post-mow mapping (vs=6 —
+    now INERT, run stays RUNNING), then transitions to vs=1 once
+    consolidation finishes. The `vs = 1` edge is the true dock arrival: it
+    qualifies for the BUG-09 fast path and completes immediately — no wait
+    for the sustained-60 s timer. Documents the post-mow `5/6 → 1` shape
+    under arbitration 4.
     """
     tracker = RunTracker()
     _open_at(tracker, mp=100)
-    tracker.process_vehicle_state(VS_MAPPING)  # hold semantics
-    assert tracker.state == STATE_PAUSED_DOCKED
+    tracker.process_vehicle_state(VS_MAPPING)  # inert — stays RUNNING
+    assert tracker.state == STATE_RUNNING
 
     events = tracker.process_vehicle_state(VS_DOCKED_IDLE)
     finishes = [e for e in events if e.kind == EVENT_RUN_FINISHED]
@@ -339,30 +342,49 @@ def test_fast_path_preempts_sustained_timer_when_user_unpauses() -> None:
     assert tracker.state == STATE_IDLE
 
 
-def test_sustained_timer_labels_completed_via_restore_race() -> None:
-    """The one reachable sustained-timer + `completed` combination:
-    a snapshot taken while `PAUSED_DOCKED + vs=6 + mp=100`, mutated to
-    `vs=1` in transit (as if the vs change happened right around the
-    HA restart and only the post-change vs was persisted), then
-    restored. `tick()` re-arms the sustained-60 s timer (`restore()`
-    intentionally clears the monotonic timestamp) and, when it fires,
-    labels the close `completed` because `last_mp = 100`.
-
-    Guards against a regression where someone hardcodes `interrupted`
-    back into the sustained-timer path.
+def _paused_docked_completed_snapshot(*, last_mp: int, zones: list) -> dict:
+    """A snapshot persisted at `PAUSED_DOCKED` with a completed-criterion
+    run and `vehicle_state = 1`. This is the restore-race state: the live
+    fast-path close landed *after* the last save (HA crashed in between),
+    so the on-disk run still shows PAUSED_DOCKED. Post-arbitration-4 (vs = 6
+    inert) this is the ONLY way a sustained-timer `completed` close is
+    reachable — a live `mp ≥ threshold ∧ vs ∈ {1,2}` always fast-closes.
     """
-    source = RunTracker()
-    _open_at(source, mp=100)
-    source.process_vehicle_state(VS_MAPPING)
-    snap = source.snapshot()
-    # Simulate a vs=1 landing between the last save and the restore
-    # (the fast path never got called live because we crashed just
-    # before it could).
-    snap["vehicle_state"] = VS_DOCKED_IDLE
+    t = 1_000_000_000_000
+    return {
+        "version": SNAPSHOT_VERSION,
+        "state": STATE_PAUSED_DOCKED,
+        "vehicle_state": VS_DOCKED_IDLE,
+        "current_run": {
+            "start_time": t,
+            "mow_start_type": 1,
+            "wk0": 0.0,
+            "sub0": 0.0,
+            "last_time": t,
+            "last_sub": 100.0,
+            "last_wk": 100.0,
+            "last_mp": last_mp,
+            "zones": zones,
+            "dock_arrival_time": None,
+        },
+        "last_accepted_wk": 100.0,
+        "last_accepted_time_ms": t,
+        "drops": {"pending_reset_holds": 0},
+        "counters": {},
+    }
 
+
+def test_sustained_timer_labels_completed_via_restore_race() -> None:
+    """The one reachable sustained-timer + `completed` combination is a
+    restore race (see helper). On restore, `tick()` re-arms the
+    sustained-60 s timer (`restore()` intentionally clears the monotonic
+    timestamp) and, when it fires, labels the close `completed` because
+    `last_mp = 100`. Guards against a regression that hardcodes
+    `interrupted` back into the sustained-timer path.
+    """
     clock = FakeClock()
     restored = RunTracker(clock=clock)
-    assert restored.restore(snap) is True
+    assert restored.restore(_paused_docked_completed_snapshot(last_mp=100, zones=[]))
     assert restored.state == STATE_PAUSED_DOCKED
 
     # First tick arms the timer; second tick past the window fires.
@@ -426,20 +448,22 @@ def test_sustained_timer_labels_completed_on_mp_99_cmp_10000() -> None:
     signal.
     """
     clock = FakeClock()
-    tracker = RunTracker(clock=clock)
-    _open_at(tracker, mp=99, cmp=10000)
-    # Skip the fast path by going through the sustained-timer route:
-    # start on vs = 6 (mapping — hold semantics, no fast fire), then
-    # transition to vs = 1 after the caller misses the vs → 1 timing.
-    tracker.process_vehicle_state(VS_MAPPING)
-    assert tracker.state == STATE_PAUSED_DOCKED
-    # A restart-race snapshot with vs already flipped to 1 in the
-    # snapshot but no fast fire live — same shape as the
-    # `via_restore_race` sustained test above.
-    snap = tracker.snapshot()
-    snap["vehicle_state"] = VS_DOCKED_IDLE
     restored = RunTracker(clock=clock)
-    assert restored.restore(snap) is True
+    # Same restore-race framing as `via_restore_race`, with the BUG-14
+    # refined completion shape (mp = 99 ∧ zones[-1].cmp_max = 10000). vs = 6
+    # no longer holds a run live (arbitration 4), so this path is only
+    # reachable through the restore race.
+    zones = [
+        {
+            "boundary_id": 1,
+            "first_time": 1_000_000_000_000,
+            "last_time": 1_000_000_000_000,
+            "cmp_max": 10000,
+            "sub_entry": 0.0,
+            "sub_exit": 100.0,
+        }
+    ]
+    assert restored.restore(_paused_docked_completed_snapshot(last_mp=99, zones=zones))
     assert restored.tick() == []
     clock.advance(INTERRUPT_SUSTAIN_SECONDS + 1)
     events = restored.tick()

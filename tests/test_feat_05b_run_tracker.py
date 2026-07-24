@@ -470,11 +470,17 @@ def test_vs_3_stopped_is_inert_never_interrupts() -> None:
 
 
 # --------------------------------------------------------------------- #
-# 7. vs=6 (explicit user pause) holds indefinitely                      #
+# 7. vs=6 (VS_MAPPING) is inert — never holds, never times out          #
 # --------------------------------------------------------------------- #
 
 
-def test_vs_6_paused_holds_docked_indefinitely() -> None:
+def test_vs_6_mapping_is_inert_run_stays_running() -> None:
+    """HARD-19 §2 arbitration 4 (#120): vs=6 (VS_MAPPING) is inert —
+    location-agnostic (a user-initiated remap runs off-dock), evidence of
+    nothing. Feeding it to an open run neither moves it to PAUSED_DOCKED nor
+    arms the sustained timer; the run stays RUNNING indefinitely on vs=6
+    alone. (Before arbitration 4, vs=6 "held" the run in PAUSED_DOCKED.)
+    """
     clock = FakeClock()
     tracker = RunTracker(clock=clock)
 
@@ -491,31 +497,11 @@ def test_vs_6_paused_holds_docked_indefinitely() -> None:
         ],
     )
     tracker.process_vehicle_state(VS_MAPPING)
-    assert tracker.state == STATE_PAUSED_DOCKED
-    # Timer NOT armed — firmware is consolidating the map, not a
-    # terminal state.
+    assert tracker.state == STATE_RUNNING  # inert — not PAUSED_DOCKED
     assert tracker._interrupt_timer_started_at is None
 
-    clock.advance(3600)  # 1 h paused
+    clock.advance(3600)  # 1 h — no timer armed, so nothing fires
     assert tracker.tick() == []
-    assert tracker.state == STATE_PAUSED_DOCKED
-
-    # Resume: the robot leaves the dock (departure evidence vs=4, HARD-19
-    # §3 #120), then a fresh type-2 (sub ≥ last) continues the same run.
-    tracker.process_vehicle_state(VS_MOWING)
-    events = _feed(
-        tracker,
-        [
-            {
-                "type": 2,
-                "mowingPercentage": 6,
-                "subtotalArea": "11.0",
-                "mowingWeekArea": "11.0",
-                "time": 1_000_000_100_000,
-            }
-        ],
-    )
-    assert events == []
     assert tracker.state == STATE_RUNNING
 
 

@@ -212,11 +212,12 @@ def test_repeated_vs4_and_wobble_do_not_refire() -> None:
 
 
 @pytest.mark.parametrize(
-    # HARD-19 §2 (#120): vs=3 (VS_STOPPED) is not a dock state, so it no
-    # longer arms the provisional-abort countdown — see the dedicated
-    # inert-vs-3 pin below. Only true dock states {1, 2, 6} abort a start.
+    # HARD-19 §2 (#120): vs=3 (VS_STOPPED) and vs=6 (VS_MAPPING) are inert
+    # (arbitrations 3 & 4), so neither arms the provisional-abort countdown
+    # — see the dedicated inert pin below. Only DOCK_EVIDENCE {1, 2} aborts
+    # a start.
     "dock_vs",
-    [VS_DOCKED_IDLE, VS_DOCKED_CHARGING, VS_MAPPING],
+    [VS_DOCKED_IDLE, VS_DOCKED_CHARGING],
 )
 def test_aborted_start_commits_minimal_interrupted_entry(dock_vs: int) -> None:
     clk = _FakeClock()
@@ -251,19 +252,22 @@ def test_aborted_start_commits_minimal_interrupted_entry(dock_vs: int) -> None:
     assert tracker.counters["aborted_starts_committed"] == 1
 
 
-def test_provisional_start_stalled_at_vs_3_stays_open_no_abort() -> None:
-    """HARD-19 §2 (#120): a provisional start that stalls at `vs = 3`
-    (VS_STOPPED — a user pause while wandering off-dock) does NOT arm the
-    abort countdown. vs = 3 is evidence of nothing: the provisional run
-    rides through as RUNNING, its timer un-armed, and never commits an
-    aborted-start entry from a stopped state alone.
+@pytest.mark.parametrize("inert_vs", [VS_STOPPED, VS_MAPPING])
+def test_provisional_start_stalled_at_inert_vs_stays_open_no_abort(
+    inert_vs: int,
+) -> None:
+    """HARD-19 §2 (#120): a provisional start that stalls at an inert state
+    — `vs = 3` (VS_STOPPED, a user pause) or `vs = 6` (VS_MAPPING, a remap)
+    — does NOT arm the abort countdown (arbitrations 3 & 4). The provisional
+    run rides through as RUNNING, its timer un-armed, and never commits an
+    aborted-start entry from an inert state alone.
     """
     clk = _FakeClock()
     tracker = RunTracker(clock=clk)
     tracker.process_vehicle_state(VS_MOWING, time_ms=_T0)
     assert tracker.is_provisional is True
 
-    ev = tracker.process_vehicle_state(VS_STOPPED, time_ms=_T0 + 1_000)
+    ev = tracker.process_vehicle_state(inert_vs, time_ms=_T0 + 1_000)
     assert ev == []
     assert tracker.state == STATE_RUNNING  # inert — not PAUSED_DOCKED
 
