@@ -133,10 +133,12 @@ opened. The stamp lives in `current_run["dock_arrival_time"]`, set on
 the dock edge in `process_vehicle_state`, frozen through the docked
 idle↔charge flips (charging after arrival never moves the end), and
 dropped on resume (an intra-run recharge dock is not the final dock).
-`_close_run` reads `end = max(dock_arrival, last_time)`; the floor keeps
-the one BUG-09 dock-first-then-`mp = 100` shape (#89) ending at its late
-completing packet — a session never ends before its last accepted data.
-Closes with no observed dock keep the last-packet fallback. Riding in
+`_close_run` reads `end = dock_arrival_time` when the stamp is present —
+**strict, no floor** (operator arbitration §1): a late BUG-09 completing
+flush (#89) is bookkeeping emitted at task teardown, its `time` is
+emission time, not session activity, and never moves the end past the
+physical arrival (family 6, inverted). Closes with no observed dock keep
+the last-packet fallback. Riding in
 the `current_run` deepcopy, the key needs no snapshot-shape change; a
 run dict without it (legacy, or a no-dock close) falls back cleanly.
 Future runs only; persisted `history[]` is untouched.
@@ -295,6 +297,16 @@ DEPARTURE_EVIDENCE = frozenset({VS_MOWING, VS_RETURNING})
 # `DOCKED_STATES` / `DOCKED_NOT_CHARGING` / `DOCKED_NOT_USER_PAUSED` are
 # gone (the `VS_DOCKED_` prefix is now a true invariant: it survives only
 # on the two dock-exclusive states).
+
+# HARD-19 §2 (#120): the complete classification of the *steady*
+# vehicleStates — every VS_* constant except the out-of-band firmware-reset
+# sentinel VS_TRANSIENT (8) must belong to exactly one evidentiary group.
+# The partition pin derives the VS_* constants by module introspection and
+# asserts equality against this set, so a future firmware state breaks a
+# test unless it is classified here (not a silent hole).
+KNOWN_VEHICLE_STATES = (
+    DOCK_EVIDENCE | DEPARTURE_EVIDENCE | frozenset({VS_STOPPED, VS_MAPPING})
+)
 
 # BUG-14 (2026-07-09, #89): threshold raised from 99 to 100. The
 # earlier value (99) was chosen when the only observed firmware plateau
@@ -834,12 +846,13 @@ class RunTracker:
                 # precede the stamp because the type-1 that closes IS the
                 # type-1 that stamps; the ordering concern raised on #120
                 # (a later `/state → docked` losing the race) cannot occur —
-                # the stamp never comes from the entity's `/state` stream,
-                # only from this type-1 edge. This is the RUNNING →
-                # PAUSED_DOCKED transition — the same event the mower
-                # entity's non-docked → docked activity is derived from, one
-                # layer down (both read the identical vehicleState feed), so
-                # the tracker owns the edge without importing HA state.
+                # the stamp comes ONLY from this `/location` type-1 edge, a
+                # single stream, so it is race-free by construction. The
+                # mower entity's non-docked → docked activity is derived from
+                # the SEPARATE `/state` `DeviceStateMessage` stream, which has
+                # no write path into the tracker (Sol/Fable review, #126); the
+                # stamp needs no equivalence-of-feeds claim (Fable Retraction
+                # A) — the tracker owns this edge without importing HA state.
                 # Frozen through the docked idle↔charge flips (those re-enter
                 # via the PAUSED_DOCKED branch below, which does not stamp)
                 # and cleared only on departure evidence (§3: a resume with

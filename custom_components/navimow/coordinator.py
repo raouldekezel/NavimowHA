@@ -42,6 +42,7 @@ from .const import (
 from .location import parse_location_type_1, parse_location_type_2
 from .run_tracker import EVENT_RUN_FINISHED as _TRACKER_EVENT_RUN_FINISHED
 from .run_tracker import EVENT_RUN_STARTED as _TRACKER_EVENT_RUN_STARTED
+from .run_tracker import STATE_IDLE as _TRACKER_STATE_IDLE
 from .run_tracker import STATE_RUNNING as _TRACKER_STATE_RUNNING
 from .run_tracker import Event as RunEvent
 from .run_tracker import RunTracker
@@ -238,6 +239,27 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.hass.async_create_task(self._store.async_save(self._build_store_payload()))
         self._last_store_save_monotonic = time.monotonic()
 
+    def _tracker_persist_fingerprint(self) -> tuple[Any, Any, Any]:
+        """The persisted fields a silent vehicle-state transition can move:
+        `(state, vehicle_state, dock_arrival_time)`.
+
+        HARD-19 §4 (#120), corrected per Sol's PR-#126 review: the persisted
+        `vehicle_state` drives the sustained-timer re-arm after a restart, so
+        a docked idle↔charge flip that changes it (RUNNING → PAUSED_DOCKED
+        never firing, `tracker.state` unchanged) still has to be saved —
+        keying the silent save on a `state` change alone left `vehicle_state`
+        stale, and a restart could then re-arm the timer on a stale `vs = 1`
+        and mint a spurious `interrupted` close while the robot was charging,
+        mapping, or already departed. The coordinator compares this tuple
+        before/after a forwarded transition and saves when it moved.
+        """
+        run = self.run_tracker.current_run
+        return (
+            self.run_tracker.state,
+            self.run_tracker.vehicle_state,
+            run.get("dock_arrival_time") if run else None,
+        )
+
     # === /location channel (real-time pose + mowing stats) — FEAT-01 ===
 
     @callback
@@ -308,14 +330,19 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # FEAT-05 (b): feed the run tracker downstream of layer-1 so it
         # only sees ordering-clean packets. Emitted events are just
         # logged here; step (c) will fire them on the HA event bus.
-        tracker_state_before = self.run_tracker.state
+        fingerprint_before = self._tracker_persist_fingerprint()
         run_events = self.run_tracker.process_type2(parsed)
         self._forward_run_events(run_events)
         # HARD-19 §4 (#120): a departure-gated resume (PAUSED_DOCKED →
         # RUNNING, dock stamp cleared) emits no run event; persist that
-        # silent transition too, symmetric with the dock-entry save on the
-        # type-1 path. When an event WAS emitted the forward above saved.
-        if not run_events and self.run_tracker.state != tracker_state_before:
+        # silent transition too, symmetric with the type-1 path — keyed on
+        # the same `(state, vehicle_state, dock_arrival_time)` tuple delta.
+        # When an event WAS emitted the forward above saved.
+        if (
+            not run_events
+            and self.run_tracker.state != _TRACKER_STATE_IDLE
+            and self._tracker_persist_fingerprint() != fingerprint_before
+        ):
             self._schedule_store_save()
         # Stats belong to the coordinator's shared data dict, so refresh
         # entities via the standard path (they are on the ~30 s tick anyway;
@@ -372,20 +399,30 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # HARD-18 (#117): also pass the type-1 `time` so the tracker
             # can anchor a provisional run's `start_time` on the vs=4
             # activation edge (and stamp the wander end on dock entry).
-            tracker_state_before = self.run_tracker.state
+            fingerprint_before = self._tracker_persist_fingerprint()
             run_events = self.run_tracker.process_vehicle_state(
                 vehicle_state, time_ms=parsed.get("time")
             )
             self._forward_run_events(run_events)
-            # HARD-19 §4 (#120): a dock entry (RUNNING → PAUSED_DOCKED,
-            # dock_arrival_time stamped) closes nothing, so it emits no run
-            # event and `_forward_run_events` schedules no save; the
-            # heartbeat save only runs while RUNNING. Persist the silent
-            # transition so the stamp (and the PAUSED_DOCKED context) survives
-            # a restart between the dock edge and the close — this also
-            # repairs the pre-existing mid-pause restart imprecision. When an
-            # event WAS emitted the forward above already saved.
-            if not run_events and self.run_tracker.state != tracker_state_before:
+            # HARD-19 §4 (#120): a dock entry, a docked idle↔charge flip, a
+            # departure edge — any accepted type-1 that moves the persisted
+            # `(state, vehicle_state, dock_arrival_time)` tuple while a run is
+            # open — closes nothing, so it emits no run event and
+            # `_forward_run_events` schedules no save (and the heartbeat save
+            # runs only while RUNNING). Persist the silent transition so the
+            # stamp AND the fresh `vehicle_state` survive a restart between the
+            # edge and the close; keying on the tuple delta (not on `state`
+            # alone) is required so a docked flip that only moves
+            # `vehicle_state` is not lost — see `_tracker_persist_fingerprint`.
+            # Delta-keyed, not per-type-1: the save is fire-and-forget with no
+            # debounce and type-1 is ~2 s, so it must fire on edges only. When
+            # an event WAS emitted the forward above already saved; at rest
+            # (IDLE) the persisted `vehicle_state` drives nothing, so skip.
+            if (
+                not run_events
+                and self.run_tracker.state != _TRACKER_STATE_IDLE
+                and self._tracker_persist_fingerprint() != fingerprint_before
+            ):
                 self._schedule_store_save()
             self.async_set_updated_data(self._build_data())
 
