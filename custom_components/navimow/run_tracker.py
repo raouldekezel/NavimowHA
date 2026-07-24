@@ -68,8 +68,8 @@ re-anchors, so persistent drift there is structurally impossible.
 No calendar assumption survives contact with evidence: nothing here
 encodes what week (ISO Monday, Sunday, etc.) the firmware follows.
 
-State machine (BUG-09 / FEAT-06 / HARD-18 revised; HARD-20 (#122)
-revised — three states, not five).
+State machine (BUG-09 / FEAT-06 / HARD-18 / HARD-19 revised; HARD-20
+(#122) revised — three states, not five).
 
 HARD-20 (SPIKE-03 #115 outcome B): the terminal resting states are gone.
 A close is a machine transition to IDLE; the completed/interrupted
@@ -88,7 +88,7 @@ the BUG-19 forgotten-resting-state class unrepresentable.
     RUNNING(provisional) ─first accepted type-2─▶ RUNNING (seeded)
         (sub₀ / mow_start_type / wk₀ / zone from the packet; start_time
         keeps the activation anchor; no second run_started)
-    RUNNING(provisional) ─vs ∈ DOCKED_STATES sustained 60 s─▶
+    RUNNING(provisional) ─vs ∈ DOCK_EVIDENCE sustained 60 s─▶
         IDLE [run_finished: interrupted]   (aborted start — minimal
         entry: session_area=None, zones=[], real wander duration. Any
         dock, charging included.)
@@ -97,14 +97,15 @@ the BUG-19 forgotten-resting-state class unrepresentable.
     IDLE (seeded reference) ─fresh type-2, strict progress─▶ open NEW
         run [run_started]   (FEAT-06 / #54 — not a reopen; an echo, or an
         empty post-abort reference, is conservatively rejected + counted)
-    RUNNING ─vs ∈ {1,2,3,6}─▶ PAUSED_DOCKED
-    PAUSED_DOCKED ─fresh type-2, strict progress─▶ RUNNING   (resume,
-        same run — intra-run recharge dock does not split)
+    RUNNING ─vs ∈ DOCK_EVIDENCE {1,2}─▶ PAUSED_DOCKED
+    RUNNING/PAUSED_DOCKED ─vs ∈ {3,6} (VS_STOPPED / VS_MAPPING)─▶ (inert)
+    PAUSED_DOCKED ─fresh type-2 while vs ∈ {4,5} (departure)─▶ RUNNING
+        (resume, same run — intra-run recharge dock does not split)
     RUNNING/PAUSED_DOCKED ─(mp ≥ 100 OR (mp ≥ 99 ∧ zones[-1].cmp_max
-        ≥ 10000)) ∧ vs ∈ {1,2,3}─▶ IDLE [run_finished: completed]
+        ≥ 10000)) ∧ vs ∈ {1,2}─▶ IDLE [run_finished: completed]
     RUNNING/PAUSED_DOCKED ─fresh reset (sub < last, sub < ceiling)─▶
         close open run [run_finished], open new run [run_started]
-    PAUSED_DOCKED ─vs ∈ {1,3} sustained 60 s─▶ IDLE
+    PAUSED_DOCKED ─vs = 1 sustained 60 s─▶ IDLE
         [run_finished: interrupted]
 
 HARD-18 (2026-07-21, #117): finishing the FEAT-06 session migration.
@@ -121,13 +122,35 @@ before any type-2 seeds it, the sustained-dock timer commits a minimal
 `interrupted` history entry (an aborted start is a session too — the
 duration includes the real dock-exit / navigation wander).
 
+HARD-19 (2026-07-23, #120): a run's `end_time` is the **dock-arrival**
+type-1 `time` — the RUNNING → PAUSED_DOCKED edge of the *final* dock —
+for every dock-closed run, mirroring HARD-18's activation-anchored
+`start_time`. A session's duration is therefore exactly FEAT-06's
+definition, **activation → dock arrival, both edges type-1-stamped**
+(HARD-18 #117 / HARD-19 #120), so the *return* transit (last mow packet
+→ dock) is now counted, closing the outbound/return asymmetry HARD-18
+opened. The stamp lives in `current_run["dock_arrival_time"]`, set on
+the dock edge in `process_vehicle_state`, frozen through the docked
+idle↔charge flips (charging after arrival never moves the end), and
+dropped on resume (an intra-run recharge dock is not the final dock).
+`_close_run` reads `end = dock_arrival_time` when the stamp is present —
+**strict, no floor** (operator arbitration §1): a late BUG-09 completing
+flush (#89) is bookkeeping emitted at task teardown, its `time` is
+emission time, not session activity, and never moves the end past the
+physical arrival (family 6, inverted). Closes with no observed dock keep
+the last-packet fallback. Riding in
+the `current_run` deepcopy, the key needs no snapshot-shape change; a
+run dict without it (legacy, or a no-dock close) falls back cleanly.
+Future runs only; persisted `history[]` is untouched.
+
 BUG-09 (2026-07-04): the completion criterion is
-`mp ≥ MP_COMPLETION_THRESHOLD` ∧ `vs ∈ {1, 2, 3}` (docked idle /
-charging / catch-all "stopped"; `vs = 6` = post-mow mapping, excluded
-so the map-consolidation phase does not race the completion close).
-See `docs/diag/2026-07-07_map-01_vs-empirical/` — the earlier comment
-that named `vs = 6` an "explicit user pause" was empirically wrong.
-Immediate close, no debounce.
+`mp ≥ MP_COMPLETION_THRESHOLD` ∧ `vs ∈ DOCK_EVIDENCE {1, 2}` (the two
+dock-exclusive states). HARD-19 §2 (#120): `vs = 3` (VS_STOPPED,
+arbitration 3) and `vs = 6` (VS_MAPPING, arbitration 4) are both
+**inert** — location-agnostic, evidence of nothing, so neither completes
+a run. See `docs/diag/2026-07-07_map-01_vs-empirical/` — the earlier
+comment that named `vs = 6` an "explicit user pause" was empirically
+wrong. Immediate close, no debounce.
 The result label is centralised in `_close_run`: `completed` iff the
 last accepted `mp ≥ MP_COMPLETION_THRESHOLD`, else `interrupted` — so
 every close path (fast, reset, sustained-timer) labels consistently.
@@ -221,50 +244,68 @@ STATE_PAUSED_DOCKED = "paused_docked"
 # via `docs/diag/2026-07-07_map-01_vs-empirical/`).
 VS_DOCKED_IDLE = 1
 VS_DOCKED_CHARGING = 2
-# vs = 3 is a **catch-all** for "not mowing, not returning, not
-# charging, not mapping". Observed sub-cases: (a) user pause emitted
-# off-dock during a mow (`/state = isPaused`), (b) transient at-dock
-# idle flip between charging samples (`/state = isIdel`), (c) docked
-# but unpowered (`/state = isDocked` on an unplugged base). The
-# historical name `_UNPOWERED` refers only to case (c); the symbol is
-# kept to minimise ripple across `DOCKED_STATES` and friends, but the
-# semantics are broader — the `/state` channel discriminates sub-cases
-# and posture confirms on-vs-off-dock.
-VS_DOCKED_UNPOWERED = 3
+# vs = 3 is a **generic stopped state** — "not mowing, not returning,
+# not charging, not mapping" — and it is NOT a dock state. Observed
+# sub-cases (MAP-01, 2026-07-07): (a) a real user pause emitted off-dock
+# mid-mow (`/state = isPaused`, posture far from origin), (b) a transient
+# at-dock idle flip between charging samples (`/state = isIdel`),
+# (c) docked on an unpowered base (`/state = isDocked`). Because it spans
+# off-dock and at-dock indistinguishably on the type-1 channel, HARD-19
+# §2 (#120) treats vs = 3 as **evidence of nothing**: in neither evidence
+# set, it never stamps a dock arrival, clears one, arms or disarms the
+# interrupt timer, resumes a paused run, or closes. The historical name
+# `VS_DOCKED_UNPOWERED` (which read case (c) as the whole story) is retired
+# for `VS_STOPPED`. Dock vs departure discrimination lives in the
+# DOCK_EVIDENCE {1,2} / DEPARTURE_EVIDENCE {4,5} sets below.
+VS_STOPPED = 3
 VS_MOWING = 4
 VS_RETURNING = 5
-# vs = 6 = firmware post-mow map-consolidation phase (isMapping in the
-# `/state` channel). The robot is at-dock and immobile during this
-# phase. The earlier label `VS_PAUSED` and its "explicit user pause"
-# comment were empirically wrong — real user pause emits vs = 3.
+# vs = 6 = firmware map-consolidation phase (isMapping in the `/state`
+# channel), typically post-mow at the dock — but mapping is a *driving
+# activity*: a user-initiated remap runs off-dock. HARD-19 §2 arbitration 4
+# (#120) therefore reclassifies vs = 6 as **location-agnostic and inert for
+# dock semantics** (like vs = 3): it is NOT dock evidence and never
+# stamps/arms/closes. The earlier label `VS_PAUSED` and its "explicit user
+# pause" comment were empirically wrong — real user pause emits vs = 3.
 VS_MAPPING = 6
 VS_TRANSIENT = 8  # firmware-reset transient (posture all-zero)
 
-# Any docked variant that puts an open run on hold. vs = 6 (isMapping)
-# belongs here because the robot is at-dock and immobile during
-# post-mow map consolidation.
-DOCKED_STATES = frozenset(
-    {VS_DOCKED_IDLE, VS_DOCKED_CHARGING, VS_DOCKED_UNPOWERED, VS_MAPPING}
-)
-# Docked-and-not-charging: signal that a recharge is not imminent.
-# vs=2 (charging) → resume coming; vs=6 (isMapping post-mow) →
-# firmware consolidating, no timeout; vs ∈ {1, 3} → terminal for the
-# open run once sustained.
-DOCKED_NOT_CHARGING = frozenset({VS_DOCKED_IDLE, VS_DOCKED_UNPOWERED})
-
-# BUG-09: docked variants that qualify for the mp-completion criterion.
-# vs = 6 (isMapping post-mow) is excluded because it is a firmware
-# phase, not a terminal dock state — closing during isMapping would
-# race the consolidation.
+# HARD-19 §2 (#120) — evidence-role naming. These are the ONLY two sets
+# the machine may branch on for dock semantics. They are named for their
+# **evidentiary role**, not their membership arithmetic: a membership name
+# (the old `DOCKED_NOT_CHARGING`) rots silently when the taxonomy moves; a
+# role name encodes its own admission criterion.
 #
-# CAVEAT (documented 2026-07-07, `docs/diag/2026-07-07_map-01_vs-empirical/`):
-# vs = 3 belongs here for the docked/unpowered sub-case, but a real
-# user pause off-dock also emits vs = 3. A user pause at mp = 99 far
-# from the dock would trigger a completion close through this set even
-# though the robot is not at the dock. Not observed in the wild;
-# discussed in the diag findings as a follow-up.
-DOCKED_NOT_USER_PAUSED = frozenset(
-    {VS_DOCKED_IDLE, VS_DOCKED_CHARGING, VS_DOCKED_UNPOWERED}
+# Principle: dock evidence must be a state that is physically
+# **dock-exclusive** — one the robot can only be in while on the base.
+#
+# DOCK_EVIDENCE = arrival. `vs=1` (idle-on-base) and `vs=2` (charging) are
+# dock-exclusive; an edge into one is a true dock arrival → stamp +
+# PAUSED_DOCKED + completion-eligible.
+DOCK_EVIDENCE = frozenset({VS_DOCKED_IDLE, VS_DOCKED_CHARGING})
+# DEPARTURE_EVIDENCE = leaving. The robot is physically off the dock and
+# moving — the only signal that clears an intermediate dock stamp (a
+# mid-run recharge that resumed) and re-opens a provisional abort window.
+DEPARTURE_EVIDENCE = frozenset({VS_MOWING, VS_RETURNING})
+#
+# vs = 3 (VS_STOPPED) and vs = 6 (VS_MAPPING) belong to NEITHER set — both
+# are **location-agnostic** (a user pause and a user-initiated remap both
+# run off-dock), so they are **inert for dock semantics**: they never
+# stamp, clear, arm, disarm, resume, or close (arbitrations 3 & 4). The
+# completion predicate is exactly DOCK_EVIDENCE, and the sustained-timer
+# arms on the single constant VS_DOCKED_IDLE — the retired sets
+# `DOCKED_STATES` / `DOCKED_NOT_CHARGING` / `DOCKED_NOT_USER_PAUSED` are
+# gone (the `VS_DOCKED_` prefix is now a true invariant: it survives only
+# on the two dock-exclusive states).
+
+# HARD-19 §2 (#120): the complete classification of the *steady*
+# vehicleStates — every VS_* constant except the out-of-band firmware-reset
+# sentinel VS_TRANSIENT (8) must belong to exactly one evidentiary group.
+# The partition pin derives the VS_* constants by module introspection and
+# asserts equality against this set, so a future firmware state breaks a
+# test unless it is classified here (not a silent hole).
+KNOWN_VEHICLE_STATES = (
+    DOCK_EVIDENCE | DEPARTURE_EVIDENCE | frozenset({VS_STOPPED, VS_MAPPING})
 )
 
 # BUG-14 (2026-07-09, #89): threshold raised from 99 to 100. The
@@ -319,7 +360,7 @@ CMP_ZONE_COMPLETE_THRESHOLD = 10000
 MP_TASK_END = 100
 RUN_START_SUB_TOLERANCE = 0.5
 
-# Seconds a PAUSED_DOCKED run must remain in DOCKED_NOT_CHARGING before
+# Seconds a PAUSED_DOCKED run must remain docked-idle (vs=1) before
 # it is declared INTERRUPTED. 60 s ≈ 30 type-1 samples at the 2 s
 # cadence — ample debounce for dock-contact transients while keeping
 # end-of-run reporting timely.
@@ -414,8 +455,8 @@ class RunTracker:
         self._last_accepted_time_ms: int | None = None
 
         # Interruption timer, monotonic seconds. `None` while charging /
-        # paused / running; set to `_clock()` when we enter
-        # DOCKED_NOT_CHARGING under an open run.
+        # paused / running; set to `_clock()` when we enter docked-idle
+        # (`vs = 1`) under an open run.
         self._interrupt_timer_started_at: float | None = None
 
         # Pending-reset candidate: a packet with `sub` below the previous
@@ -545,7 +586,7 @@ class RunTracker:
         if (
             self.is_provisional
             and self.state == STATE_PAUSED_DOCKED
-            and self.vehicle_state in DOCKED_STATES
+            and self.vehicle_state in DOCK_EVIDENCE
         ):
             _LOGGER.debug(
                 "run_tracker: type-2 ignored while provisional start "
@@ -657,10 +698,27 @@ class RunTracker:
                 # run's `wk₀`, then accept. A persistent deviation streak
                 # WARNs at HARD-06 / #62 threshold; it never blocks.
                 self._observe_invariant_deviation(parsed)
-                # Resume from a pause when a fresh type-2 continues.
-                if self.state == STATE_PAUSED_DOCKED:
+                # HARD-19 §3 (#120): resume from a pause + drop the
+                # intermediate dock stamp ONLY on departure evidence — the
+                # robot physically left the dock (`vehicle_state ∈ {4, 5}`)
+                # and a fresh type-2 is now continuing the mow, so the dock
+                # it left was a mid-run recharge, not the session's final
+                # dock. Only a subsequent (final) dock's arrival can then end
+                # the run. A type-2 that arrives while still docked
+                # (`vehicle_state ∉ DEPARTURE_EVIDENCE` — the late BUG-09 completing
+                # flush, or a cross-stream skew where the packet beats the
+                # off-dock type-1) still updates accumulators and may complete
+                # the run below, but it never resumes and never clears the
+                # stamp: the run then ends at the frozen dock arrival, not the
+                # flush packet (family 6, inverted). `current_run` is non-None
+                # here (PAUSED_DOCKED implies an open run).
+                if (
+                    self.state == STATE_PAUSED_DOCKED
+                    and self.vehicle_state in DEPARTURE_EVIDENCE
+                ):
                     self.state = STATE_RUNNING
                     self._interrupt_timer_started_at = None
+                    self.current_run["dock_arrival_time"] = None
 
         # HARD-18 (#117): seed a provisional run from its first accepted
         # type-2. The run was opened at the vs=4 activation edge with all
@@ -708,7 +766,7 @@ class RunTracker:
         if parsed.get("time") is not None:
             self._last_accepted_time_ms = parsed["time"]
 
-        # BUG-09: completion criterion (`mp ≥ 99 ∧ vs ∈ {1,2,3}`). Fires
+        # BUG-09: completion criterion (`mp ≥ 99 ∧ vs ∈ {1,2}`). Fires
         # when a fresh type-2 pushes `last_mp` over the threshold while
         # the robot is already docked (the mp-then-dock path is handled
         # by `process_vehicle_state`).
@@ -733,13 +791,16 @@ class RunTracker:
         from `parsed.get("time")`. The keyword-only default keeps every
         existing caller (and test) valid.
 
-        Otherwise: entries into `DOCKED_STATES` from `RUNNING` move a
-        live run into `PAUSED_DOCKED`. Resume of a *seeded* run is driven
-        by a fresh type-2 in `process_type2`, not by a vs=4/5 signal —
-        type-1 briefly showing `vs=4` during a dock-poke must not falsely
-        "resume" a real run. A *provisional* run, having no mowing data
-        to hold for, treats any sustained dock as an aborted start (see
-        `tick` and `_close_run`).
+        Otherwise: entries into `DOCK_EVIDENCE` (`{1, 2}`) from
+        `RUNNING` move a live run into `PAUSED_DOCKED`. Resume of a
+        *seeded* run is driven by a fresh type-2 in `process_type2`
+        (gated on departure evidence `vehicle_state ∈ {4, 5}`, HARD-19 §3),
+        not by the vs edge itself — a type-1 briefly showing `vs=4` during
+        a dock-poke must not by itself "resume" a real run. A *provisional*
+        run, having no mowing data to hold for, treats any sustained dock
+        as an aborted start (see `tick` and `_close_run`). HARD-19 §2
+        (#120): `vs = 3` (VS_STOPPED) is inert here — it returns before any
+        transition.
         """
         events: list[Event] = []
 
@@ -747,6 +808,22 @@ class RunTracker:
             return events
 
         self.vehicle_state = vs
+
+        # HARD-19 §2 (#120): vs = 3 (VS_STOPPED) and vs = 6 (VS_MAPPING) are
+        # both **evidence of nothing** (arbitrations 3 & 4) — location-
+        # agnostic states in neither DOCK_EVIDENCE nor DEPARTURE_EVIDENCE. A
+        # user pause and a user-initiated remap both run off-dock, so
+        # neither is a reliable dock signal. They never stamp a dock
+        # arrival, clear one, arm or disarm the interrupt timer, resume a
+        # paused run, or close: the open run (RUNNING or PAUSED_DOCKED)
+        # rides through untouched, its timer context intact, so MAP-01's
+        # transient `2 → 3 → 2` dock flip and its `1 → 6 → 1` analogue pass
+        # straight through. `vehicle_state` is updated above so the display
+        # ladder can render « En pause » on vs = 3 (§5; vs = 6 reads
+        # « En cours »); no machine transition occurs, and completion cannot
+        # fire (the predicate is DOCK_EVIDENCE = {1, 2}).
+        if vs in (VS_STOPPED, VS_MAPPING):
+            return events
 
         # HARD-18: eager session start. HARD-20 (#122): the three terminal
         # origins collapsed to `IDLE`, so this is a single equality test.
@@ -760,10 +837,39 @@ class RunTracker:
         provisional = self.is_provisional
 
         if self.state == STATE_RUNNING:
-            if vs in DOCKED_STATES:
+            if vs in DOCK_EVIDENCE:
+                # HARD-19 (#120): stamp the dock-arrival edge on the current
+                # run FIRST — before the arm / complete logic below — so a
+                # completion close fired later in this same call (the BUG-09
+                # dock-then-`mp = 100` fast path, #89) reads a stamp that
+                # already exists. There is no window where the close can
+                # precede the stamp because the type-1 that closes IS the
+                # type-1 that stamps; the ordering concern raised on #120
+                # (a later `/state → docked` losing the race) cannot occur —
+                # the stamp comes ONLY from this `/location` type-1 edge, a
+                # single stream, so it is race-free by construction. The
+                # mower entity's non-docked → docked activity is derived from
+                # the SEPARATE `/state` `DeviceStateMessage` stream, which has
+                # no write path into the tracker (Sol/Fable review, #126); the
+                # stamp needs no equivalence-of-feeds claim (Fable Retraction
+                # A) — the tracker owns this edge without importing HA state.
+                # Frozen through the docked idle↔charge flips (those re-enter
+                # via the PAUSED_DOCKED branch below, which does not stamp)
+                # and cleared only on departure evidence (§3: a resume with
+                # `vehicle_state ∈ {4, 5}` — a mid-run recharge dock the
+                # robot then left is not the session's final dock). vs entry
+                # is DOCK_EVIDENCE `{1, 2}` only — vs = 3 and vs = 6 returned
+                # inert above and never reach this stamp. Gated on `time_ms`
+                # so a legacy
+                # caller without it falls back to the last packet cursor in
+                # `_close_run`. For a provisional run the stamp coincides
+                # with `last_time` (both = this edge's `time_ms`), so the
+                # HARD-18 abort mechanics below are untouched.
+                if time_ms is not None:
+                    self.current_run["dock_arrival_time"] = time_ms
                 # HARD-18 abort arming: a provisional run has no mowing
-                # data to hold for, so *any* dock entry (including vs=2
-                # charging and vs=6) starts the close countdown. The
+                # data to hold for, so *any* DOCK_EVIDENCE entry (vs=1 idle
+                # or vs=2 charging) starts the close countdown. The
                 # wander end is stamped here on the RUNNING→PAUSED_DOCKED
                 # edge and then frozen — a later charge↔idle flip an hour
                 # after the abort must not inflate the duration.
@@ -782,13 +888,15 @@ class RunTracker:
                 self.current_run["last_time"] = time_ms
         elif self.state == STATE_PAUSED_DOCKED:
             if provisional:
-                if vs in DOCKED_STATES:
+                if vs in DOCK_EVIDENCE:
                     # Still docked — keep the abort countdown armed
                     # regardless of charging; do NOT refresh `last_time`
                     # (frozen at the dock-entry edge above).
                     self._arm_interrupt_timer()
                 else:
-                    # Left the dock again before the debounce fired — the
+                    # Departure evidence (`vs ∈ {4, 5}` — vs = 3 returned
+                    # inert above, so this else is reached only on {4, 5}):
+                    # left the dock again before the debounce fired, so the
                     # provisional window re-opens off-dock; a real type-2
                     # (resume + seed) or a sustained re-dock (abort) will
                     # resolve it. Disarm and keep the wander duration live.
@@ -796,6 +904,9 @@ class RunTracker:
                     self._interrupt_timer_started_at = None
                     if time_ms is not None:
                         self.current_run["last_time"] = time_ms
+                    # HARD-19 §3 (#120): that dock was intermediate — drop
+                    # its arrival stamp (symmetric with the seeded resume).
+                    self.current_run["dock_arrival_time"] = None
             else:
                 # Charging / explicit pause reset the timer; docked-and-
                 # not-charging arms it.
@@ -805,8 +916,10 @@ class RunTracker:
         # before the robot arrived at the dock — process_type2 alone
         # can't fire the close in that ordering because no further
         # type-2 packet is guaranteed after dock arrival. Firing here
-        # closes the run as soon as `vs` enters {1, 2, 3}. A provisional
-        # run cannot complete here (`last_mp is None`).
+        # closes the run as soon as `vs` enters DOCK_EVIDENCE {1, 2}
+        # (vs = 3 and vs = 6 already returned inert above). A provisional
+        # run cannot
+        # complete here (`last_mp is None`).
         completion = self._maybe_complete_run()
         if completion is not None:
             events.append(completion)
@@ -818,7 +931,7 @@ class RunTracker:
 
         Called periodically (coordinator cadence ~30 s). Two roles:
         - Arm the timer if we are `PAUSED_DOCKED` under
-          `DOCKED_NOT_CHARGING` and it is not yet running. This makes
+          docked-idle (`vs = 1`) and it is not yet running. This makes
           the interruption detector survive an HA restart *without*
           needing a fresh `vehicleState` change to re-arm — a `restore()`
           followed by a tick suffices.
@@ -836,12 +949,12 @@ class RunTracker:
             # HARD-18 (#117): a *provisional* run (aborted start) fires on
             # ANY sustained dock — charging included — because there is no
             # mowing data to hold for. A *seeded* run keeps the original
-            # semantics: only DOCKED_NOT_CHARGING arms, so a mid-run
+            # semantics: only vs = 1 (idle) arms, so a mid-run
             # recharge (vs=2) never times out.
             docked = (
-                self.vehicle_state in DOCKED_STATES
+                self.vehicle_state in DOCK_EVIDENCE
                 if self.is_provisional
-                else self.vehicle_state in DOCKED_NOT_CHARGING
+                else self.vehicle_state == VS_DOCKED_IDLE
             )
             if docked:
                 if self._interrupt_timer_started_at is None:
@@ -1347,6 +1460,10 @@ class RunTracker:
             "last_wk": wk,
             "last_mp": parsed.get("mowing_percentage"),
             "zones": [],
+            # HARD-19 §3 (#120): a fresh run carries no dock arrival — the
+            # key is present-and-None so the stamp is a first-class field
+            # (a legacy snapshot without it still falls back via `.get`).
+            "dock_arrival_time": None,
         }
         self.state = STATE_RUNNING
         self._interrupt_timer_started_at = None
@@ -1396,6 +1513,10 @@ class RunTracker:
             "last_mp": None,
             "zones": [],
             "provisional": True,
+            # HARD-19 §3 (#120): structural clear — a provisional run has no
+            # dock arrival until it docks. For an aborted start the dock
+            # entry stamp coincides with `last_time` (§1c/§1d values agree).
+            "dock_arrival_time": None,
         }
         self.state = STATE_RUNNING
         self._interrupt_timer_started_at = None
@@ -1429,7 +1550,29 @@ class RunTracker:
             # wander `duration_ms` from the type-1 `last_time`).
             self.counters["aborted_starts_committed"] += 1
         start = r.get("start_time")
-        end = r.get("last_time")
+        # HARD-19 (#120): a run that closed at a dock ends at the dock's
+        # arrival edge, not at its last accepted type-2. `dock_arrival_time`
+        # is stamped on the RUNNING → PAUSED_DOCKED transition (see
+        # `process_vehicle_state`), frozen through the docked idle↔charge
+        # flips and through a late completing flush (§3 clears the stamp
+        # only on departure evidence), so the session duration is exactly
+        # FEAT-06's activation → dock arrival (symmetric with HARD-18's
+        # activation-anchored `start_time`). The end is the stamp itself —
+        # strict, no `max(…, last_time)` floor (operator arbitration §1:
+        # "use dock_arrival_time as end_time INSTEAD OF the last type-2
+        # timestamp"; a late BUG-09 #89 completing flush is bookkeeping
+        # emitted at task teardown, its `time` is emission time, not session
+        # activity, so it must not move the end past the physical arrival).
+        # One accepted cosmetic consequence: a zone's last packet time may
+        # exceed the run's `end_time` by the flush seconds. Closes with no
+        # observed dock (a reset-driven close mid-mow, a legacy / degraded
+        # run without the key) carry no stamp and fall back to the last
+        # packet cursor. `last_time` is deliberately NOT mutated — it stays
+        # the packet cursor the post-close gating baseline (`last_sub`) and
+        # everything downstream read.
+        last_time = r.get("last_time")
+        dock_arrival = r.get("dock_arrival_time")
+        end = dock_arrival if dock_arrival is not None else last_time
         duration_ms: int | None = None
         if start is not None and end is not None:
             duration_ms = end - start
@@ -1466,7 +1609,7 @@ class RunTracker:
     def _maybe_complete_run(self) -> Event | None:
         """BUG-09 completion criterion (BUG-14 refined): close on
         `mp ≥ 100`, OR on `mp ≥ 99 ∧ zones[-1].cmp_max ≥ 10000`, with
-        `vehicle_state ∈ DOCKED_NOT_USER_PAUSED` (`{1, 2, 3}`) in either
+        `vehicle_state ∈ DOCK_EVIDENCE` (`{1, 2}`) in either
         case. Immediate close with no debounce. Returns the close event,
         or `None` when neither branch fires.
 
@@ -1480,7 +1623,7 @@ class RunTracker:
         """
         if self.state not in (STATE_RUNNING, STATE_PAUSED_DOCKED):
             return None
-        if self.vehicle_state not in DOCKED_NOT_USER_PAUSED:
+        if self.vehicle_state not in DOCK_EVIDENCE:
             return None
         if not self._is_completed():
             return None
@@ -1576,12 +1719,13 @@ class RunTracker:
     # ------------------------------------------------------------- #
 
     def _start_interrupt_timer_if_applicable(self, vs: int) -> None:
-        if vs in DOCKED_NOT_CHARGING:
+        if vs == VS_DOCKED_IDLE:
             if self._interrupt_timer_started_at is None:
                 self._interrupt_timer_started_at = self._clock()
         else:
-            # vs=2 (charging) or vs=6 (paused) explicitly holds the run
-            # without a countdown.
+            # vs=2 (charging) — and vs=4/5 reaching here from a seeded
+            # PAUSED_DOCKED — hold the run without a countdown (vs=3/6 are
+            # inert and never reach this helper).
             self._interrupt_timer_started_at = None
 
     def _arm_interrupt_timer(self) -> None:
@@ -1678,9 +1822,12 @@ class RunTracker:
         # `_interrupt_timer_started_at` is monotonic and cannot be
         # restored across a process restart. `tick()` re-arms it on the
         # first call after restart if the machine is `PAUSED_DOCKED`
-        # under `vs ∈ {1, 3}` — so the sustained-docked interruption
-        # detector survives a restart even if `vehicle_state` is
-        # restored from the snapshot rather than re-derived. A pending
+        # under `vs = 1` (docked-idle, HARD-19 §2) — so the
+        # sustained-docked interruption detector survives a restart even if
+        # `vehicle_state` is restored from the snapshot rather than
+        # re-derived. A restored `PAUSED_DOCKED` under `vs = 3` cannot arm
+        # (vs = 3 is not a dock state) — it waits for the next real dock or
+        # departure edge. A pending
         # reset is intentionally *not* persisted: worst case a mid-flight
         # candidate re-confirms one packet later after a restart, which
         # is safer than serialising a transient decision.

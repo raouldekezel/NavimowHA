@@ -160,7 +160,7 @@ def test_full_recharge_cycle_with_mp_100_finish_closes_completed() -> None:
     """The alternate happy path: some firmware tasks do emit `mp = 100`
     on the resumed segment (2026-05-25 and 2026-07-04 afternoon are
     the two documented occurrences). The BUG-14 fast path fires on
-    the `mp = 100 ∧ vs ∈ {1,2,3}` branch — cmp not even required.
+    the `mp = 100 ∧ vs ∈ DOCK_EVIDENCE {1,2}` branch — cmp not even required.
     Same invariant: one session, one close, `completed`.
     """
     tracker = RunTracker()
@@ -206,8 +206,10 @@ def test_fresh_type2_at_mp_99_during_recharge_pause_resumes_run() -> None:
     tracker.process_vehicle_state(VS_DOCKED_CHARGING)
     assert tracker.state == STATE_PAUSED_DOCKED
 
-    # A follow-up type-2 with strict progress on `sub` (typical of the
-    # first packet emitted after the robot leaves the dock).
+    # The robot leaves the dock (departure evidence vs=4, HARD-19 §3 #120),
+    # then a follow-up type-2 with strict progress on `sub` (the first
+    # packet emitted after leaving the dock) resumes the same run.
+    tracker.process_vehicle_state(VS_MOWING)
     events = _process(tracker, _pkt(mp=99, sub=200.5, t=2_000))
     assert tracker.state == STATE_RUNNING
     # No close event fired anywhere in this continuation.
