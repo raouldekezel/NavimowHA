@@ -41,6 +41,7 @@ from custom_components.navimow.run_tracker import (
     EVENT_RUN_FINISHED,
     EVENT_RUN_STARTED,
     INTERRUPT_SUSTAIN_SECONDS,
+    KNOWN_VEHICLE_STATES,
     RESULT_COMPLETED,
     RESULT_INTERRUPTED,
     SNAPSHOT_VERSION,
@@ -244,7 +245,8 @@ def test_arbitration_pin_charge_idle_flips_do_not_move_end_interrupted() -> None
 
 def test_completed_sustained_close_after_restore_ends_at_dock() -> None:
     """The completed arm of the arbitration pin. A completed run closes on
-    the fast path the instant a live vs-edge in {1,2,3} arrives, so the
+    the fast path the instant a live DOCK_EVIDENCE {1,2} vs-edge arrives, so
+    the
     sustained-timer *completed* path is only reachable post-restore, where
     loading runs no fast-path re-evaluation. A restored completed-pending
     PAUSED_DOCKED run carrying a dock stamp closes `completed` via the
@@ -485,9 +487,9 @@ def test_bug09_dock_first_then_mp100_ends_at_dock_not_the_flush_packet() -> None
 
 def test_provisional_abort_end_unchanged_and_stamp_coincides() -> None:
     """HARD-18's aborted-start entry is untouched: its `last_time` IS the
-    dock entry, so the new stamp coincides and `max(stamp, last_time)`
-    yields the same end. §1c/§1d mechanics are not refactored onto the new
-    field (one change per PR) — the values simply agree.
+    dock entry, so the new stamp coincides — the strict `end = dock_arrival`
+    equals the last-packet fallback here. §1c/§1d mechanics are not
+    refactored onto the new field (one change per PR) — the values agree.
     """
     clk = _FakeClock()
     tracker = RunTracker(clock=clk)
@@ -806,15 +808,24 @@ def test_regression_vs_5_then_vs_6_then_vs_1_post_mow() -> None:
 
 
 def test_partition_pin_every_vehiclestate_is_classified() -> None:
-    """Partition pin (HARD-19 §2, #120): the four evidentiary groups
-    partition every steady vehicleState — DOCK_EVIDENCE {1,2},
-    DEPARTURE_EVIDENCE {4,5}, and the two inert singletons VS_STOPPED (3) /
-    VS_MAPPING (6). The groups are pairwise disjoint and their union is
-    {1..6}, so a future firmware `vs = 7` breaks THIS test instead of
-    falling into a silent hole. VS_TRANSIENT (8) is the out-of-band
-    firmware-reset sentinel, handled before the partition (returns early),
-    so it is deliberately outside the union.
+    """Partition pin (HARD-19 §2, #120), future-proofed per Sol's PR-#126
+    review. The test DERIVES the steady VS_* integer constants by module
+    introspection (excluding the out-of-band reset sentinel VS_TRANSIENT)
+    and asserts they equal the production `KNOWN_VEHICLE_STATES`, which is in
+    turn the disjoint union of the four evidentiary groups. A future firmware
+    constant (say `VS_NEW = 7`) added to the module but left unclassified
+    breaks THIS test — the earlier hand-built `{1..6}` union stayed green
+    because it never read the module's constants (the vacuous-green class).
     """
+    import custom_components.navimow.run_tracker as rt
+
+    introspected = {
+        v
+        for name, v in vars(rt).items()
+        if name.startswith("VS_") and isinstance(v, int) and name != "VS_TRANSIENT"
+    }
+    assert introspected == KNOWN_VEHICLE_STATES  # a new/unclassified VS_* breaks this
+
     groups = [
         DOCK_EVIDENCE,
         DEPARTURE_EVIDENCE,
@@ -824,9 +835,8 @@ def test_partition_pin_every_vehiclestate_is_classified() -> None:
     for i in range(len(groups)):
         for j in range(i + 1, len(groups)):
             assert not (groups[i] & groups[j]), (groups[i], groups[j])
-    union = set().union(*groups)
-    assert union == {1, 2, 3, 4, 5, 6}
-    assert VS_TRANSIENT not in union  # reset sentinel, out of band
+    assert set().union(*groups) == KNOWN_VEHICLE_STATES  # disjoint union == KNOWN
+    assert VS_TRANSIENT not in KNOWN_VEHICLE_STATES  # reset sentinel, out of band
 
 
 # ===================================================================== #
@@ -965,11 +975,17 @@ def test_pin_o2_state_topic_docked_writes_nothing_then_type1_ends_at_dock() -> N
 def test_dock_entry_persists_even_though_no_run_event_fires() -> None:
     """§4 (#120), coordinator-level with a fake Store hook. A dock entry
     that closes nothing (mp < 100) emits no run event, and the heartbeat
-    save only runs while RUNNING — so the stamp used to live only in
-    memory until the eventual close. Now the silent RUNNING → PAUSED_DOCKED
-    transition schedules a Store save. A subsequent idle↔charge flip that
-    does NOT change the tracker state schedules no extra save (no
-    over-persisting).
+    save only runs while RUNNING — so the stamp used to live only in memory
+    until the eventual close. Now the silent RUNNING → PAUSED_DOCKED
+    transition schedules a Store save.
+
+    Sol's PR-#126 correction (§1): a subsequent docked idle↔charge flip
+    (2 → 1) ALSO persists — it changes the on-disk `vehicle_state`, which
+    drives the sustained-timer re-arm after a restart; keying the save on a
+    `state` change alone (the first cut) would have lost it. But a forwarded
+    transition that moves NOTHING persist-relevant (a VS_TRANSIENT that
+    returns inert) schedules no save — the key is the tuple delta, not the
+    bare vs-change.
     """
     coord = _make_coordinator()
     coord._store = MagicMock()  # fake save hook — _schedule_store_save proceeds
@@ -1008,8 +1024,9 @@ def test_dock_entry_persists_even_though_no_run_event_fires() -> None:
     # A save WAS scheduled despite no run event.
     assert coord.hass.async_create_task.call_count == saves_before + 1
 
-    # An idle↔charge flip that does not change the tracker state (still
-    # PAUSED_DOCKED) schedules no extra save.
+    # A docked idle↔charge flip (2 → 1): state unchanged (still
+    # PAUSED_DOCKED) but the persisted vehicle_state moves → MUST save
+    # (Sol §1, inverting the first cut's "no save on a docked flip").
     saves_after_dock = coord.hass.async_create_task.call_count
     with patch("custom_components.navimow.coordinator.async_dispatcher_send"):
         coord._handle_location_position(
@@ -1022,4 +1039,189 @@ def test_dock_entry_persists_even_though_no_run_event_fires() -> None:
             }
         )
     assert coord.run_tracker.state == STATE_PAUSED_DOCKED
-    assert coord.hass.async_create_task.call_count == saves_after_dock
+    assert coord.run_tracker.vehicle_state == VS_DOCKED_IDLE
+    assert coord.hass.async_create_task.call_count == saves_after_dock + 1
+
+    # A VS_TRANSIENT edge returns inert (tracker unchanged) → the tuple
+    # delta is empty → no save. Delta-keying, not per-vs-change.
+    saves_after_flip = coord.hass.async_create_task.call_count
+    with patch("custom_components.navimow.coordinator.async_dispatcher_send"):
+        coord._handle_location_position(
+            {
+                "type": 1,
+                "postureX": "0.0",
+                "postureY": "0.0",
+                "vehicleState": VS_TRANSIENT,
+                "time": dock_y + 2_000,
+            }
+        )
+    assert coord.run_tracker.state == STATE_PAUSED_DOCKED
+    assert coord.run_tracker.vehicle_state == VS_DOCKED_IDLE  # unchanged (inert)
+    assert coord.hass.async_create_task.call_count == saves_after_flip  # no save
+
+
+def _seed_paused_docked_at_vs1(coord, t: int) -> None:
+    """Drive `coord` to a seeded run PAUSED_DOCKED at vs=1 (mp<100), via the
+    real type-1/type-2 handlers."""
+    _feed_type2(
+        coord,
+        {
+            "type": 2,
+            "currentMowBoundary": 1,
+            "currentMowProgress": 5000,
+            "mowingPercentage": 50,
+            "subtotalArea": "20.0",
+            "mowingWeekArea": "300.0",
+            "time": t + 1_000,
+        },
+    )
+    coord.vehicle_state = VS_MOWING
+    with patch("custom_components.navimow.coordinator.async_dispatcher_send"):
+        coord._handle_location_position(
+            {
+                "type": 1,
+                "postureX": "0.0",
+                "postureY": "0.0",
+                "vehicleState": VS_DOCKED_IDLE,
+                "time": t + 3_000,
+            }
+        )
+    assert coord.run_tracker.state == STATE_PAUSED_DOCKED
+
+
+@pytest.mark.parametrize(
+    "flip_to", [VS_DOCKED_CHARGING, VS_STOPPED, VS_MAPPING, VS_MOWING, VS_RETURNING]
+)
+def test_silent_vehicle_state_flip_while_docked_persists(flip_to: int) -> None:
+    """Sol §1 (#126): while a run is open, ANY accepted type-1 that moves the
+    persisted `vehicle_state` — a charge flip (2), an inert blip (3/6), or a
+    departure edge (4/5) — schedules a Store save, so the restored
+    `vehicle_state` can never drive a wrong sustained-timer re-arm."""
+    coord = _make_coordinator()
+    coord._store = MagicMock()
+    t = 1_000_000_000_000
+    _seed_paused_docked_at_vs1(coord, t)
+    saves_before = coord.hass.async_create_task.call_count
+
+    with patch("custom_components.navimow.coordinator.async_dispatcher_send"):
+        coord._handle_location_position(
+            {
+                "type": 1,
+                "postureX": "0.0",
+                "postureY": "0.0",
+                "vehicleState": flip_to,
+                "time": t + 4_000,
+            }
+        )
+    assert coord.run_tracker.vehicle_state == flip_to
+    assert coord.hass.async_create_task.call_count == saves_before + 1
+
+
+def test_departure_type2_resume_persists_the_stamp_clear() -> None:
+    """Sol §1 (#126): a departure-gated type-2 resume (PAUSED_DOCKED →
+    RUNNING, `dock_arrival_time` cleared) emits no run event but moves the
+    persisted tuple, so `_handle_location_stats` must schedule a save."""
+    coord = _make_coordinator()
+    coord._store = MagicMock()
+    t = 1_000_000_000_000
+    _seed_paused_docked_at_vs1(coord, t)
+    # Depart (vs=4) — a seeded run does not resume on the type-1 alone.
+    with patch("custom_components.navimow.coordinator.async_dispatcher_send"):
+        coord._handle_location_position(
+            {
+                "type": 1,
+                "postureX": "0.0",
+                "postureY": "0.0",
+                "vehicleState": VS_MOWING,
+                "time": t + 4_000,
+            }
+        )
+    assert coord.run_tracker.state == STATE_PAUSED_DOCKED
+    saves_before = coord.hass.async_create_task.call_count
+
+    # A continuation type-2 with vehicle_state=4 → resume + clear stamp, via
+    # the REAL stats handler (which carries the §4 save logic).
+    coord._handle_location_stats(
+        {
+            "type": 2,
+            "currentMowBoundary": 1,
+            "currentMowProgress": 5500,
+            "mowingPercentage": 55,
+            "subtotalArea": "25.0",
+            "mowingWeekArea": "305.0",
+            "time": t + 5_000,
+        }
+    )
+    assert coord.run_tracker.state == STATE_RUNNING
+    assert coord.run_tracker.current_run["dock_arrival_time"] is None
+    assert coord.hass.async_create_task.call_count == saves_before + 1
+
+
+@pytest.mark.parametrize(
+    "vs,should_close",
+    [
+        (VS_DOCKED_IDLE, True),  # idle → re-arms → sustained close
+        (VS_DOCKED_CHARGING, False),  # charging → held, no arm
+        (VS_STOPPED, False),  # inert
+        (VS_MAPPING, False),  # inert
+        (VS_MOWING, False),  # departed → not docked
+        (VS_RETURNING, False),  # departed
+    ],
+)
+def test_restore_sustained_timer_respects_persisted_vehicle_state(
+    vs: int, should_close: bool
+) -> None:
+    """Sol's five restart pins (#126): the persisted `vehicle_state`,
+    restored after a crash, alone decides the sustained-timer behaviour.
+    Only `vs = 1` (docked-idle) re-arms and closes; charging (2) holds; the
+    inert (3/6) and departed (4/5) states neither arm nor close. This is
+    exactly why a docked flip must persist a FRESH `vehicle_state` — a stale
+    `vs = 1` restored here would mint a spurious `interrupted` close while
+    the robot is charging, mapping, or departed.
+    """
+    dock_y = _T0 + 3_000
+    snap = {
+        "version": SNAPSHOT_VERSION,
+        "state": STATE_PAUSED_DOCKED,
+        "vehicle_state": vs,
+        "current_run": {
+            "start_time": _T0,
+            "mow_start_type": 0,
+            "wk0": 50.0,
+            "sub0": 10.0,
+            "last_time": _T0 + 1_000,
+            "last_sub": 40.0,
+            "last_wk": 90.0,
+            "last_mp": 50,  # below threshold → interrupted if it closes
+            "zones": [
+                {
+                    "boundary_id": 1,
+                    "first_time": _T0,
+                    "last_time": _T0 + 1_000,
+                    "cmp_max": 5000,
+                    "sub_entry": 10.0,
+                    "sub_exit": 40.0,
+                }
+            ],
+            "dock_arrival_time": dock_y,
+        },
+        "last_accepted_wk": 90.0,
+        "last_accepted_time_ms": _T0 + 1_000,
+        "drops": {"pending_reset_holds": 0},
+        "counters": {},
+    }
+    clk = _FakeClock()
+    tracker = RunTracker(clock=clk)
+    assert tracker.restore(snap) is True
+
+    tracker.tick()  # arm attempt (depends on the restored vehicle_state)
+    clk.advance(INTERRUPT_SUSTAIN_SECONDS + 5)
+    closed = tracker.tick()
+    if should_close:
+        assert [e.kind for e in closed] == [EVENT_RUN_FINISHED]
+        assert closed[0].payload["result"] == RESULT_INTERRUPTED
+        assert closed[0].payload["end_time"] == dock_y  # strict frozen arrival
+        assert tracker.state == STATE_IDLE
+    else:
+        assert closed == []
+        assert tracker.state == STATE_PAUSED_DOCKED

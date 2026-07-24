@@ -709,8 +709,9 @@ def test_boundary_zero_updates_run_but_not_zones() -> None:
 
 def test_mp_100_plus_dock_closes_run_completed() -> None:
     """BUG-09 revised the completion criterion: `mp ≥ 99` alone is not
-    enough; the robot must also be docked (`vs ∈ {1, 2, 3}`). A run
-    that reaches `mp = 100` mid-mow stays open until the robot docks.
+    enough; the robot must also be docked (`vs ∈ DOCK_EVIDENCE {1, 2}` —
+    HARD-19 §2 narrowed it from {1,2,3}). A run that reaches `mp = 100`
+    mid-mow stays open until the robot docks.
     """
     tracker = RunTracker()
     events = _feed(
