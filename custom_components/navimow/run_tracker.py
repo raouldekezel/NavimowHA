@@ -563,6 +563,53 @@ class RunTracker:
         if self._gate_run_start_vestige(parsed):
             return events
 
+        # BUG-15 (#90): drop the all-zero session-init sentinel. The firmware
+        # emits a zero-payload type-2 at task start
+        # (`boundary = 0 ∧ mp = 0 ∧ cmp = 0 ∧ sub = 0 ∧ action = -1`) ~15 s
+        # AFTER `vs = 4` (validated 4/4 in the 2026-05 corpus, 3/3 in the
+        # post-HARD-18 window). It carries no zone, no progress, and nothing
+        # the physical `vs = 4` edge (HARD-18) does not already give — a real
+        # session-init therefore always arrives while the tracker is already
+        # RUNNING (the `vs = 4` provisional is open), so it never reaches the
+        # `STATE_IDLE` open. Left in, it is pure liability:
+        # - from `STATE_IDLE` it opens a phantom run that then lingers (it
+        #   opens RUNNING while the robot is already docked, so no
+        #   `RUNNING → PAUSED_DOCKED` edge arms the sustained timer — observed
+        #   ~10.9 h on 2026-07-24) and can engulf the next real mow;
+        # - in `STATE_RUNNING` on a seeded run (`last_sub > 0`) its `sub = 0`
+        #   trips `is_reset` → close + reopen, splitting a real run.
+        # Dropping it only ever removes a docked spurious sentinel; the real
+        # run seeds on the first boundary-carrying packet a moment later
+        # (`sub0` anchors ~2.5 m² later, ~1 %).
+        #
+        # Drop signature = `boundary ∈ {0, None} ∧ mp = 0 ∧ sub = 0`, keyed on
+        # boundary/mp/sub — sufficient to separate the sentinel from the
+        # `boundary = 0 ∧ mp = 100` task-*end* marker (completion + final area,
+        # which must NOT drop). `cmp` is 0 on the wire but not tested: the
+        # task-end carries `cmp = 0` too, so it adds no discrimination.
+        # `mp` / `sub` are compared **explicitly** to zero, no `or 0` coercion
+        # (Sol review, #129): the parser represents a missing/invalid field as
+        # `None`, and absence of a field must not be read as a confirmed zero
+        # — a sparse or malformed packet fails open onto the normal path.
+        boundary = parsed.get("boundary")
+        mp = parsed.get("mowing_percentage")
+        sub = parsed.get("area_session")
+        if boundary in (None, 0) and mp == 0 and sub == 0.0:
+            _LOGGER.debug(
+                "run_tracker: all-zero session-init sentinel dropped (BUG-15) "
+                "(state=%s vs=%s boundary=%s mp=%s cmp=%s sub=%s wk=%s action=%s time=%s)",
+                self.state,
+                self.vehicle_state,
+                boundary,
+                mp,
+                parsed.get("current_mow_progress"),
+                sub,
+                parsed.get("area_week"),
+                parsed.get("action"),
+                parsed.get("time"),
+            )
+            return events
+
         # HARD-18 (#117) — Sol/Fable review 2026-07-23 (blocking): a
         # type-2 that arrives while a provisional start is STILL DOCKED
         # must be ignored — neither resume nor seed. Placed right after

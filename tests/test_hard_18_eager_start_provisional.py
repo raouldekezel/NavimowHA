@@ -376,18 +376,28 @@ def test_honest_seeding_keeps_activation_start_time() -> None:
     assert r["zones"] and r["zones"][0]["boundary_id"] == 1
 
 
-def test_bug06_sentinel_first_packet_seeds_sub0_zero() -> None:
-    """Explicitly-accepted parity (brief §1f): a BUG-06 all-zero
-    sentinel as the first window packet seeds `sub0 = 0.0`, exactly as
-    `_open_run(sentinel)` would from IDLE. Not a regression.
+def test_bug15_sentinel_dropped_provisional_seeds_on_first_real_packet() -> None:
+    """BUG-15 (#90) revised the former BUG-06 parity: the all-zero
+    session-init sentinel is now DROPPED (it carries no zone/progress, and
+    `vs = 4` already marks the session start), so it no longer seeds. The
+    provisional run stays provisional through the sentinel and seeds on the
+    first boundary-carrying packet — `sub0` anchors on that real packet, not
+    on the sentinel's 0.0; the activation `start_time` is untouched.
     """
     tracker = RunTracker()
-    tracker.process_vehicle_state(VS_MOWING, time_ms=_T0)
-    _feed_t2(tracker, boundary=0, mp=0, cmp=0, sub=0.0, time=_T0 + 1_000)
+    tracker.process_vehicle_state(VS_MOWING, time_ms=_T0)  # provisional
+    # The all-zero sentinel is dropped — no seeding, no run event.
+    ev = _feed_t2(tracker, boundary=0, mp=0, cmp=0, sub=0.0, time=_T0 + 1_000)
+    assert ev == []
+    assert tracker.is_provisional is True
+    assert tracker.current_run["sub0"] is None  # not seeded by the sentinel
+
+    # The first real boundary packet seeds the provisional.
+    _feed_t2(tracker, boundary=1, mp=3, cmp=104, sub=2.49, time=_T0 + 2_000)
     assert tracker.is_provisional is False
-    assert tracker.current_run["sub0"] == 0.0
-    # boundary=0 is filtered from zone accounting (BUG-06).
-    assert tracker.current_run["zones"] == []
+    assert tracker.current_run["sub0"] == 2.49  # anchored on the real packet
+    assert tracker.current_run["start_time"] == _T0  # activation anchor kept
+    assert tracker.current_run["zones"][0]["boundary_id"] == 1
 
 
 # --------------------------------------------------------------------- #
