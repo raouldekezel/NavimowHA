@@ -26,7 +26,10 @@ Observable-only (tracker API, `caplog`); no source introspection.
 
 from __future__ import annotations
 
+import copy
 import logging
+
+import pytest
 
 from custom_components.navimow.location import parse_location_type_2
 from custom_components.navimow.run_tracker import (
@@ -95,12 +98,12 @@ def test_sentinel_from_idle_with_reference_opens_nothing() -> None:
     reference, the all-zero sentinel is dropped — no `run_started`, the
     tracker stays IDLE, the closed reference is untouched."""
     tr = _idle_with_reference()
-    ref_before = dict(tr.current_run)
+    ref_before = copy.deepcopy(tr.current_run)
 
     ev = tr.process_type2(_t2(time=_T0 + 100_000, **_SENTINEL))
     assert ev == []
     assert tr.state == STATE_IDLE
-    assert tr.current_run == ref_before  # reference not mutated
+    assert tr.current_run == ref_before  # reference not mutated (deep)
 
 
 def test_sentinel_from_cold_idle_opens_nothing() -> None:
@@ -158,6 +161,38 @@ def test_sentinel_in_running_does_not_split_a_seeded_run() -> None:
     assert tr.state == STATE_RUNNING
     assert tr.current_run["start_time"] == start  # same run, not split
     assert tr.current_run["last_sub"] == 44.0  # accumulator not reset to 0
+
+
+# ===================================================================== #
+# Fail-open — a sparse/malformed packet is NOT a sentinel (Sol, #129)     #
+# ===================================================================== #
+
+
+@pytest.mark.parametrize(
+    "boundary,mp,sub",
+    [
+        (None, None, None),  # every field absent
+        (0, None, 0.0),  # mp absent
+        (None, 0, None),  # sub absent
+    ],
+)
+def test_sparse_packet_is_not_classified_as_sentinel(boundary, mp, sub, caplog) -> None:
+    """A missing/invalid field parses to `None`; absence must not be read as a
+    confirmed zero. These sparse shapes must fail open onto the normal tracker
+    path and must NOT emit the sentinel-drop DEBUG line — the drop keys on
+    `mp == 0 ∧ sub == 0.0` explicitly, no `or 0` coercion (Sol review, #129).
+    """
+    tr = _idle_with_reference()
+    item: dict = {"type": 2, "time": _T0 + 100_000}
+    if boundary is not None:
+        item["currentMowBoundary"] = boundary
+    if mp is not None:
+        item["mowingPercentage"] = mp
+    if sub is not None:
+        item["subtotalArea"] = str(sub)
+    with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
+        tr.process_type2(parse_location_type_2(item))
+    assert not any("session-init sentinel dropped" in r.message for r in caplog.records)
 
 
 # ===================================================================== #

@@ -580,22 +580,30 @@ class RunTracker:
         #   trips `is_reset` → close + reopen, splitting a real run.
         # Dropping it only ever removes a docked spurious sentinel; the real
         # run seeds on the first boundary-carrying packet a moment later
-        # (`sub0` anchors ~2.5 m² later, ~1 %). Signature is the all-zero
-        # shape, NOT bare `boundary = 0` — a `boundary = 0 ∧ mp = 100` packet
-        # is a task-*end* marker (completion + final area) and must not drop.
-        _b = parsed.get("boundary")
-        _mp = parsed.get("mowing_percentage")
-        _sub = parsed.get("area_session")
-        if _b in (None, 0) and (_mp or 0) == 0 and (_sub or 0.0) == 0.0:
+        # (`sub0` anchors ~2.5 m² later, ~1 %).
+        #
+        # Drop signature = `boundary ∈ {0, None} ∧ mp = 0 ∧ sub = 0`, keyed on
+        # boundary/mp/sub — sufficient to separate the sentinel from the
+        # `boundary = 0 ∧ mp = 100` task-*end* marker (completion + final area,
+        # which must NOT drop). `cmp` is 0 on the wire but not tested: the
+        # task-end carries `cmp = 0` too, so it adds no discrimination.
+        # `mp` / `sub` are compared **explicitly** to zero, no `or 0` coercion
+        # (Sol review, #129): the parser represents a missing/invalid field as
+        # `None`, and absence of a field must not be read as a confirmed zero
+        # — a sparse or malformed packet fails open onto the normal path.
+        boundary = parsed.get("boundary")
+        mp = parsed.get("mowing_percentage")
+        sub = parsed.get("area_session")
+        if boundary in (None, 0) and mp == 0 and sub == 0.0:
             _LOGGER.debug(
                 "run_tracker: all-zero session-init sentinel dropped (BUG-15) "
                 "(state=%s vs=%s boundary=%s mp=%s cmp=%s sub=%s wk=%s action=%s time=%s)",
                 self.state,
                 self.vehicle_state,
-                _b,
-                _mp,
+                boundary,
+                mp,
                 parsed.get("current_mow_progress"),
-                _sub,
+                sub,
                 parsed.get("area_week"),
                 parsed.get("action"),
                 parsed.get("time"),
