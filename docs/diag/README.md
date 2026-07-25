@@ -41,7 +41,7 @@ docs/diag/
 ├── README.md                                # this file (= the index)
 └── YYYY-MM-DD_<bug-id>_<short-topic>/
     ├── findings.md
-    ├── NN_<action>.mqtt.log                 # raw HA log slice, ANSI stripped
+    ├── NN_<action>.mqtt.log                 # HA log slice, logger-filtered + ANSI stripped
     └── NN_<action>.sensors.tsv              # periodic HA entity poll
 ```
 
@@ -50,8 +50,42 @@ docs/diag/
 - `NN_` numeric prefix gives chronological order; the slug describes the
   **action taken**, never the **outcome** (findings get revised; actions
   don't).
-- Two file flavours per action: `.mqtt.log` for raw log lines,
-  `.sensors.tsv` for periodic polls of Navimow entities.
+- Two file flavours per action: `.mqtt.log` for the integration's own
+  log lines, `.sensors.tsv` for periodic polls of Navimow entities.
+
+## Capturing the `.mqtt.log`
+
+The `.mqtt.log` is a slice of `docker logs hass` **filtered to this
+integration's own loggers** (`custom_components.navimow` and
+`mower_sdk`) — never a raw, unfiltered dump. A bare `docker logs hass`
+slice also captures every other component active in the same window
+(presence / `device_tracker`, reverse-geocoding, camera proxies,
+weather, automations): analysis noise that **also carries unrelated
+third-party PII** — household-member locations, camera access tokens,
+LAN addresses. Logger scoping is the first line of PII defense; the
+value-level redaction below is the second. **This is mandatory**, not
+best-effort.
+
+Filter **record by record, not line by line**, so multi-line records —
+tracebacks from `_LOGGER.exception()`, pretty-printed payloads — are kept
+whole. A plain `grep` on the logger tag keeps only the first line and
+drops the rest:
+
+```
+docker logs hass --since <ISO-ts> 2>&1 \
+  | sed -r 's/\x1b\[[0-9;]*m//g' \
+  | awk '/ (DEBUG|INFO|WARNING|ERROR|CRITICAL) \(/ { keep = /\[custom_components\.navimow|\[mower_sdk/ } keep' \
+  > NN_<action>.mqtt.log
+```
+
+The `awk` starts a new record on each `… LEVEL (thread) …` line and keeps
+it — plus its continuation lines — only when the logger is `navimow` or
+`mower_sdk`. Format-agnostic (works with or without `docker logs -t`).
+
+**Caveat:** an unretrieved async-task crash is logged by HA core under
+`[homeassistant]`, with `navimow` only in the stack frames — a
+logger-scoped filter misses it. When chasing a crash specifically, also
+grep the full log for the traceback.
 
 ## findings.md
 
