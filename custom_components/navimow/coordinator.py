@@ -48,9 +48,11 @@ from .run_tracker import Event as RunEvent
 from .run_tracker import RunTracker
 from .zone_registry import ZoneRegistry
 
-# Map internal tracker Event.kind → HA event bus event name. Keeps the
-# HA-facing surface a pure translation, so a rename on either side lands in
-# exactly one place.
+# Map internal tracker Event.kind → HA event bus event name. The two constant
+# families share their names (`EVENT_RUN_*` in both `const` and `run_tracker`)
+# and are aliased apart at import: the tracker side is a kind, the const side is
+# the domain-prefixed bus name. Keeps the HA-facing surface a pure translation,
+# so a rename on either side lands in exactly one place.
 _TRACKER_KIND_TO_HA_EVENT = {
     _TRACKER_EVENT_RUN_STARTED: EVENT_RUN_STARTED,
     _TRACKER_EVENT_RUN_FINISHED: EVENT_RUN_FINISHED,
