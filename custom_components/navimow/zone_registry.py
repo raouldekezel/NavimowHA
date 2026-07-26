@@ -1,8 +1,8 @@
-"""Pure, HA-agnostic per-zone registry for FEAT-04.
+"""Pure, HA-agnostic per-zone registry.
 
 Folds run_tracker ``run_finished`` payloads into per-zone records. Holds no
 persisted state of its own: the coordinator rebuilds it from ``history`` at
-startup (PR 2). See docs/design/FEAT-04-zone-registry.md.
+startup. See docs/design/FEAT-04-zone-registry.md.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ from dataclasses import dataclass
 # and refreshes size_estimate_m2. All 8 completions in the 763-packet archive
 # reach cmp = 10000; the threshold sits below 10000 to tolerate a peak packet
 # missed by a lossy stream, and far above the ~7000 partial ceiling.
-# See design section 4 / D6.
 COMPLETE_PASS_CMP = 9900
 
 
@@ -28,16 +27,15 @@ class ZoneRecord:
     last_duration_s: int | None = None
     last_cmp_max: int = 0
     size_estimate_m2: float | None = None
-    # FEAT-08: start-time of the visit that most recently refreshed
-    # `size_estimate_m2`. Paired with the estimate so the operator can
-    # tell when the current zone-size figure was last calibrated —
-    # useful after an app-side reshape (the estimate auto-corrects on
-    # the next complete pass, this stamp says which pass "won").
-    # Aligned with `last_mowed_ms` semantics (start of the visit, not
-    # its exit — HARD-12).
+    # Start-time of the visit that most recently refreshed
+    # `size_estimate_m2`. Paired with the estimate so the operator can tell
+    # when the zone-size figure was last calibrated — useful after an
+    # app-side reshape, where the estimate auto-corrects on the next complete
+    # pass and this stamp says which pass won. Start of the visit, not its
+    # exit, matching `last_mowed_ms`.
     size_estimate_updated_ms: int | None = None
     last_result: str | None = None
-    bbox: dict[str, float] | None = None  # deferred posture-bbox phase, unused here
+    bbox: dict[str, float] | None = None  # reserved for posture-bbox, unused today
 
 
 class ZoneRegistry:
@@ -49,8 +47,8 @@ class ZoneRegistry:
     def ingest_run(self, rf: dict) -> list[int]:
         """Fold one run_finished payload.
 
-        Returns the boundary ids seen for the first time (for lazy entity
-        creation wired in later PRs).
+        Returns the boundary ids seen for the first time, for lazy entity
+        creation.
         """
         result = rf.get("result")
         segments = rf.get("zones") or []
@@ -58,7 +56,7 @@ class ZoneRegistry:
         by_boundary: dict[int, list[dict]] = defaultdict(list)
         for seg in segments:
             bid = seg.get("boundary_id")
-            if bid:  # None / 0 (BUG-06 sentinel) excluded
+            if bid:  # None / 0 (the session-init sentinel) excluded
                 by_boundary[bid].append(seg)
 
         newly_seen: list[int] = []
@@ -83,25 +81,22 @@ class ZoneRegistry:
             )
             cmp_max = max((s.get("cmp_max") or 0) for s in segs)
 
-            # HARD-12: "last mowed" = **start** of this boundary's last visit
-            # (min(first_time)), not the exit (max(last_time)). Aligns with
-            # `last_run_started` / `current_run_started` which are also start
-            # times, so the operator sees a coherent set of session-start
-            # timestamps. Fable's original guard against using the run's
-            # `end_time` (which would stamp zone 1 with the moment zone 3
-            # finished on a 1→3 run) still applies — first_time is zone-local
-            # too, so the durable invariant `last_mowed_ms != end_time` is
-            # preserved.
+            # "Last mowed" is the **start** of this boundary's last visit
+            # (min(first_time)), not its exit. It lines up with the other
+            # session-start timestamps the operator sees. Taking the run's
+            # `end_time` instead would stamp zone 1 with the moment zone 3
+            # finished on a 1→3 run; `first_time` is zone-local, so the
+            # invariant `last_mowed_ms != end_time` holds.
             seg_first_times = [
                 s["first_time"] for s in segs if s.get("first_time") is not None
             ]
 
-            # HARD-10: preserve prior ZoneRecord on a fully-degenerate
-            # payload. If not a single segment carries usable data
-            # (no timing, no sub delta, no cmp progress), skip the
-            # boundary — never materialise a new record, never wipe a
-            # prior one. The tracker never emits such a payload today;
-            # this hardens the pure module against an out-of-band caller.
+            # Preserve a prior ZoneRecord on a fully-degenerate payload: if not
+            # one segment carries usable data (no timing, no sub delta, no cmp
+            # progress), skip the boundary — never materialise a new record,
+            # never wipe an existing one. The tracker never emits such a
+            # payload; this hardens the pure module against an out-of-band
+            # caller.
             has_area = any(
                 s.get("sub_exit") is not None and s.get("sub_entry") is not None
                 for s in segs
@@ -121,10 +116,10 @@ class ZoneRegistry:
             rec.last_result = result
             if cmp_max >= COMPLETE_PASS_CMP:
                 rec.size_estimate_m2 = round(surface, 2)  # last complete wins
-                # FEAT-08: stamp the complete pass. `min(seg_first_times)`
-                # matches `last_mowed_ms` semantics (start of the visit).
-                # `rebuild` replays history oldest-to-newest, so this too
-                # ends on the *most recent* complete pass.
+                # Stamp the complete pass. `min(seg_first_times)` matches
+                # `last_mowed_ms` semantics (start of the visit), and `rebuild`
+                # replays history oldest-to-newest, so this too ends on the
+                # most recent complete pass.
                 rec.size_estimate_updated_ms = (
                     min(seg_first_times) if seg_first_times else None
                 )
@@ -141,5 +136,5 @@ class ZoneRegistry:
             self.ingest_run(rf)
 
     def forget(self, boundary_id: int) -> bool:
-        """Drop a zone's record (options-flow removal, later PR)."""
+        """Drop a zone's record."""
         return self.zones.pop(boundary_id, None) is not None
