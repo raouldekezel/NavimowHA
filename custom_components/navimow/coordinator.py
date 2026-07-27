@@ -48,11 +48,11 @@ from .run_tracker import Event as RunEvent
 from .run_tracker import RunTracker
 from .zone_registry import ZoneRegistry
 
-# Map internal tracker Event.kind → HA event bus event name. Keeps the
-# HA-facing surface a pure translation, so a future rename on either
-# side lands in exactly one place. The `run_reopened` kind was retired
-# by FEAT-06 (#54) — the tracker now emits `run_started` for a new
-# session and never resurrects a closed run.
+# Map internal tracker Event.kind → HA event bus event name. The two constant
+# families share their names (`EVENT_RUN_*` in both `const` and `run_tracker`)
+# and are aliased apart at import: the tracker side is a kind, the const side is
+# the domain-prefixed bus name. Keeps the HA-facing surface a pure translation,
+# so a rename on either side lands in exactly one place.
 _TRACKER_KIND_TO_HA_EVENT = {
     _TRACKER_EVENT_RUN_STARTED: EVENT_RUN_STARTED,
     _TRACKER_EVENT_RUN_FINISHED: EVENT_RUN_FINISHED,
@@ -86,44 +86,38 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_state: DeviceStateMessage | None = None
         self._last_attributes: DeviceAttributesMessage | None = None
         self._last_mqtt_update: float | None = None
-        # Separate state-freshness clock (BUG-03). Attribute packets bump
+        # Separate state-freshness clock. Attribute packets bump
         # `_last_mqtt_update` but not this one — otherwise a docked robot
-        # receiving periodic attribute pushes would suppress the HTTP
-        # fallback even while its state is genuinely stale.
+        # receiving periodic attribute pushes would suppress the HTTP fallback
+        # even while its state is genuinely stale.
         self._last_mqtt_state_update: float | None = None
         self._last_http_fetch: float | None = None
         self._last_data_source: str | None = None
-        # BUG-01: edge-trigger the MQTT disconnect WARNING/reconnect INFO
-        # pair, so a routine 1 h outage produces one WARNING (on entry) and
-        # one INFO (when the SDK reports the WSS session back up), not
-        # ~120 identical lines. Flag flips True once we have emitted the
-        # WARNING; flips False once we have emitted the paired INFO.
+        # Edge-triggers the MQTT disconnect WARNING / reconnect INFO pair, so a
+        # routine 1 h outage produces one WARNING on entry and one INFO when the
+        # SDK reports the WSS session back up, instead of ~120 identical lines.
+        # True once the WARNING is out; False again once the paired INFO is.
         self._mqtt_disconnect_warned: bool = False
-        # HARD-04: debounce the WARNING so a routine sub-second token-refresh
-        # reconnect that happens to span a tick does not raise it. Counter
-        # increments each tick that observes `is_connected=False`, resets to
-        # 0 on any tick that observes True. WARN fires only when the counter
-        # reaches MQTT_DISCONNECT_TICKS_TO_WARN.
+        # Debounces that WARNING so a routine sub-second token-refresh
+        # reconnect spanning a tick does not raise it. Incremented on each tick
+        # observing `is_connected=False`, reset to 0 on any tick observing True.
         self._mqtt_disconnect_ticks: int = 0
-        # FEAT-01: live pose from the /realtimeDate/location channel that
-        # the SDK does not subscribe. Stored separately from `_last_state`
-        # so it does NOT interfere with the HTTP fallback freshness logic.
+        # Live pose from the /realtimeDate/location channel, which the SDK does
+        # not subscribe. Stored apart from `_last_state` so it does NOT feed the
+        # HTTP fallback freshness logic.
         self.position: dict[str, Any] | None = None
         self.vehicle_state: int | None = None
         self._last_position_dispatch: float = 0.0
-        # FEAT-02: mowing stats (type 2 items). Cached across ticks: the
-        # /location channel stops publishing type 2 while docked, so we keep
-        # the last observed values rather than showing "unknown" until the
-        # next mowing session.
+        # Mowing stats (type-2 items), cached across ticks: the /location
+        # channel stops publishing type-2 while docked, so the last observed
+        # values are kept rather than showing "unknown" until the next session.
         self.stats: dict[str, Any] | None = None
-        # FEAT-05 layer-1 guard: firmware `time` (epoch ms) of the last
-        # accepted /location packet, tracked per stream (type-1 poses at
-        # ~2 s and type-2 stats at ~30-90 s have independent cadences).
-        # Same pathology family as BUG-05 on /state; the tracker in step (b)
-        # layers `wk` monotonicity + wk₀+sub invariant on top. In-memory
-        # only in (a); persistence arrives in (c). The stamped value is
-        # clamped to `now + FUTURE_TIMESTAMP_TOLERANCE_MS` to keep a
-        # future-stamped packet from poisoning the cursor indefinitely.
+        # Layer-1 ordering guard: firmware `time` (epoch ms) of the last
+        # accepted /location packet, tracked per stream — type-1 poses at ~2 s
+        # and type-2 stats at ~30-90 s have independent cadences. The stamped
+        # value is clamped to `now + FUTURE_TIMESTAMP_TOLERANCE_MS`, so a
+        # future-stamped packet cannot poison the cursor indefinitely.
+        # Content-level judgement belongs to the tracker, not here.
         self._last_accepted_time_type1: int | None = None
         self._last_accepted_time_type2: int | None = None
         # Consecutive-drop counters, one per stream. Increment on drop,
@@ -132,20 +126,18 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # stuck cursor without log flooding.
         self._type1_drop_streak: int = 0
         self._type2_drop_streak: int = 0
-        # FEAT-05 (b): pure state machine that turns the accepted
-        # /location stream into run/zone events. Fed by
-        # `_handle_location_stats`, `_handle_location_position` (on vs
-        # change), and `_async_update_data.tick()`.
+        # Pure state machine turning the accepted /location stream into
+        # run/zone events. Fed by `_handle_location_stats`,
+        # `_handle_location_position` (on a vs change) and the update tick.
         self.run_tracker = RunTracker()
-        # FEAT-05 (c): capped history of closed runs (result, duration,
-        # zones, mst) — exposed as an attribute of `last_run_result` for
-        # the future custom card, restored from Store on setup.
+        # Capped history of closed runs (result, duration, zones, mst), exposed
+        # as an attribute of `last_run_result` and restored from Store on setup.
         self.history: list[dict[str, Any]] = []
         # Most-recently-closed run's `run_finished` payload; drives the
         # `last_run_*` sensors (started/duration/result).
         self.last_finished_run: dict[str, Any] | None = None
-        # FEAT-04 PR 2: pure per-boundary registry, fed by `_forward_run_events`
-        # on `run_finished` and rebuilt from `history` on restore. Holds no
+        # Pure per-boundary registry, fed by `_forward_run_events` on
+        # `run_finished` and rebuilt from `history` on restore. Holds no
         # persisted state of its own — the projection is complete every boot.
         self.zone_registry = ZoneRegistry()
         # `homeassistant.helpers.storage.Store` instance, created on
@@ -195,14 +187,13 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # dropped).
         self.history = list(history[-HISTORY_MAX:])
         self.last_finished_run = payload.get("last_finished_run")
-        # FEAT-04 PR 2: project the restored history onto the zone registry.
-        # The last complete pass per zone wins `size_estimate`, so every
-        # value the sensor platform (PR 3) will read is already correct
-        # before the first live packet arrives. Guarded against a corrupt
-        # on-disk shape: if a run entry is malformed (e.g. `zones` is not a
-        # list) the projection cannot proceed, but restore must not crash —
-        # the registry stays empty and future `run_finished` events will
-        # re-populate it as sessions close.
+        # Project the restored history onto the zone registry: the last
+        # complete pass per zone wins `size_estimate`, so every value the
+        # sensor platform reads is already correct before the first live packet
+        # arrives. Guarded against a corrupt on-disk shape — if a run entry is
+        # malformed (`zones` not a list, say) the projection cannot proceed but
+        # restore must not crash; the registry stays empty and future
+        # `run_finished` events re-populate it as sessions close.
         try:
             self.zone_registry.rebuild(self.history)
         except Exception as err:  # noqa: BLE001
@@ -243,15 +234,14 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """The persisted fields a silent vehicle-state transition can move:
         `(state, vehicle_state, dock_arrival_time)`.
 
-        HARD-19 §4 (#120), corrected per Sol's PR-#126 review: the persisted
-        `vehicle_state` drives the sustained-timer re-arm after a restart, so
-        a docked idle↔charge flip that changes it (RUNNING → PAUSED_DOCKED
-        never firing, `tracker.state` unchanged) still has to be saved —
-        keying the silent save on a `state` change alone left `vehicle_state`
-        stale, and a restart could then re-arm the timer on a stale `vs = 1`
-        and mint a spurious `interrupted` close while the robot was charging,
-        mapping, or already departed. The coordinator compares this tuple
-        before/after a forwarded transition and saves when it moved.
+        The persisted `vehicle_state` drives the sustained-timer re-arm after a
+        restart, so a docked idle↔charge flip that moves it has to be saved even
+        when `tracker.state` did not move. Keying the silent save on a `state`
+        change alone leaves `vehicle_state` stale, and a restart could then
+        re-arm the timer on a stale `vs = 1` and mint a spurious `interrupted`
+        close while the robot was charging, mapping, or already departed. The
+        coordinator compares this tuple before and after a forwarded transition,
+        and saves when it moved.
         """
         run = self.run_tracker.current_run
         return (
@@ -260,7 +250,7 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             run.get("dock_arrival_time") if run else None,
         )
 
-    # === /location channel (real-time pose + mowing stats) — FEAT-01 ===
+    # === /location channel (real-time pose + mowing stats) ===
 
     @callback
     def handle_location_item(self, item: dict[str, Any]) -> None:
@@ -268,7 +258,7 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         The payload is a JSON array discriminated by `type`:
         - type 1 = pose (postureX/Y/Theta + vehicleState) ~every 2 s
-        - type 2 = mowing stats ~every 30-90 s (FEAT-02)
+        - type 2 = mowing stats ~every 30-90 s
         Types 3/4 (heartbeat, taskDelay) ignored.
         """
         msg_type = item.get("type")
@@ -281,12 +271,11 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Cap a firmware timestamp at `now + FUTURE_TIMESTAMP_TOLERANCE_MS`
         before storing it as an ordering cursor.
 
-        A packet stamped anomalously far in the future (BUG-08-style
-        content/timestamp mismatch, or a robot RTC skewed ahead) is still
-        accepted — content-level judgement belongs to the step-(b) tracker
-        layers — but the cursor it stamps is clamped, so a subsequent
-        stream of legitimate (present-time) packets self-heals the guard
-        within the tolerance window.
+        A packet stamped anomalously far in the future (a content/timestamp
+        mismatch, or a robot RTC skewed ahead) is still accepted — content-level
+        judgement belongs to the tracker — but the cursor it stamps is clamped,
+        so a subsequent stream of legitimate present-time packets self-heals the
+        guard within the tolerance window.
         """
         now_ms = int(time.time() * 1000)
         return min(incoming_time_ms, now_ms + FUTURE_TIMESTAMP_TOLERANCE_MS)
@@ -296,13 +285,11 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         parsed = parse_location_type_2(item)
         if parsed is None:
             return
-        # FEAT-05 layer-1: drop items whose firmware `time` is not strictly
-        # greater than the last accepted type-2's — catches ordering
-        # regressions and duplicates. Guard is intentionally ordering-only;
-        # the tracker in step (b) layers `wk` monotonicity + wk₀+sub
-        # invariant on top for content-level checks. Guard is skipped when
-        # `time` is missing (defensive tolerance — never observed on i210
-        # over ~180 committed packets but the parser accepts the shape).
+        # Layer-1: drop items whose firmware `time` is not strictly greater than
+        # the last accepted type-2's — ordering regressions and duplicates.
+        # Ordering only; content-level checks belong to the tracker. Skipped
+        # when `time` is missing (never observed on i210 over ~180 committed
+        # packets, but the parser accepts the shape).
         incoming_time = parsed.get("time")
         if incoming_time is not None:
             last_time = self._last_accepted_time_type2
@@ -327,17 +314,16 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._last_accepted_time_type2 = self._clamp_cursor(incoming_time)
             self._type2_drop_streak = 0
         self.stats = parsed
-        # FEAT-05 (b): feed the run tracker downstream of layer-1 so it
-        # only sees ordering-clean packets. Emitted events are just
-        # logged here; step (c) will fire them on the HA event bus.
+        # Feed the run tracker downstream of layer-1, so it only ever sees
+        # ordering-clean packets.
         fingerprint_before = self._tracker_persist_fingerprint()
         run_events = self.run_tracker.process_type2(parsed)
         self._forward_run_events(run_events)
-        # HARD-19 §4 (#120): a departure-gated resume (PAUSED_DOCKED →
-        # RUNNING, dock stamp cleared) emits no run event; persist that
-        # silent transition too, symmetric with the type-1 path — keyed on
-        # the same `(state, vehicle_state, dock_arrival_time)` tuple delta.
-        # When an event WAS emitted the forward above saved.
+        # A departure-gated resume (PAUSED_DOCKED → RUNNING, dock stamp
+        # cleared) emits no run event; persist that silent transition too,
+        # symmetric with the type-1 path and keyed on the same
+        # `(state, vehicle_state, dock_arrival_time)` delta. When an event WAS
+        # emitted, the forward above already saved.
         if (
             not run_events
             and self.run_tracker.state != _TRACKER_STATE_IDLE
@@ -355,11 +341,10 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if parsed is None:
             return
 
-        # FEAT-05 layer-1: same ordering guard on the type-1 stream. Cursor
-        # is independent from type-2 (`_last_accepted_time_type2`) because
-        # the two streams have distinct cadences (~2 s vs ~30-90 s) and a
-        # single shared cursor would drop the whole slower stream after
-        # every faster-stream update.
+        # Same ordering guard on the type-1 stream, with its own cursor: the two
+        # streams have distinct cadences (~2 s vs ~30-90 s), and a single shared
+        # cursor would drop the whole slower stream after every faster-stream
+        # update.
         incoming_time = parsed.get("time")
         if incoming_time is not None:
             last_time = self._last_accepted_time_type1
@@ -393,31 +378,29 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         vs_changed = vehicle_state is not None and vehicle_state != self.vehicle_state
         if vs_changed:
             self.vehicle_state = vehicle_state
-            # FEAT-05 (b): forward the vs change to the tracker so it can
-            # move an open run into PAUSED_DOCKED / arm the sustained-60 s
-            # interruption timer.
-            # HARD-18 (#117): also pass the type-1 `time` so the tracker
-            # can anchor a provisional run's `start_time` on the vs=4
-            # activation edge (and stamp the wander end on dock entry).
+            # Forward the vs change so the tracker can move an open run into
+            # PAUSED_DOCKED and arm the sustained interruption timer. The
+            # type-1 `time` goes with it: the tracker anchors a provisional
+            # run's `start_time` on the vs=4 activation edge, and stamps the
+            # wander end on dock entry.
             fingerprint_before = self._tracker_persist_fingerprint()
             run_events = self.run_tracker.process_vehicle_state(
                 vehicle_state, time_ms=parsed.get("time")
             )
             self._forward_run_events(run_events)
-            # HARD-19 §4 (#120): a dock entry, a docked idle↔charge flip, a
-            # departure edge — any accepted type-1 that moves the persisted
+            # Any accepted type-1 that moves the persisted
             # `(state, vehicle_state, dock_arrival_time)` tuple while a run is
-            # open — closes nothing, so it emits no run event and
-            # `_forward_run_events` schedules no save (and the heartbeat save
-            # runs only while RUNNING). Persist the silent transition so the
-            # stamp AND the fresh `vehicle_state` survive a restart between the
-            # edge and the close; keying on the tuple delta (not on `state`
-            # alone) is required so a docked flip that only moves
-            # `vehicle_state` is not lost — see `_tracker_persist_fingerprint`.
-            # Delta-keyed, not per-type-1: the save is fire-and-forget with no
-            # debounce and type-1 is ~2 s, so it must fire on edges only. When
-            # an event WAS emitted the forward above already saved; at rest
-            # (IDLE) the persisted `vehicle_state` drives nothing, so skip.
+            # open — a dock entry, a docked idle↔charge flip, a departure edge —
+            # closes nothing, so it emits no run event and schedules no save
+            # (the heartbeat save runs only while RUNNING). Persist it anyway,
+            # so the stamp AND the fresh `vehicle_state` survive a restart
+            # between the edge and the close. Keyed on the tuple delta rather
+            # than on `state` alone, or a docked flip that moves only
+            # `vehicle_state` is lost — see `_tracker_persist_fingerprint`.
+            # Delta-keyed rather than per-type-1: the save is fire-and-forget
+            # with no debounce and type-1 arrives every ~2 s, so it must fire on
+            # edges only. At rest the persisted `vehicle_state` drives nothing,
+            # so IDLE is skipped.
             if (
                 not run_events
                 and self.run_tracker.state != _TRACKER_STATE_IDLE
@@ -482,11 +465,9 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     # FIFO trim — keep the most recent HISTORY_MAX entries.
                     self.history = self.history[-HISTORY_MAX:]
                 self.last_finished_run = entry
-                # FEAT-04 PR 2: fold this run into the zone registry and
-                # announce first-time boundaries so the sensor platform
-                # (PR 3) can lazy-add its per-zone entities. No listener
-                # exists yet in PR 2 — the dispatch is a documented no-op
-                # until then.
+                # Fold this run into the zone registry and announce first-time
+                # boundaries, so the sensor platform can lazy-add its per-zone
+                # entities.
                 for boundary_id in self.zone_registry.ingest_run(entry):
                     async_dispatcher_send(
                         self.hass,
@@ -559,18 +540,17 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         cached_state = self.sdk.get_cached_state(self.device.id)
         if cached_state is not None:
-            # BUG-08: HTTP is the source of truth for `battery`. The SDK's
-            # cached /state can carry a stale battery reading (e.g. battery=0
-            # from a past over-discharge, battery=100 forwarded by the cloud
-            # mid-mow) that would clobber the fresh HTTP value on every tick.
-            # We still take the other fields (state, error, position,
-            # signal_strength, timestamp) from the cache — the trace shows
-            # they stay coherent with reality — but we thread the previously
-            # held battery back into a fresh object. `replace()` is essential
-            # here: the SDK holds `cached_state` by reference in its own cache
-            # dict and hands the same reference to the callback, so any
-            # in-place mutation would corrupt `sdk._state_cache` from another
-            # thread.
+            # HTTP is the source of truth for `battery`. The SDK's cached
+            # /state can carry a stale reading (battery=0 from a past
+            # over-discharge, battery=100 forwarded by the cloud mid-mow) that
+            # would clobber the fresh HTTP value on every tick. The other
+            # fields — state, error, position, signal_strength, timestamp —
+            # stay coherent with reality and are taken from the cache, with the
+            # previously held battery threaded back into a fresh object.
+            # `replace()` is essential: the SDK holds `cached_state` by
+            # reference in its own cache dict and hands that same reference to
+            # the callback, so an in-place mutation would corrupt
+            # `sdk._state_cache` from another thread.
             prev_battery = (
                 self._last_state.battery if self._last_state is not None else None
             )
@@ -586,10 +566,10 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._last_attributes = cached_attrs
 
         now = time.monotonic()
-        # Use state-specific freshness (BUG-03). Attribute packets can arrive
-        # periodically while vehicle state is genuinely stale — using the
-        # catch-all `_last_mqtt_update` here would suppress the HTTP fallback
-        # and leave HA showing old state indefinitely.
+        # State-specific freshness: attribute packets can arrive periodically
+        # while the vehicle state is genuinely stale, so the catch-all
+        # `_last_mqtt_update` here would suppress the HTTP fallback and leave HA
+        # showing old state indefinitely.
         is_state_stale = (
             self._last_mqtt_state_update is None
             or now - self._last_mqtt_state_update > MQTT_STALE_SECONDS
@@ -598,19 +578,18 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._last_http_fetch is None
             or now - self._last_http_fetch > HTTP_FALLBACK_MIN_INTERVAL
         )
-        # Edge-triggered MQTT connectivity log — WARNING when we first
-        # notice the WSS is down AND the state has aged past the stale
-        # threshold (i.e. this is an actionable outage, not a routine
-        # reconnect blip), INFO when the SDK reports the WSS back up.
-        # Prevents log spam (~120 identical lines over a 1 h outage) and
-        # decouples "connectivity recovered" from "state is fresh again"
-        # so a lingering HTTP-fallback-only mode still reports the
-        # reconnect the moment it happens. (BUG-01)
+        # Edge-triggered MQTT connectivity log: WARNING when the WSS is first
+        # noticed down AND the state has aged past the stale threshold (an
+        # actionable outage, not a reconnect blip), INFO when the SDK reports it
+        # back up. Keeps a 1 h outage to two lines instead of ~120, and
+        # decouples "connectivity recovered" from "state is fresh again", so a
+        # lingering HTTP-fallback-only mode still reports the reconnect the
+        # moment it happens.
         #
-        # HARD-04 extends this: the WARN is further debounced by a counter
-        # of consecutive `is_connected=False` ticks, so a routine sub-second
-        # reconnect (~40 min token refresh, per FEAT-03 diag) that spans a
-        # tick does not raise it. The counter resets on any True observation.
+        # The WARN is further debounced by a counter of consecutive
+        # `is_connected=False` ticks, so a routine sub-second reconnect (the
+        # ~40 min token refresh) that spans a tick does not raise it. The
+        # counter resets on any True observation.
         if not self.sdk.is_connected:
             self._mqtt_disconnect_ticks += 1
         else:
@@ -655,15 +634,14 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._last_mqtt_state_update,
             self._last_http_fetch,
         )
-        # FEAT-05 (b): tick the tracker so the sustained-docked
-        # interruption detector fires even when no MQTT traffic is
-        # arriving (the whole point of the timer is to catch a run that
-        # has silently ended).
+        # Tick the tracker so the sustained-dock interruption detector fires
+        # even when no MQTT traffic is arriving — catching a run that has
+        # silently ended is the whole point of the timer.
         self._forward_run_events(self.run_tracker.tick())
-        # FEAT-05 (c): heartbeat Store save while a run is open. Every
-        # tracker transition already saves through `_forward_run_events`;
-        # this is the between-transition backstop for a hard crash mid-
-        # run. `TRACKER_HEARTBEAT_SECONDS` throttles it — never per-tick.
+        # Heartbeat Store save while a run is open. Every tracker transition
+        # already saves through `_forward_run_events`; this is the
+        # between-transition backstop for a hard crash mid-run, throttled by
+        # `TRACKER_HEARTBEAT_SECONDS` — never per-tick.
         if (
             self.run_tracker.state == _TRACKER_STATE_RUNNING
             and (time.monotonic() - self._last_store_save_monotonic)
@@ -700,12 +678,11 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.hass.loop.call_soon_threadsafe(self._update_from_attributes, attrs)
 
     def _update_from_state(self, state: DeviceStateMessage) -> None:
-        # BUG-08: HTTP is the source of truth for `battery`. The MQTT /state
-        # topic occasionally forwards a stale battery reading — same class
-        # of clobbering as BUG-04's SDK cache, hitting the callback path
-        # instead of the poll path. Preserve the previously held battery so
-        # only the HTTP fallback ever writes it. `replace()` is essential
-        # here: the SDK caches `state` by reference before invoking the
+        # HTTP is the source of truth for `battery`. The MQTT /state topic
+        # occasionally forwards a stale reading — the same clobbering as on the
+        # poll path, reaching the callback path instead. Preserve the previously
+        # held battery so only the HTTP fallback ever writes it. `replace()` is
+        # essential: the SDK caches `state` by reference before invoking the
         # callback, so an in-place mutation would corrupt `sdk._state_cache`
         # from the HA loop thread.
         prev_battery = (
