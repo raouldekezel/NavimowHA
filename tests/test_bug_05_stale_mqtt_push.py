@@ -1,28 +1,17 @@
-"""BUG-05 — MQTT `/state` pushes with stale battery.
+"""MQTT `/state` push path — battery now sourced from MQTT (FEAT-11).
 
-The Navimow cloud replays the last-buffered `/state` payload at every
-WSS reconnect (~40 min). If the buffered payload pre-dates the physical
-robot state, the battery field it carries is a lie (e.g. `docked,
-battery=100` from before a mowing departure, or `docked, battery=68`
-from before charging).
+BUG-05/BUG-08 made HTTP the sole writer of `battery`: every `/state`
+push had its battery replaced with the previously held value, because
+the old firmware forwarded stale battery content on reconnect replays.
 
-The original BUG-05 fix compared the payload's own `timestamp` field to
-the previously held state's timestamp and dropped the push when strictly
-older. That worked for the buffered-replay pattern but missed the
-2026-07-03 pattern documented in BUG-08 (#45): the cloud forwards stale
-battery *content* with a **fresh** firmware timestamp, so the guard
-never fires (0/7 pushes dropped over the trace) and the sensor still
-flips backward for ~60-90 s until the next HTTP-fallback tick.
+OS V4.3.0 inverts that premise — the live mowing capture in
+`docs/diag/2026-08-23_feat-11_v43-battery-mowing/` showed `/state`
+carries the correct, changing battery while mowing and charging, and the
+discard was pinning HA to a stale value. FEAT-11 reverts the suppression:
+`_update_from_state` accepts the push as-is, battery included.
 
-BUG-08 retires the timestamp guard and replaces it with a stronger
-invariant: HTTP is the sole source of truth for `battery`. Every
-`/state` push is accepted — for its state/error/timestamp fields — but
-the previously held `battery` value is threaded through via
-`dataclasses.replace()`, so a stale battery from any MQTT source can
-never land in `_last_state.battery` AND the SDK's shared cache object
-that backs `state` is never mutated in place.
-
-These tests lock in that invariant on both angles.
+These tests lock the reverted behaviour on the push path, plus the
+`_handle_state` gating that is unchanged by the revert.
 """
 
 from __future__ import annotations
@@ -75,16 +64,14 @@ def _state(
 
 
 # --------------------------------------------------------------------- #
-# _handle_state — clock bump + scheduling                               #
+# _handle_state — clock bump + scheduling (unchanged by FEAT-11)        #
 # --------------------------------------------------------------------- #
 
 
 def test_handle_state_schedules_update_and_bumps_clock() -> None:
     """`_handle_state` accepts every payload whose device_id matches:
     scheduling `_update_from_state` on the HA loop and stamping the
-    MQTT state clock. The retired BUG-05 timestamp guard is no longer
-    in the way — the battery invariant lives one level down in
-    `_update_from_state`.
+    MQTT state clock.
     """
     coordinator = _make_coordinator()
     fresh = _state(battery=85)
@@ -97,11 +84,10 @@ def test_handle_state_schedules_update_and_bumps_clock() -> None:
     assert coordinator._last_mqtt_state_update is not None
 
 
-def test_handle_state_older_timestamp_no_longer_dropped() -> None:
-    """Post-BUG-08: `_handle_state` accepts even a payload whose
-    firmware timestamp is strictly older than the currently held
-    state's — the timestamp guard is gone. The BUG-08 invariant
-    (`battery = HTTP`) is what actually protects the sensor.
+def test_handle_state_older_timestamp_not_dropped() -> None:
+    """`_handle_state` accepts even a payload whose firmware timestamp is
+    strictly older than the currently held state's — there is no
+    timestamp guard on this path.
     """
     coordinator = _make_coordinator()
     coordinator._last_state = _state(battery=85, timestamp=1_000_000_000_000)
@@ -132,58 +118,40 @@ def test_handle_state_wrong_device_id_still_dropped() -> None:
 
 
 # --------------------------------------------------------------------- #
-# _update_from_state — the actual BUG-05/BUG-08 protection              #
+# _update_from_state — MQTT battery is written (FEAT-11 revert)         #
 # --------------------------------------------------------------------- #
 
 
-def test_update_from_state_preserves_battery_from_previous_state() -> None:
-    """The canonical BUG-05 scenario, restated for BUG-08: a reconnect
-    replay push carrying an old battery (`100`) hits `_update_from_state`
-    while `_last_state.battery` holds the HTTP truth (`87`). The battery
-    must stay at `87`; non-battery fields land freshly.
+def test_update_from_state_writes_incoming_battery() -> None:
+    """A fresh MQTT push carrying a changed battery updates
+    `_last_state.battery` — MQTT is the battery source again. Non-battery
+    fields land freshly too.
     """
     coordinator = _make_coordinator()
     coordinator._last_state = _state(
-        battery=87, timestamp=1_000_000_000_000, state="isRunning"
+        battery=100, timestamp=1_000_000_000_000, state="isRunning"
     )
 
-    replay = _state(battery=100, timestamp=1_000_000_030_000, state="isRunning")
-    coordinator._update_from_state(replay)
+    push = _state(battery=99, timestamp=1_000_000_030_000, state="isRunning")
+    coordinator._update_from_state(push)
 
-    assert coordinator._last_state.battery == 87  # HTTP truth preserved
+    assert coordinator._last_state.battery == 99
     assert coordinator._last_state.state == "isRunning"
+    # The payload lands as-is (same reference); no copy is made.
+    assert coordinator._last_state is push
 
 
 def test_update_from_state_first_ever_uses_payload_battery() -> None:
-    """Cold start: no `_last_state` to preserve from → the first push's
-    battery lands verbatim. The invariant re-arms itself from that
-    point on.
+    """Cold start: no `_last_state` yet → the first push's battery lands
+    verbatim.
     """
     coordinator = _make_coordinator()
 
     first = _state(battery=42, timestamp=1_000_000_000_000)
     coordinator._update_from_state(first)
 
-    # No prev battery to thread through, so the payload reference lands
-    # verbatim — no `replace()` call in the cold-start path.
     assert coordinator._last_state is first
     assert coordinator._last_state.battery == 42
-
-
-def test_update_from_state_fresh_content_battery_still_ignored() -> None:
-    """The invariant is unconditional: even a fresh, plausible battery
-    on the MQTT push must not overwrite the HTTP-held value. HTTP is
-    the sole writer, whatever the payload happens to say.
-    """
-    coordinator = _make_coordinator()
-    coordinator._last_state = _state(
-        battery=87, timestamp=1_000_000_000_000, state="isRunning"
-    )
-
-    plausible = _state(battery=86, timestamp=1_000_000_030_000, state="isRunning")
-    coordinator._update_from_state(plausible)
-
-    assert coordinator._last_state.battery == 87
 
 
 def test_update_from_state_marks_source_as_mqtt_push() -> None:
@@ -196,26 +164,3 @@ def test_update_from_state_marks_source_as_mqtt_push() -> None:
     coordinator._update_from_state(_state(battery=42, timestamp=1_000_000_030_000))
 
     assert coordinator._last_data_source == "mqtt_push"
-
-
-def test_update_from_state_does_not_mutate_incoming_payload() -> None:
-    """The SDK caches the payload before invoking the callback and
-    returns the same reference from `get_cached_state()`. In-place
-    mutation would corrupt the SDK cache from the HA loop thread.
-    `replace()` must produce a fresh object; the incoming payload's
-    battery stays at what it arrived with.
-    """
-    coordinator = _make_coordinator()
-    coordinator._last_state = _state(
-        battery=87, timestamp=1_000_000_000_000, state="isRunning"
-    )
-
-    replay = _state(battery=100, timestamp=1_000_000_030_000, state="isRunning")
-    coordinator._update_from_state(replay)
-
-    # Coordinator saw the preserved HTTP battery.
-    assert coordinator._last_state.battery == 87
-    # But the payload object we passed in stayed at battery=100 — the
-    # SDK's cache reference is untouched.
-    assert replay.battery == 100
-    assert coordinator._last_state is not replay

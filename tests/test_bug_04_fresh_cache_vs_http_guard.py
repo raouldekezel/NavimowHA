@@ -1,23 +1,16 @@
-"""BUG-04 — SDK cache re-application in the coordinator poll path.
+"""SDK cache re-application in the coordinator poll path — battery now
+sourced from MQTT (FEAT-11).
 
-The SDK's `get_cached_state()` returns the last MQTT push forever, even
-after that push became stale (e.g. `battery=0` after over-discharge, or
-`battery=100` while the robot is actively discharging on the lawn). Each
-coordinator tick re-applies that cache as `_last_state`.
+Each coordinator tick re-applies `sdk.get_cached_state()` as
+`_last_state`. BUG-04/BUG-08 preserved the previously held battery here,
+so only HTTP could write it. OS V4.3.0 makes the `/state` battery
+reliable (see `docs/diag/2026-08-23_feat-11_v43-battery-mowing/`), and
+the preservation was pinning HA to a stale value, so FEAT-11 reverts it:
+the cache is applied as-is, battery included.
 
-The original BUG-04 fix skipped the re-application altogether when HTTP
-had been fetched more recently than the last MQTT state update. That
-guard has been retired as of BUG-08 (#45): the coordinator now applies
-the cache unconditionally but preserves `_last_state.battery` from the
-previous holder — via `dataclasses.replace()`, so the SDK's shared
-cache object is never mutated in place. Non-battery fields (state,
-error, position, timestamp, signal_strength) still come from the cache
-— the 2026-07-03 trace established they stay coherent with reality.
-
-These tests lock in the surviving BUG-04 protection: HTTP-truth battery
-must NOT be clobbered by the SDK cache re-application, whatever the
-relative timestamps happen to be, AND the SDK cache object itself must
-stay untouched.
+These tests lock the reverted cache-path behaviour: the SDK cache
+battery is accepted, cold start lands the cache verbatim, and a missing
+cache leaves `_last_state` untouched.
 """
 
 from __future__ import annotations
@@ -97,54 +90,32 @@ def _state(
 
 
 @pytest.mark.asyncio
-async def test_http_battery_survives_stale_cache_reapplication() -> None:
-    """The canonical BUG-04 scenario, restated for the BUG-08 invariant:
-    SDK cache carries `battery=0` (stale MQTT payload from over-discharge),
-    `_last_state` currently holds the HTTP truth (`battery=87`). Ticking
-    the coordinator must NOT overwrite the battery.
+async def test_cache_battery_is_accepted() -> None:
+    """The cache re-application writes the SDK cache's battery: the mowing
+    `/state` battery (94) replaces the stale held value (100), and the
+    non-battery fields come from the cache too.
     """
-    mqtt_cache = _state(battery=0, state="isDocked")
+    mqtt_cache = _state(battery=94, state="isRunning")
 
     coordinator = _make_coordinator(cached_state=mqtt_cache)
-    coordinator._last_state = _state(battery=87, state="isRunning")
+    coordinator._last_state = _state(battery=100, state="isDocked")
 
     await coordinator._async_update_data()
 
-    assert coordinator._last_state.battery == 87
-
-
-@pytest.mark.asyncio
-async def test_cache_reapplication_still_updates_state_field() -> None:
-    """Non-battery fields must still be picked up from the SDK cache —
-    the trace shows `state` stays coherent, and BUG-04's guard used to
-    block this legitimate refresh whenever HTTP happened to be newer.
-    """
-    mqtt_cache = _state(battery=55, state="isRunning")
-
-    coordinator = _make_coordinator(cached_state=mqtt_cache)
-    coordinator._last_state = _state(battery=90, state="isDocked")
-
-    await coordinator._async_update_data()
-
+    assert coordinator._last_state.battery == 94
     assert coordinator._last_state.state == "isRunning"
-    assert coordinator._last_state.battery == 90
     assert coordinator._last_data_source == "mqtt_cache"
 
 
 @pytest.mark.asyncio
 async def test_first_boot_no_prior_state_accepts_cache_verbatim() -> None:
-    """Cold start: `_last_state is None`, no prior battery to preserve.
-    The SDK cache lands unchanged (previously handled by falling through
-    the guard's `http_is_newer=False` branch).
-    """
+    """Cold start: `_last_state is None`. The SDK cache lands unchanged."""
     mqtt_cache = _state(battery=42, state="isDocked")
 
     coordinator = _make_coordinator(cached_state=mqtt_cache)
 
     await coordinator._async_update_data()
 
-    # No prev battery to thread through, so the cache reference lands
-    # verbatim — no unnecessary `replace()` call in the cold-start path.
     assert coordinator._last_state is mqtt_cache
     assert coordinator._last_state.battery == 42
     assert coordinator._last_data_source == "mqtt_cache"
@@ -163,27 +134,3 @@ async def test_no_cache_yet_leaves_state_untouched() -> None:
 
     assert coordinator._last_state is http_state
     assert coordinator._last_state.battery == 77
-
-
-@pytest.mark.asyncio
-async def test_sdk_cache_object_is_not_mutated_by_battery_preserve() -> None:
-    """The SDK caches its `/state` payload as a shared reference, hands
-    it to callbacks, and returns the same object from
-    `get_cached_state()`. In-place mutation of that reference would
-    corrupt the SDK's private cache from the HA loop thread. `replace()`
-    must produce a fresh object; the cache reference stays at
-    `battery=0` even after the coordinator holds `battery=87`.
-    """
-    mqtt_cache = _state(battery=0, state="isDocked")
-
-    coordinator = _make_coordinator(cached_state=mqtt_cache)
-    coordinator._last_state = _state(battery=87, state="isRunning")
-
-    await coordinator._async_update_data()
-
-    # Coordinator got the preserved HTTP battery.
-    assert coordinator._last_state.battery == 87
-    # SDK's cache object was NOT mutated.
-    assert mqtt_cache.battery == 0
-    # And what `get_cached_state()` returns still says 0.
-    assert coordinator.sdk.get_cached_state("REDACTED-ROBOT-SERIAL").battery == 0
