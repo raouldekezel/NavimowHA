@@ -3,7 +3,6 @@
 import copy
 import logging
 import time
-from dataclasses import replace
 from datetime import timedelta
 from typing import Any
 
@@ -540,25 +539,9 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         cached_state = self.sdk.get_cached_state(self.device.id)
         if cached_state is not None:
-            # HTTP is the source of truth for `battery`. The SDK's cached
-            # /state can carry a stale reading (battery=0 from a past
-            # over-discharge, battery=100 forwarded by the cloud mid-mow) that
-            # would clobber the fresh HTTP value on every tick. The other
-            # fields — state, error, position, signal_strength, timestamp —
-            # stay coherent with reality and are taken from the cache, with the
-            # previously held battery threaded back into a fresh object.
-            # `replace()` is essential: the SDK holds `cached_state` by
-            # reference in its own cache dict and hands that same reference to
-            # the callback, so an in-place mutation would corrupt
-            # `sdk._state_cache` from another thread.
-            prev_battery = (
-                self._last_state.battery if self._last_state is not None else None
-            )
-            self._last_state = (
-                replace(cached_state, battery=prev_battery)
-                if prev_battery is not None
-                else cached_state
-            )
+            # Apply the SDK's cached /state as-is, battery included: the MQTT
+            # /state battery is authoritative again.
+            self._last_state = cached_state
             self._last_data_source = "mqtt_cache"
 
         cached_attrs = self.sdk.get_cached_attributes(self.device.id)
@@ -678,19 +661,8 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.hass.loop.call_soon_threadsafe(self._update_from_attributes, attrs)
 
     def _update_from_state(self, state: DeviceStateMessage) -> None:
-        # HTTP is the source of truth for `battery`. The MQTT /state topic
-        # occasionally forwards a stale reading — the same clobbering as on the
-        # poll path, reaching the callback path instead. Preserve the previously
-        # held battery so only the HTTP fallback ever writes it. `replace()` is
-        # essential: the SDK caches `state` by reference before invoking the
-        # callback, so an in-place mutation would corrupt `sdk._state_cache`
-        # from the HA loop thread.
-        prev_battery = (
-            self._last_state.battery if self._last_state is not None else None
-        )
-        self._last_state = (
-            replace(state, battery=prev_battery) if prev_battery is not None else state
-        )
+        # Accept the MQTT /state push as-is, battery included.
+        self._last_state = state
         self._last_data_source = "mqtt_push"
         self.async_set_updated_data(self._build_data())
 
