@@ -11,9 +11,10 @@ so the same conventions apply here.
 - **`main`** — strict mirror of `upstream/main`. Fast-forward only. Never
   a place to commit personal changes. Used to detect patches absorbed
   upstream via `git cherry main deploy`.
-- **`deploy`** — cut from an upstream tag (`UPSTREAM_BASE`, currently
-  `NavimowHA-v1.1.0`). Carries the linear sequence of squash commits from
-  merged PRs. HACS points to tags on this branch.
+- **`deploy`** — `main` plus the fork-local squash commits from merged PRs.
+  Upstream changes reach it through explicit merges from `origin/main`;
+  published history is never rebased or rewritten. HACS points to tags on
+  this branch.
 - **`patches/<id>-<slug>`** — one patch per branch, cut from
   `origin/deploy`. Ephemeral (deleted at squash-merge).
 
@@ -45,9 +46,22 @@ Issue titles: `<ID>: <short description>`. Branch names:
 
 ## Merges
 
-Squash-only. `delete_branch_on_merge=true`. Squash commits inherit `(#NN)`
-from GitHub; they ARE the atomic patch that will be replayed by
-`git rebase --onto NEW_BASE OLD_BASE deploy` at each upstream sync.
+Ordinary issue PRs are squash-only. `delete_branch_on_merge=true`. Squash
+commits inherit `(#NN)` from GitHub and remain the atomic fork-local patches.
+
+Upstream synchronization is the explicit exception: update `main` from
+`upstream/main`, then merge `origin/main` directly into `deploy` without a PR
+and without rebasing the local patch stack:
+
+```
+git fetch origin
+git checkout deploy
+git merge origin/main
+git push origin deploy
+```
+
+Resolve conflicts in favour of the local behaviour unless upstream has fixed
+the underlying problem, in which case remove the redundant local patch.
 
 ## Tags & releases
 
