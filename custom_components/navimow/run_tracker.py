@@ -45,6 +45,7 @@ Transitions:
         RUNNING [run_started]
     IDLE (seeded reference) ─fresh type-2 with strict progress─▶
         NEW run [run_started]   (an echo is refused and counted)
+    IDLE ─type-2 with boundary = 0─▶ (refused: a zoneless packet never opens)
     RUNNING ─vs ∈ DOCK_EVIDENCE─▶ PAUSED_DOCKED
     RUNNING/PAUSED_DOCKED ─vs ∈ {VS_STOPPED, VS_MAPPING}─▶ (inert)
     PAUSED_DOCKED ─fresh type-2 while vs ∈ DEPARTURE_EVIDENCE─▶ RUNNING
@@ -59,7 +60,8 @@ What blocks a packet, and what only observes it:
 
 - Blocking, upstream in the coordinator: `/location` `time` monotonicity per
   stream. Not visible here — the tracker trusts its input.
-- Blocking, here: the strict-progress echo filter (a post-close packet must
+- Blocking, here: the zoneless-open refusal (from IDLE, `boundary = 0` never
+  opens a run), the strict-progress echo filter (a post-close packet must
   advance `sub`, or `mp` when `sub` is absent), and pending-reset deferral (a
   `sub` regression above `RESET_SUB_CEILING` waits for a coherent successor).
   The deferral compares packet to packet, never packet to stored anchor, so a
@@ -378,6 +380,34 @@ class RunTracker:
                 parsed.get("area_week"),
                 parsed.get("action"),
                 parsed.get("boundary"),
+                parsed.get("time"),
+            )
+            return events
+
+        # At rest, a type-2 that names no zone never opens a run. The
+        # firmware emits a zoneless `mp = 100` task-end marker while docked,
+        # at night, long after the run closed; opened here, it completes in
+        # the same call (docked ∧ `mp = 100`) and leaves a 0-second
+        # `completed` row with no zone. A real mow opens on the `vs = 4` edge,
+        # so this path is only the recovery for a missed edge, and the next
+        # zone-carrying packet opens the run one cadence later. Inside an open
+        # run the marker still flows: it carries the completion and the final
+        # area. The packet is inert — no cursor, reference or pending reset is
+        # touched. Keyed on an explicit `boundary == 0`: an absent field parses
+        # to `None` and fails open, like the sentinel drop above.
+        if self.state == STATE_IDLE and boundary == 0:
+            _LOGGER.debug(
+                "run_tracker: zoneless type-2 refused at rest (BUG-20) "
+                "(vs=%s boundary=%s mp=%s cmp=%s sub=%s wk=%s action=%s "
+                "mst=%s time=%s)",
+                self.vehicle_state,
+                boundary,
+                mp,
+                parsed.get("current_mow_progress"),
+                sub,
+                parsed.get("area_week"),
+                parsed.get("action"),
+                parsed.get("mow_start_type"),
                 parsed.get("time"),
             )
             return events

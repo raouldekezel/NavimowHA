@@ -228,13 +228,13 @@ def test_idle_order_next_real_packet_opens_run_cleanly() -> None:
 
 
 # --------------------------------------------------------------------- #
-# 2. Sentinel order (BUG-06) — sentinel opens the run, zones stays []   #
+# 2. Sentinel order (BUG-06) — sentinel seeds the run, zones stays []   #
 # --------------------------------------------------------------------- #
 
 
 def test_sentinel_order_vestige_dropped_run_stays_seedless(caplog) -> None:
-    """BUG-06 session-init sentinel opens the run through the public
-    `process_type2` path. `_update_zone` rejects `boundary = 0`, so
+    """BUG-06 session-init sentinel seeds the provisional run opened on
+    the `vs = 4` edge. `_update_zone` rejects `boundary = 0`, so
     `state == STATE_RUNNING` with `zones == []` and cursors anchored
     on the sentinel's fields. A vestige-shape packet arriving at the
     second position (before the real boundary ~60 s later) hits the
@@ -242,13 +242,14 @@ def test_sentinel_order_vestige_dropped_run_stays_seedless(caplog) -> None:
     sentinel's values, no `zones[0]` gets seeded.
     """
     tracker = RunTracker()
+    started = tracker.process_vehicle_state(VS_MOWING, time_ms=500)
+    assert [e.kind for e in started] == [EVENT_RUN_STARTED]
     sentinel_events = _process(tracker, _sentinel(sub=0.1, wk=0.1, t=1_000))
-    started = [e for e in sentinel_events if e.kind == EVENT_RUN_STARTED]
-    assert len(started) == 1
+    assert sentinel_events == []
     assert tracker.state == STATE_RUNNING
     assert tracker.current_run["zones"] == []
-    # Sentinel anchored the run.
-    assert tracker.current_run["start_time"] == 1_000
+    # Sentinel seeded the run; `start_time` keeps the activation anchor.
+    assert tracker.current_run["start_time"] == 500
     assert tracker.current_run["sub0"] == 0.1
     assert tracker.current_run["last_mp"] == 0
     assert tracker.current_run["last_sub"] == 0.1
@@ -277,8 +278,8 @@ def test_sentinel_order_vestige_dropped_run_stays_seedless(caplog) -> None:
     assert tracker.current_run["last_mp"] == 0
     assert tracker.current_run["last_sub"] == 0.1
     assert tracker.current_run["last_wk"] == 0.1
-    # `start_time` still anchored on the sentinel, not the vestige.
-    assert tracker.current_run["start_time"] == 1_000
+    # `start_time` still on the activation anchor, not the vestige.
+    assert tracker.current_run["start_time"] == 500
 
     dbgs = [
         r.getMessage()
@@ -289,13 +290,14 @@ def test_sentinel_order_vestige_dropped_run_stays_seedless(caplog) -> None:
 
 
 def test_sentinel_then_early_dock_paused_docked_vestige_dropped(caplog) -> None:
-    """Sentinel opens the run, then the robot re-docks before its
+    """Sentinel seeds the run, then the robot re-docks before its
     first real boundary — `vs = 2` transitions `STATE_RUNNING →
     STATE_PAUSED_DOCKED` with `zones` still empty. A vestige-shape
     packet at this point must still be dropped (the second disjunct
     includes `STATE_PAUSED_DOCKED`).
     """
     tracker = RunTracker()
+    tracker.process_vehicle_state(VS_MOWING, time_ms=500)
     _process(tracker, _sentinel(sub=0.1, t=1_000))
     tracker.process_vehicle_state(VS_DOCKED_CHARGING)
     assert tracker.state == STATE_PAUSED_DOCKED
@@ -341,6 +343,7 @@ def test_sentinel_then_real_boundary_closes_window(caplog) -> None:
     forever.
     """
     tracker = RunTracker()
+    tracker.process_vehicle_state(VS_MOWING, time_ms=500)
     _process(tracker, _sentinel(sub=0.1, t=1_000))
     # Real boundary lands ~60 s later per BUG-06 corpus.
     _process(
@@ -393,23 +396,24 @@ def test_sentinel_then_real_boundary_closes_window(caplog) -> None:
 # --------------------------------------------------------------------- #
 
 
-def test_sentinel_from_idle_accepted_with_suspicious_debug(caplog) -> None:
+def test_sentinel_in_provisional_run_accepted_with_suspicious_debug(caplog) -> None:
     """The BUG-06 sentinel itself carries `mp = 0`, so it fails the
     drop signature (which requires `mp = MP_TASK_END`). It must be
-    accepted — otherwise the guard would break session opens for
-    every real run. Its low `sub` (0.1) triggers the
-    suspicious-shape observability DEBUG line, documenting the
-    accepted noise: sentinels land there every session, alongside
-    genuine low-`sub` first packets (Sunday first-mow, fresh session
-    post-reset).
+    accepted — otherwise the guard would break the seeding of every
+    real run. Its low `sub` (0.1) triggers the suspicious-shape
+    observability DEBUG line, documenting the accepted noise:
+    sentinels land there every session, alongside genuine low-`sub`
+    first packets (Sunday first-mow, fresh session post-reset).
     """
     tracker = RunTracker()
+    tracker.process_vehicle_state(VS_MOWING, time_ms=500)
     with caplog.at_level(logging.DEBUG, logger="custom_components.navimow.run_tracker"):
         events = _process(tracker, _sentinel(sub=0.1, t=1_000))
-    # Sentinel accepted — run_started fired, state moved to RUNNING.
-    started = [e for e in events if e.kind == EVENT_RUN_STARTED]
-    assert len(started) == 1
+    # Sentinel accepted — it seeds the provisional run, no second start.
+    assert events == []
     assert tracker.state == STATE_RUNNING
+    assert not tracker.is_provisional
+    assert tracker.current_run["last_mp"] == 0
     assert tracker.current_run["zones"] == []
     # No drop DEBUG.
     rejects = [
